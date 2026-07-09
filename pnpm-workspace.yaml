@@ -1,0 +1,7 @@
+packages:
+  - "packages/*"
+
+# pnpm 11 only reads auth/registry settings from .npmrc; everything else lives here.
+engineStrict: true
+autoInstallPeers: true
+linkWorkspacePackages: true

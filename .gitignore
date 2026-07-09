@@ -1,3 +1,11 @@
+## Node / pnpm / Turborepo / TypeScript build artifacts
+node_modules/
+dist/
+coverage/
+.turbo/
+.tmp/
+*.tsbuildinfo
+
 ## Project-specific
 *.local.*
 

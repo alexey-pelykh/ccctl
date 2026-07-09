@@ -1,0 +1,32 @@
+{
+  "name": "@ccctl/e2e",
+  "version": "0.0.0",
+  "description": "ccctl end-to-end tests: patched headless worker -> local server -> SSE -> inference still hits api.anthropic.com",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "AGPL-3.0-only",
+  "author": "Alexey Pelykh (https://github.com/alexey-pelykh)",
+  "scripts": {
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts --passWithNoTests",
+    "lint": "eslint src/",
+    "dev": "tsc --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^25",
+    "eslint": "^10.4.1",
+    "typescript": "~6.0.3",
+    "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "@ccctl/cli": "workspace:*",
+    "@ccctl/core": "workspace:*",
+    "@ccctl/server": "workspace:*"
+  }
+}

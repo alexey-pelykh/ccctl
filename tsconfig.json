@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/server" },
+    { "path": "packages/web-ui" },
+    { "path": "packages/tunnel-adapters" },
+    { "path": "packages/cli" },
+    { "path": "packages/e2e" }
+  ]
+}

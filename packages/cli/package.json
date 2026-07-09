@@ -1,0 +1,43 @@
+{
+  "name": "@ccctl/cli",
+  "version": "0.0.0",
+  "description": "ccctl CLI: start the local server and pick a tunnel",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "AGPL-3.0-only",
+  "author": "Alexey Pelykh (https://github.com/alexey-pelykh)",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "ccctl": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "lint": "eslint src/",
+    "dev": "tsc --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^25",
+    "eslint": "^10.4.1",
+    "typescript": "~6.0.3",
+    "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "@ccctl/core": "workspace:*",
+    "@ccctl/server": "workspace:*",
+    "@ccctl/tunnel-adapters": "workspace:*",
+    "commander": "^15.0.0"
+  }
+}

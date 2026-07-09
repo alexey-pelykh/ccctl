@@ -1,0 +1,24 @@
+{
+  "name": "@ccctl/web-ui",
+  "version": "0.0.0",
+  "description": "ccctl zero-build static UI: plain HTML + vanilla ES modules (EventSource + fetch), no framework, no bundler",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "AGPL-3.0-only",
+  "author": "Alexey Pelykh (https://github.com/alexey-pelykh)",
+  "files": [
+    "index.html",
+    "src"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "rm -rf dist && mkdir -p dist && cp index.html dist/ && cp -r src dist/",
+    "typecheck": "node --check src/app.js",
+    "test": "echo \"@ccctl/web-ui: no tests\" && exit 0",
+    "lint": "echo \"@ccctl/web-ui: static assets, linted at root\" && exit 0",
+    "dev": "echo \"serve this directory statically, e.g. npx serve .\""
+  }
+}

@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 Oleksii PELYKH -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ccctl</title>
+  </head>
+  <body>
+    <main>
+      <h1>ccctl</h1>
+      <p>Steer Claude Code from anywhere. Control channel only — inference stays on Anthropic.</p>
+      <section id="status">connecting…</section>
+      <ul id="events" aria-live="polite"></ul>
+      <form id="prompt-form">
+        <input id="prompt-input" name="prompt" type="text" autocomplete="off" placeholder="Send to session…" />
+        <button type="submit">Send</button>
+      </form>
+    </main>
+    <!-- Zero-build: a single plain ES module, no framework and no bundler. -->
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>

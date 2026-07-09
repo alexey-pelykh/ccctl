@@ -1,0 +1,34 @@
+{
+  "name": "@ccctl/core",
+  "version": "0.0.0",
+  "description": "ccctl hub: session/state model + Claude Code stream-json control-channel types",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "AGPL-3.0-only",
+  "author": "Alexey Pelykh (https://github.com/alexey-pelykh)",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "lint": "eslint src/",
+    "dev": "tsc --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^25",
+    "eslint": "^10.4.1",
+    "typescript": "~6.0.3",
+    "vitest": "^4.1.9"
+  }
+}
