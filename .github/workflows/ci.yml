@@ -62,14 +62,41 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run lint:code
 
-  # End-to-end gate. Stubbed for now — the real suite lands in a later wave (see
-  # packages/e2e). `needs: test` runs it after typecheck + unit tests. Once
-  # packages/e2e's `test:e2e` script runs clean, swap the echo below for
-  # `pnpm run test:e2e` — no further CI wiring needed, the gate is already here.
+  # End-to-end gate, wired after typecheck + unit tests (`needs: test`). The
+  # packages/e2e suite is currently `describe.todo`/`it.todo` placeholders, so this
+  # runs clean (0 tests, exit 0) with no live worker or credentials. The real specs
+  # — which drive a patched worker and reach api.anthropic.com — land in a later
+  # wave and will gate on their own env (turbo passes CCCTL_E2E / CCCTL_SDK_URL /
+  # ANTHROPIC_API_KEY through to the `test:e2e` task).
   e2e:
     runs-on: ubuntu-latest
     needs: test
     timeout-minutes: 15
     steps:
-      - name: End-to-end tests (stub)
-        run: echo "e2e stub — real end-to-end suite lands in a later wave (see packages/e2e)"
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Restore Turborepo cache
+        uses: actions/cache@v6
+        with:
+          path: .turbo
+          # Same key as `test`; this job `needs: test`, so that cache is already
+          # saved and we exact-hit it (and therefore skip re-saving — no collision).
+          key: ${{ runner.os }}-turbo-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: End-to-end tests
+        run: pnpm run test:e2e
