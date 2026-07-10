@@ -47,3 +47,15 @@ jobs:
 
       - name: Unit tests
         run: pnpm run test
+
+  # End-to-end gate. Stubbed for now — the real suite lands in a later wave (see
+  # packages/e2e). `needs: test` runs it after typecheck + unit tests. Once
+  # packages/e2e's `test:e2e` script runs clean, swap the echo below for
+  # `pnpm run test:e2e` — no further CI wiring needed, the gate is already here.
+  e2e:
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 15
+    steps:
+      - name: End-to-end tests (stub)
+        run: echo "e2e stub — real end-to-end suite lands in a later wave (see packages/e2e)"
