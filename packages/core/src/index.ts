@@ -81,7 +81,7 @@ export function decodeControlFrame(line: string): ControlFrame {
   if (typeof value !== "object" || value === null || !("type" in value)) {
     throw new Error("ccctl: malformed control frame (missing `type`)");
   }
-  const type = (value as { type: unknown }).type;
+  const type = value.type;
   if (type !== "control_request" && type !== "control_response" && type !== "control_event") {
     throw new Error(`ccctl: unknown control frame type: ${String(type)}`);
   }

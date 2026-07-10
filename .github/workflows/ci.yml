@@ -48,6 +48,20 @@ jobs:
       - name: Unit tests
         run: pnpm run test
 
+      # Formatting and eslint gate the PR as two orthogonal steps. `pnpm lint`
+      # chains `format:check && …`, so a single stray formatting nit short-circuits
+      # before eslint ever runs — that is exactly how five eslint errors sat
+      # unnoticed on `main`. `lint:code` is the eslint half on its own, and
+      # `!cancelled()` lets each step report even when an earlier one already
+      # failed, so one push surfaces every verdict instead of the first.
+      - name: Format check
+        if: ${{ !cancelled() }}
+        run: pnpm run format:check
+
+      - name: Lint
+        if: ${{ !cancelled() }}
+        run: pnpm run lint:code
+
   # End-to-end gate. Stubbed for now — the real suite lands in a later wave (see
   # packages/e2e). `needs: test` runs it after typecheck + unit tests. Once
   # packages/e2e's `test:e2e` script runs clean, swap the echo below for

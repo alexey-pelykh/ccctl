@@ -20,20 +20,14 @@ import { ADAPTERS, type TunnelKind } from "@ccctl/tunnel-adapters";
 export function buildProgram(): Command {
   const program = new Command();
 
-  program
-    .name("ccctl")
-    .description("Self-hosted control plane for Claude Code")
-    .version("0.0.0");
+  program.name("ccctl").description("Self-hosted control plane for Claude Code").version("0.0.0");
 
   program
     .command("serve")
     .description("Start the local control-plane server")
     .option("-p, --port <port>", "loopback port to bind", "4321")
     .option("--host <host>", "bind host", DEFAULT_HOST)
-    .option(
-      "-t, --tunnel <kind>",
-      `expose via a tunnel (${Object.keys(ADAPTERS).join(" | ")})`,
-    )
+    .option("-t, --tunnel <kind>", `expose via a tunnel (${Object.keys(ADAPTERS).join(" | ")})`)
     .action((options: { port: string; host: string; tunnel?: string }) => {
       const tunnel = options.tunnel as TunnelKind | undefined;
       if (tunnel !== undefined && !(tunnel in ADAPTERS)) {

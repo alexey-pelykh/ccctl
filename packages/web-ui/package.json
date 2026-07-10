@@ -18,7 +18,7 @@
     "build": "rm -rf dist && mkdir -p dist && cp index.html dist/ && cp -r src dist/",
     "typecheck": "node --check src/app.js",
     "test": "echo \"@ccctl/web-ui: no tests\" && exit 0",
-    "lint": "echo \"@ccctl/web-ui: static assets, linted at root\" && exit 0",
+    "lint": "eslint src/",
     "dev": "echo \"serve this directory statically, e.g. npx serve .\""
   }
 }
