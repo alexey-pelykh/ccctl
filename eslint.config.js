@@ -11,7 +11,7 @@ export default tseslint.config(
   ...tseslint.configs.strictTypeChecked,
   eslintConfigPrettier,
   {
-    ignores: ["**/dist/", "packages/web-ui/src/"],
+    ignores: ["**/dist/"],
   },
   {
     languageOptions: {
@@ -22,6 +22,18 @@ export default tseslint.config(
     },
     rules: {
       "@typescript-eslint/restrict-template-expressions": ["error", { allowNumber: true }],
+      // A leading underscore marks a binding that is deliberately unused: a
+      // parameter kept because it documents a contract (`startServer(_config)`,
+      // `open(_local)`), or a caught error we intentionally swallow. Without
+      // this the skeleton's typed stubs cannot express their own signatures.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrorsIgnorePattern: "^_",
+        },
+      ],
     },
   },
   {
@@ -41,6 +53,21 @@ export default tseslint.config(
     files: ["eslint.config.js", "**/scripts/**/*.{js,mjs,cjs}"],
     rules: {
       "no-undef": "off",
+    },
+  },
+  {
+    // Zero-build browser ES module: shipped as-is, so it belongs to no tsconfig
+    // project — skip type-aware lint. Declaring the handful of Web APIs it uses
+    // (rather than switching `no-undef` off) keeps typo'd globals an error.
+    files: ["packages/web-ui/src/**/*.js"],
+    ...tseslint.configs.disableTypeChecked,
+    languageOptions: {
+      ...tseslint.configs.disableTypeChecked.languageOptions,
+      globals: {
+        document: "readonly",
+        EventSource: "readonly",
+        fetch: "readonly",
+      },
     },
   },
   {

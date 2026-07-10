@@ -10,6 +10,18 @@ trim_trailing_whitespace = true
 insert_final_newline = true
 charset = utf-8
 
+# Prettier reads .editorconfig by default (indent_size -> tabWidth), so these
+# per-format overrides are what keep `prettier --check` green: the committed
+# TS/JS/HTML is 2-space, while the house default above stays 4-space for editors
+# and every other file type. yaml/yml/json already override below.
+[*.{ts,tsx,js,jsx,mjs,cjs}]
+indent_size = 2
+continuation_indent_size = 4
+
+[*.html]
+indent_size = 2
+continuation_indent_size = 4
+
 [*.{yaml,yml}]
 indent_size = 2
 
