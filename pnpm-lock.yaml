@@ -72,9 +72,6 @@ importers:
 
   packages/core:
     devDependencies:
-      '@types/node':
-        specifier: ^25
-        version: 25.9.5
       eslint:
         specifier: ^10.4.1
         version: 10.6.0
