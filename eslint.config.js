@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
+import { builtinModules } from "node:module";
 import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
 import eslintConfigPrettier from "eslint-config-prettier";
 import headerPlugin from "@tony.ganchev/eslint-plugin-header";
+
+// `@ccctl/core` is the runtime-agnostic protocol layer (CORE-C-001): a Node
+// builtin imported there would couple the wire contract to one runtime and make
+// a later Bun revisit costly. The message below is shown at every offending
+// import.
+const RUNTIME_AGNOSTIC_MESSAGE =
+  "@ccctl/core is the runtime-agnostic protocol layer — no Node builtins (fs, net, node:*, …). Keep it pure TypeScript so a later Bun revisit stays ~0-cost.";
 
 export default tseslint.config(
   eslint.configs.recommended,
@@ -68,6 +76,26 @@ export default tseslint.config(
         EventSource: "readonly",
         fetch: "readonly",
       },
+    },
+  },
+  {
+    // Runtime-agnostic protocol layer: forbid every Node builtin import. The
+    // bare specifiers (`fs`, `net`, …) are enumerated from Node's own
+    // `builtinModules` so the ban can't rot as the stdlib grows; the `^node:`
+    // pattern covers the prefixed form (`node:fs`, `node:test`, `node:fs/promises`,
+    // …). Ambient Node globals are separately denied by `"types": []` in
+    // packages/core/tsconfig.json — together they keep the layer pure.
+    files: ["packages/core/src/**/*.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: builtinModules
+            .filter((name) => !name.startsWith("node:"))
+            .map((name) => ({ name, message: RUNTIME_AGNOSTIC_MESSAGE })),
+          patterns: [{ regex: "^node:", message: RUNTIME_AGNOSTIC_MESSAGE }],
+        },
+      ],
     },
   },
   {
