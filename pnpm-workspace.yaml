@@ -5,3 +5,5 @@ packages:
 engineStrict: true
 autoInstallPeers: true
 linkWorkspacePackages: true
+allowBuilds:
+  esbuild: true
