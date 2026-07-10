@@ -234,25 +234,58 @@ export function isLoopbackHost(host: string): boolean {
 /** Lifecycle of a single steered Claude Code session. */
 export type SessionStatus = "connecting" | "ready" | "busy" | "closed" | "errored";
 
-/** A Claude Code session under ccctl control, as tracked by the hub. */
+/**
+ * A Claude Code session under ccctl control, as tracked by the hub.
+ *
+ * Session state is THREE orthogonal dimensions that COMPOSE — none subsumes
+ * another, so each is tracked and transitioned on its own:
+ *
+ *   - {@link SessionStatus} `status` — the transport LIFECYCLE of the steering
+ *     channel (connecting → ready → busy → closed/errored).
+ *   - {@link SessionActivity} `activity` — what the worker is DOING inside a
+ *     live session, derived from `worker_status` frames (running /
+ *     requires_action / idle). See {@link sessionActivityFromFrame}.
+ *   - liveness — heartbeat freshness ({@link Session.lastHeartbeatAt}); a
+ *     session whose heartbeat gap exceeds the window is *stale* regardless of
+ *     lifecycle or activity. See {@link isSessionStale}.
+ *
+ * A `ready` + `running` session can still be `stale` (the worker stopped
+ * heart-beating) — the dimensions are independent.
+ */
 export interface Session {
-  /** ccctl-assigned session identifier (distinct from any worker-side id). */
+  /**
+   * Session identity — the **session id from the register response**
+   * ({@link RegisterResponse.sessionId}, contract §1), server-assigned and
+   * distinct from any worker-side id. {@link sessionFromRegister} keys a session
+   * on it.
+   */
   readonly id: string;
-  /** Current lifecycle state. */
+  /** Transport lifecycle state. */
   status: SessionStatus;
+  /** Activity derived from the latest `worker_status` frame. */
+  activity: SessionActivity;
   /** Epoch millis when the session was first registered. */
   readonly createdAt: number;
-  /** Epoch millis of the most recent frame in either direction. */
+  /** Epoch millis of the most recent `worker_status` frame applied. */
   lastActivityAt: number;
+  /** Epoch millis of the most recent heartbeat; drives liveness/staleness. */
+  lastHeartbeatAt: number;
 }
 
-/** Create a freshly-registered session in the `connecting` state. */
+/**
+ * Create a freshly-registered session: `connecting` lifecycle, `idle` activity,
+ * and the heartbeat clock started at `now` (registration is its first liveness
+ * signal). `now` is injectable so liveness/heartbeat timing is deterministic
+ * under test — never a baked-in ambient clock.
+ */
 export function createSession(id: string, now: number = Date.now()): Session {
   return {
     id,
     status: "connecting",
+    activity: { kind: "idle" },
     createdAt: now,
     lastActivityAt: now,
+    lastHeartbeatAt: now,
   };
 }
 
@@ -451,10 +484,17 @@ export function isWorkerStatus(value: unknown): value is WorkerStatus {
  * `"worker_status"` and whose payload carries a {@link WorkerStatus}. Modelled
  * as a refinement of {@link ControlEvent} — not a new frame kind — so it rides
  * the existing NDJSON codec unchanged.
+ *
+ * When `status` is `"requires_action"` the worker MAY attach a `detail`: a
+ * human-ready line naming what input it is waiting for (a permission prompt, a
+ * question). It is OPTIONAL on the wire — {@link sessionActivityFromFrame}
+ * supplies {@link DEFAULT_REQUIRES_ACTION_DETAIL} when it is absent, so the
+ * derived activity always carries a non-empty, displayable detail. Adding it as
+ * an optional field keeps every existing `{ status }` payload valid.
  */
 export interface WorkerStatusEvent extends ControlEvent {
   subtype: "worker_status";
-  payload: { status: WorkerStatus };
+  payload: { status: WorkerStatus; detail?: string };
 }
 
 /**
@@ -478,6 +518,147 @@ export function isWorkerStatusEvent(frame: ControlFrame): frame is WorkerStatusE
  */
 export function workerStatusFromFrame(frame: ControlFrame): WorkerStatus | null {
   return isWorkerStatusEvent(frame) ? frame.payload.status : null;
+}
+
+// ---------------------------------------------------------------------------
+// session activity, liveness & transitions
+//
+// The tri-state a `worker_status` frame derives (running / requires_action /
+// idle), the heartbeat-based liveness rule, and the explicit per-session
+// transitions that fold both into a {@link Session}. Every transition is a PURE
+// function returning a NEW session, so one session's transition can never mutate
+// another (contract: per-session isolation). Timing is via an injected `now`
+// (epoch millis), never an ambient clock, so liveness is deterministic in tests.
+// ---------------------------------------------------------------------------
+
+/**
+ * The session state derived from a `worker_status` frame — the richer form of
+ * {@link WorkerStatus} that carries, for `requires_action`, the human-ready
+ * detail naming what input the worker is waiting for. A discriminated union on
+ * `kind`, so a consumer handles the detail exactly when (and only when) it
+ * exists.
+ */
+export type SessionActivity =
+  | { readonly kind: "running" }
+  | { readonly kind: "requires_action"; readonly detail: string }
+  | { readonly kind: "idle" };
+
+/**
+ * Human-ready detail used when a `requires_action` frame carries none, so the
+ * derived {@link SessionActivity} always has a non-empty, displayable detail.
+ */
+export const DEFAULT_REQUIRES_ACTION_DETAIL = "Awaiting input.";
+
+/**
+ * Read a `worker_status` payload's `detail`, defaulting to
+ * {@link DEFAULT_REQUIRES_ACTION_DETAIL}. Defensive over a decoded frame: a
+ * `detail` that is absent, non-string, or blank falls back rather than surfacing
+ * an empty line.
+ */
+function requiresActionDetail(payload: WorkerStatusEvent["payload"]): string {
+  const { detail } = payload;
+  return typeof detail === "string" && detail.trim() !== "" ? detail : DEFAULT_REQUIRES_ACTION_DETAIL;
+}
+
+/**
+ * Derive the {@link SessionActivity} a control frame reports, or `null` if it is
+ * not a well-formed `worker_status` event. The tri-state the session model is
+ * built on: `running` / `requires_action` (+ its human-ready detail) / `idle`.
+ * Shares the fail-closed guard {@link isWorkerStatusEvent} with
+ * {@link workerStatusFromFrame}, then enriches `requires_action` with the
+ * detail. The `switch` is exhaustive over {@link WorkerStatus}, so adding a
+ * fourth status later is a compile error here until it is handled.
+ */
+export function sessionActivityFromFrame(frame: ControlFrame): SessionActivity | null {
+  if (!isWorkerStatusEvent(frame)) {
+    return null;
+  }
+  switch (frame.payload.status) {
+    case "running":
+      return { kind: "running" };
+    case "idle":
+      return { kind: "idle" };
+    case "requires_action":
+      return { kind: "requires_action", detail: requiresActionDetail(frame.payload) };
+  }
+}
+
+/**
+ * How long the hub tolerates silence — no heartbeat — before it marks a session
+ * stale. The worker channel emits a periodic heartbeat; a session stays live
+ * while beats keep arriving, and a gap wider than this window means the worker
+ * is presumed gone rather than merely slow.
+ *
+ * Chosen at 30_000 ms (30 s). The heartbeat cadence is NOT pinned by the
+ * protocol, so this is a deliberate design value, not a derived one: assuming a
+ * nominal ~10 s beat, 30 s absorbs two consecutive missed beats (a GC pause,
+ * transient network jitter, a brief event-loop stall) before a false-positive
+ * stale, while still surfacing a genuinely dead worker within a few seconds of
+ * the third missed beat. It is an INJECTABLE default — a deployment with a
+ * faster or slower heartbeat passes its own window to {@link isSessionStale} /
+ * {@link sessionLiveness} — never a hidden magic number.
+ */
+export const DEFAULT_HEARTBEAT_STALE_AFTER_MS = 30_000;
+
+/** Heartbeat-derived liveness: `live` while beats are fresh, `stale` once the window lapses. */
+export type SessionLiveness = "live" | "stale";
+
+/**
+ * Whether `session` is stale at `now`: `true` once the gap since its last
+ * heartbeat EXCEEDS `staleAfterMs` (a gap exactly at the window is still live —
+ * the boundary is `>`). Pure and injectable — both `now` and the window are
+ * parameters — so staleness is a deterministic derivation, never a stored flag
+ * that drifts out of date.
+ */
+export function isSessionStale(
+  session: Session,
+  now: number,
+  staleAfterMs: number = DEFAULT_HEARTBEAT_STALE_AFTER_MS,
+): boolean {
+  return now - session.lastHeartbeatAt > staleAfterMs;
+}
+
+/** The {@link SessionLiveness} of `session` at `now` under the (injectable) stale window. */
+export function sessionLiveness(
+  session: Session,
+  now: number,
+  staleAfterMs: number = DEFAULT_HEARTBEAT_STALE_AFTER_MS,
+): SessionLiveness {
+  return isSessionStale(session, now, staleAfterMs) ? "stale" : "live";
+}
+
+/**
+ * Create a session keyed on the **register-response session id** (contract §1):
+ * identity is {@link RegisterResponse.sessionId}, never a worker-side id. The
+ * explicit, single tie from a register response to {@link createSession}.
+ */
+export function sessionFromRegister(response: RegisterResponse, now: number = Date.now()): Session {
+  return createSession(response.sessionId, now);
+}
+
+/**
+ * Explicit transition — apply a `worker_status` frame to a session. Returns a
+ * NEW session with the derived {@link SessionActivity} and `lastActivityAt`
+ * advanced to `now`. If `frame` is not a well-formed `worker_status` event the
+ * session is returned unchanged (no transition). Pure: the input session is
+ * never mutated, so applying a frame to one session cannot touch another.
+ */
+export function applyWorkerStatusFrame(session: Session, frame: ControlFrame, now: number = Date.now()): Session {
+  const activity = sessionActivityFromFrame(frame);
+  if (activity === null) {
+    return session;
+  }
+  return { ...session, activity, lastActivityAt: now };
+}
+
+/**
+ * Explicit transition — record a heartbeat. Returns a NEW session with
+ * `lastHeartbeatAt` advanced to `now` (refreshing liveness); every other
+ * dimension is untouched. Pure: never mutates the input, so one session's
+ * heartbeat cannot touch another's.
+ */
+export function recordHeartbeat(session: Session, now: number = Date.now()): Session {
+  return { ...session, lastHeartbeatAt: now };
 }
 
 // --- loggable / persistable (JSON) shape + credential-omission proofs ---
@@ -515,13 +696,15 @@ type IsJson<T> = [T] extends [JsonValue]
  * (and is therefore evaluated, not dropped as unused). Each element is a proof:
  * the account {@link AccountBearer} is NOT JSON — so a leak into a log/snapshot
  * is a type error — while {@link RegisterResponse}, {@link RegisterRequestBody},
- * {@link LoggableWorkerChannelConnect}, and the {@link Session} snapshot ARE
- * JSON, provably free of the credential.
+ * {@link LoggableWorkerChannelConnect}, the {@link SessionActivity} derived from
+ * a `worker_status` frame, and the {@link Session} snapshot ARE JSON, provably
+ * free of the credential.
  */
 export type BridgeCredentialJsonProofs = [
   Assert<IsJson<AccountBearer> extends true ? false : true>,
   Assert<IsJson<RegisterResponse>>,
   Assert<IsJson<RegisterRequestBody>>,
   Assert<IsJson<LoggableWorkerChannelConnect>>,
+  Assert<IsJson<SessionActivity>>,
   Assert<IsJson<Session>>,
 ];
