@@ -576,10 +576,10 @@ export function sessionActivityFromFrame(frame: ControlFrame): SessionActivity |
   switch (frame.payload.status) {
     case "running":
       return { kind: "running" };
-    case "idle":
-      return { kind: "idle" };
     case "requires_action":
       return { kind: "requires_action", detail: requiresActionDetail(frame.payload) };
+    case "idle":
+      return { kind: "idle" };
   }
 }
 
