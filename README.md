@@ -61,4 +61,4 @@ implementation.
 
 ## License
 
-[AGPL-3.0-only](./LICENSE). Copyright (C) 2026 Oleksii PELYKH.
+[AGPL-3.0-or-later](./LICENSE). Copyright (C) 2026 Oleksii PELYKH.

@@ -7,7 +7,7 @@
   "engines": {
     "node": ">=22.19.0"
   },
-  "license": "AGPL-3.0-only",
+  "license": "AGPL-3.0-or-later",
   "author": "Alexey Pelykh (https://github.com/alexey-pelykh)",
   "files": [
     "index.html",
