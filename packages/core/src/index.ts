@@ -227,6 +227,18 @@ export function isLoopbackHost(host: string): boolean {
   return LOOPBACK_HOSTS.includes(host);
 }
 
+/**
+ * Format a `host:port` authority (RFC 3986), bracketing an IPv6 host so `::1`
+ * renders `[::1]:port` — never the malformed `::1:port`. The single place that
+ * knows the bracketing rule, shared by everything that renders a
+ * {@link HostEndpoint} into a URL (the server's `ws_url`, a tunnel's serve
+ * target), so an IPv6 loopback is handled the one correct way everywhere.
+ */
+export function formatAuthority(host: string, port: number): string {
+  const authority = host.includes(":") ? `[${host}]` : host;
+  return `${authority}:${port}`;
+}
+
 // ---------------------------------------------------------------------------
 // session / state model
 // ---------------------------------------------------------------------------

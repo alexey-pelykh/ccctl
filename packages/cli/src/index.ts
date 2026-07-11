@@ -33,7 +33,7 @@ export function buildProgram(): Command {
       if (tunnel !== undefined && !(tunnel in ADAPTERS)) {
         throw new Error(`ccctl: unknown tunnel "${tunnel}"`);
       }
-      // TODO: startServer(...) then, if `tunnel`, ADAPTERS[tunnel].open(...)
+      // TODO: startServer(...) then, if `tunnel`, ADAPTERS[tunnel]().establish(...)
       throw new Error("ccctl: serve is not implemented yet (skeleton)");
     });
 
