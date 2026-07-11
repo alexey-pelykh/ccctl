@@ -6,19 +6,64 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ccctl</title>
+    <style>
+      /* Minimal legibility only — zero-build, no framework and no bundler. */
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 1rem;
+        line-height: 1.4;
+      }
+      #status {
+        color: #666;
+      }
+      #activity {
+        margin: 0.5rem 0;
+        font-weight: 600;
+      }
+      #activity[data-status="running"] {
+        color: #047857;
+      }
+      #activity[data-status="requires_action"] {
+        color: #b45309;
+      }
+      #events {
+        list-style: none;
+        padding: 0;
+      }
+      #events li {
+        padding: 0.25rem 0;
+        border-bottom: 1px solid #eee;
+      }
+      #events li[data-unparsed] {
+        color: #999;
+        font-style: italic;
+      }
+      #prompt-form {
+        margin-top: 1rem;
+        display: flex;
+        gap: 0.5rem;
+      }
+      #prompt-input {
+        flex: 1;
+      }
+    </style>
   </head>
   <body>
     <main>
       <h1>ccctl</h1>
       <p>Steer Claude Code from anywhere. Control channel only — inference stays on Anthropic.</p>
-      <section id="status">connecting…</section>
+      <!-- Transport lifecycle of the SSE connection. -->
+      <section id="status" aria-live="polite">connecting…</section>
+      <!-- The session's current turn (worker_status); revealed on the first frame. -->
+      <section id="activity" aria-live="polite" hidden></section>
+      <h2>Transcript</h2>
       <ul id="events" aria-live="polite"></ul>
       <form id="prompt-form">
         <input id="prompt-input" name="prompt" type="text" autocomplete="off" placeholder="Send to session…" />
         <button type="submit">Send</button>
       </form>
     </main>
-    <!-- Zero-build: a single plain ES module, no framework and no bundler. -->
+    <!-- Zero-build: plain ES modules, no framework and no bundler. -->
     <script type="module" src="./src/app.js"></script>
   </body>
 </html>
