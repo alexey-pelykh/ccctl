@@ -8,4 +8,7 @@ The `ccctl` command-line interface for [ccctl](../../README.md). Provides the
 executable entry (shebang + argv parse) and `src/index.ts` builds the command
 tree. Depends on [`@ccctl/core`](../core), [`@ccctl/server`](../server), and
 [`@ccctl/tunnel-adapters`](../tunnel-adapters). This package is a skeleton — the
-`serve` action is a typed stub.
+`serve` action enforces the baseline startup guards from `@ccctl/server`
+(refuse-start-without-auth + localhost-bind: no configured local-server auth exits
+non-zero, and a `0.0.0.0` bind is refused) and otherwise stubs the server + tunnel
+orchestration.
