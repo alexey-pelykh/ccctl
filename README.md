@@ -8,7 +8,11 @@ sessions from a phone or web UI while you're away from your machine — with **n
 claude.ai, no public IP, and no open ports**. Model inference and billing stay
 on Anthropic under your own paid subscription; `ccctl` never proxies or sees the
 model traffic — it only relays the control channel between the worker and your
-UI.
+UI. That control/inference split is `ccctl`'s load-bearing guarantee; today it is
+verified only by a hermetic test skeleton (**partial**) — see
+[Security posture](docs/security-posture.md) for its status and the release gate
+([#67](https://github.com/alexey-pelykh/ccctl/issues/67)) that must prove it
+end-to-end before any real-worker rollout.
 
 A separate patcher, [`ccctl-patch`](../ccctl-patch), re-scopes Claude Code's
 `--sdk-url` host-allowlist check so it will accept a localhost or tunnel host.
@@ -37,8 +41,13 @@ workspace.
 - **`@ccctl/tunnel-adapters`** — a pluggable tunnel-adapter interface with stub
   adapters for Tailscale, Cloudflare, and Headscale behind one interface.
 - **`@ccctl/cli`** — the `ccctl` CLI: start the server and pick a tunnel.
-- **`@ccctl/e2e`** — end-to-end test package (placeholder). Target scenario:
-  _patched headless worker → local server → SSE → inference still hits
+- **`@ccctl/e2e`** — end-to-end test package. The inference-untouched guarantee
+  (above) is verified today only by a hermetic skeleton — **necessary but not
+  sufficient**; the full-flow release gate
+  ([#67](https://github.com/alexey-pelykh/ccctl/issues/67)) must prove it
+  end-to-end before any real-worker rollout (see
+  [Security posture](docs/security-posture.md)). Target scenario: _patched
+  headless worker → local server → SSE → inference still hits
   `api.anthropic.com`._
 
 ## Requirements
