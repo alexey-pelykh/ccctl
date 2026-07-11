@@ -5,21 +5,31 @@
  * Skeleton harness for the one-session control-plane flow (issue #19, traces
  * E2E-B-002).
  *
- * It drives the whole one-session round-trip the walking skeleton ships —
- * register → server → phone view + steer — end-to-end against the REAL
+ * It drives the whole one-session round-trip the walking skeleton ships over the
+ * CURRENT environments-bridge flow (#124) — register → session-create → work-poll →
+ * per-session channel → phone view + steer — end-to-end against the REAL
  * {@link CcctlServer}, hermetically (loopback only; a stand-in worker and a
  * stand-in phone, no patched Claude Code worker, no credentials, no egress):
  *
- *   1. **Register** — a session registers with the local server
- *      (`POST /v1/code/sessions`, #10). The response is asserted against the
- *      snake_case `{session_id, ws_url}` wire PINNED by #108 / ADR-001, via the
- *      shared {@link assertRegisterResponseWire}.
- *   2. **Worker channel** — a stand-in worker opens the worker-channel WebSocket
+ *   1. **Environment register** (§1) — the bridge registers with the local server
+ *      (`POST /v1/environments/bridge`); the response yields the scoped
+ *      per-environment work-poll token, asserted against the pinned
+ *      `{environment_id, work_poll_token}` wire via {@link registerEnvironment}.
+ *   2. **Session create** (§2) — a session is created (`POST /v1/sessions`); the
+ *      response is asserted against the snake_case `{session_id, ws_url}` wire
+ *      PINNED by ADR-001, via {@link createSession}.
+ *   3. **Work poll** (§3) — the bridge long-polls `GET …/work/poll` with its SCOPED
+ *      token (never the account Bearer) and receives the session-dispatch work item,
+ *      then acks it — grounded in the poll body it RECEIVED and the server dropping
+ *      the in-flight item. The server-side ingress that a create triggers in the full
+ *      build (the §2→§3 enqueue wiring) is a later item, so the harness drives the
+ *      enqueue explicitly — as it stands in for the worker/phone.
+ *   4. **Worker channel** (§4) — a stand-in worker opens the worker-channel WebSocket
  *      at the minted `ws_url` (#11); the session moves `connecting → ready`.
- *   3. **Phone view (SSE)** — a stand-in phone subscribes over Server-Sent Events
+ *   5. **Phone view (SSE)** — a stand-in phone subscribes over Server-Sent Events
  *      (`GET /api/events`, #13/#15); the worker emits a `control_event` and the
  *      phone VIEWS it — grounded in the phone's OWN received record.
- *   4. **Phone steer** — the phone POSTs one steer (`POST /api/command`, #13/#16);
+ *   6. **Phone steer** — the phone POSTs one steer (`POST /api/command`, #13/#16);
  *      the server re-frames it as a `control_request` and relays it over the
  *      worker channel (#12), where the worker RECEIVES it — grounded in the
  *      worker's OWN received frames.
@@ -46,14 +56,15 @@ import {
   ControlFrameDecoder,
   encodeControlFrame,
   formatAuthority,
-  SESSIONS_CREATE_PATH,
   type ControlEvent,
   type ControlRequest,
   type HostEndpoint,
+  type WorkItem,
 } from "@ccctl/core";
 import type { CcctlServer } from "@ccctl/server";
+import { createSession, registerEnvironment, roundTripWork } from "./bridge-wire-conformance.js";
 import type { ObservedConnection } from "./inference-guarantee.js";
-import { assertRegisterResponseWire, type InferenceStandIn } from "./traffic-harness.js";
+import type { InferenceStandIn } from "./traffic-harness.js";
 
 /** The same-origin SSE subscription path (mirrors the server's `EVENTS_PATH`, #13). */
 const EVENTS_PATH = "/api/events";
@@ -99,7 +110,7 @@ export interface FakeWorker {
 
 /** Inputs to open the stand-in worker's channel. */
 export interface FakeWorkerOptions {
-  /** The `ws_url` the register response minted (the worker dials exactly this). */
+  /** The `ws_url` the §2 session-create response minted (the worker dials exactly this). */
   readonly wsUrl: string;
   /** The account Bearer, presented again on the WS connect (bridge-protocol §4). */
   readonly bearer: string;
@@ -248,7 +259,7 @@ export function connectUiClient(options: UiClientOptions): Promise<UiClient> {
 export interface OneSessionFlowOptions {
   /** The real local ccctl server the flow runs against. */
   readonly server: CcctlServer;
-  /** The account Bearer presented on the register AND the worker-channel connect. */
+  /** The account Bearer presented on the §1/§2 control POSTs AND the §4 worker-channel connect. */
   readonly bearer: string;
   /** The Anthropic stand-in, used to prove control-plane traffic never leaks to it. */
   readonly standIn: InferenceStandIn;
@@ -260,9 +271,13 @@ export interface OneSessionFlowOptions {
 
 /** The receiver-grounded outcome of one full one-session flow. */
 export interface OneSessionFlow {
-  /** The server-assigned session id from the register response. */
+  /** The server-assigned environment id from the §1 environment-register response. */
+  readonly environmentId: string;
+  /** The session-dispatch work item the bridge received over the §3 work poll (and acked). */
+  readonly workItem: WorkItem;
+  /** The server-assigned session id from the §2 session-create response. */
   readonly sessionId: string;
-  /** The worker-channel URL the register response minted. */
+  /** The worker-channel URL the §2 session-create response minted. */
   readonly wsUrl: string;
   /**
    * The control-leg observation the whole flow grounds — the fixture the
@@ -305,21 +320,41 @@ export async function driveOneSessionFlow(options: OneSessionFlowOptions): Promi
   let workerHandle: FakeWorker | undefined;
   let uiHandle: UiClient | undefined;
   try {
-    // 1. Register — the control leg reaches the local server (grounded in its own
-    //    session map) and the response IS the pinned register→worker wire.
-    const { sessionId, wsUrl } = await registerSession(server, bearer);
-    if (server.sessions.size !== 1 || !server.sessions.has(sessionId)) {
-      throw new Error("ccctl e2e: the local server did not record the registered session");
+    // 1. Environment register (§1) — the bridge registers itself; grounded in the
+    //    server's own environments record, and yields the scoped §3 work-poll token.
+    const { environmentId, workPollToken } = await registerEnvironment(server, bearer);
+    if (!server.environments.has(environmentId)) {
+      throw new Error("ccctl e2e: the local server did not record the registered environment");
     }
-    assertNoAnthropicLeak(standIn, "session registration");
+    assertNoAnthropicLeak(standIn, "environment registration");
 
-    // 2. Worker channel — the stand-in worker opens the WS at ws_url; ready confirms it.
+    // 2. Session create (§2) — a session is created; grounded in the server's own
+    //    session record, and the response IS the pinned { session_id, ws_url } wire.
+    const { sessionId, wsUrl } = await createSession(server, bearer);
+    if (server.sessions.size !== 1 || !server.sessions.has(sessionId)) {
+      throw new Error("ccctl e2e: the local server did not record the created session");
+    }
+    assertNoAnthropicLeak(standIn, "session creation");
+
+    // 3. Work poll (§3) — the bridge polls with its SCOPED token and receives the
+    //    session-dispatch work item, then acks it. The server-side ingress a create
+    //    triggers in the full build (the §2→§3 enqueue wiring) is a later item, so the
+    //    harness drives the enqueue explicitly — as it stands in for the worker/phone.
+    const dispatch: WorkItem = {
+      kind: "create_session",
+      id: "e2e-create-session",
+      payload: { session_id: sessionId },
+    };
+    const workItem = await roundTripWork(server, environmentId, workPollToken, dispatch);
+    assertNoAnthropicLeak(standIn, "work poll");
+
+    // 4. Worker channel (§4) — the stand-in worker opens the WS at ws_url; ready confirms it.
     const worker = await connectFakeWorker({ wsUrl, bearer });
     workerHandle = worker;
     await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
     assertNoAnthropicLeak(standIn, "worker-channel connect");
 
-    // 3. Phone view — subscribe over SSE, then the worker emits a transcript event
+    // 5. Phone view — subscribe over SSE, then the worker emits a transcript event
     //    and the phone views it (grounded in the phone's own SSE record).
     const ui = await connectUiClient({ server });
     uiHandle = ui;
@@ -334,7 +369,7 @@ export async function driveOneSessionFlow(options: OneSessionFlowOptions): Promi
     }
     assertNoAnthropicLeak(standIn, "SSE transcript view");
 
-    // 4. Phone steer — POST one steer; the server relays it worker-ward and the
+    // 6. Phone steer — POST one steer; the server relays it worker-ward and the
     //    worker receives it (grounded in the worker's own inbound frames).
     const ack = await ui.steer(steer);
     if (ack.status !== 202) {
@@ -359,6 +394,8 @@ export async function driveOneSessionFlow(options: OneSessionFlowOptions): Promi
     assertNoAnthropicLeak(standIn, "worker-channel steer");
 
     return {
+      environmentId,
+      workItem,
       sessionId,
       wsUrl,
       control: { leg: "control", receivedBy: "local-server", intendedHost: authority },
@@ -383,25 +420,6 @@ export async function driveOneSessionFlow(options: OneSessionFlowOptions): Promi
     }
     throw error;
   }
-}
-
-/**
- * Register a session over the real HTTP endpoint, asserting the `201` and the
- * pinned snake_case `{session_id, ws_url}` wire (#108 / ADR-001, via the shared
- * {@link assertRegisterResponseWire}), and return the session id + `ws_url`.
- */
-async function registerSession(server: CcctlServer, bearer: string): Promise<{ sessionId: string; wsUrl: string }> {
-  const { host, port } = server.address;
-  const res = await fetch(`http://${formatAuthority(host, port)}${SESSIONS_CREATE_PATH}`, {
-    method: "POST",
-    headers: { "content-type": "application/json", Authorization: `Bearer ${bearer}` },
-    body: JSON.stringify({ sessionIngressToken: "e2e-ingress-token" }),
-  });
-  if (res.status !== 201) {
-    throw new Error(`ccctl e2e: control register expected 201 from the local server, got ${res.status}`);
-  }
-  const wire = assertRegisterResponseWire(await res.text());
-  return { sessionId: wire.session_id, wsUrl: wire.ws_url };
 }
 
 /** POST one steer to `/api/command` and read the server's `{ id }` ack (best-effort on a refusal). */

@@ -14,16 +14,18 @@ import { observeInferenceLeg, startInferenceStandIn, type InferenceStandIn } fro
 import { processEventData } from "@ccctl/web-ui/src/transcript.js";
 import { describeCommand, inputCommand } from "@ccctl/web-ui/src/command.js";
 
-// Skeleton E2E for the one-session control-plane flow (issue #19, traces E2E-B-002):
-// register → server → phone view + steer, driven end-to-end against the REAL
-// @ccctl/server on loopback with a stand-in worker + phone (hermetic — no patched
-// worker, no credentials, no egress). Every "reached X" is grounded in the
-// receiver's OWN record (the server's session map; the phone's SSE log; the
-// worker's inbound frames), never a sender's self-report — the same posture the
-// inference-untouched legs hold. The flow this harness drives PRODUCES the
-// control-leg fixture that the AC-5 assertion (#18, assertInferenceUntouched) runs
-// against; the later credentialed suite swaps the stand-ins for a real worker +
-// browser and a real api.anthropic.com, and the assertion does not change.
+// Skeleton E2E for the one-session control-plane flow (issue #19, traces E2E-B-002),
+// re-pointed onto the CURRENT environments-bridge flow (#124): environment register →
+// session-create → work-poll → per-session worker channel → phone view + steer, driven
+// end-to-end against the REAL @ccctl/server on loopback with a stand-in worker + phone
+// (hermetic — no patched worker, no credentials, no egress). Every "reached X" is
+// grounded in the receiver's OWN record (the server's environments + session maps; the
+// poll body the bridge received; the phone's SSE log; the worker's inbound frames),
+// never a sender's self-report — the same posture the inference-untouched legs hold. The
+// flow this harness drives PRODUCES the control-leg fixture that the AC-5 assertion (#18,
+// assertInferenceUntouched) runs against; the later credentialed suite swaps the
+// stand-ins for a real worker + browser and a real api.anthropic.com, and the assertion
+// does not change.
 
 const ACCOUNT_BEARER = "oauth-account-secret-e2e-flow";
 const EXPECTATION = { inferenceHost: ANTHROPIC_INFERENCE_HOST } as const;
@@ -72,12 +74,26 @@ describe("ccctl e2e: one-session flow — register → server → phone view + s
       const flow = await driveOneSessionFlow({ server, bearer: ACCOUNT_BEARER, standIn, steer: steer ?? undefined });
       flows.push(flow);
 
-      // register — the local server recorded exactly the one session, keyed by the wire
-      // session_id, and the minted ws_url points back at THIS server for THAT session.
+      // environment register (§1) — the local server recorded exactly the one environment
+      // the bridge registered, keyed by the wire environment_id.
+      expect(server.environments.size).toBe(1);
+      expect(server.environments.has(flow.environmentId)).toBe(true);
+
+      // session-create (§2) — the local server recorded exactly the one session, keyed by
+      // the wire session_id, and the minted ws_url points back at THIS server for THAT
+      // session (the current /v1/sessions/{id}/ws worker channel, not the legacy path).
       expect(server.sessions.size).toBe(1);
       expect(server.sessions.has(flow.sessionId)).toBe(true);
       expect(server.sessions.get(flow.sessionId)?.status).toBe("ready");
-      expect(flow.wsUrl).toContain(flow.sessionId);
+      expect(flow.wsUrl).toContain(`/v1/sessions/${flow.sessionId}/ws`);
+
+      // work-poll (§3) — the bridge received the session-dispatch work item over the poll
+      // (grounded in the poll body it got back), correlated to the created session.
+      expect(flow.workItem).toEqual({
+        kind: "create_session",
+        id: "e2e-create-session",
+        payload: { session_id: flow.sessionId },
+      });
 
       // phone VIEW (#15) — the phone saw the worker's transcript event over SSE with the
       // monotonic Last-Event-ID, and the REAL UI decode classifies it as a transcript line.

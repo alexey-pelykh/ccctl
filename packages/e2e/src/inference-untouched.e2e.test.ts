@@ -17,9 +17,11 @@ import {
 // and billing still reach api.anthropic.com (issue #18, traces E2E-B-002).
 //
 // Real vs skeleton: the local server is the REAL @ccctl/server and the control
-// leg is a REAL register; api.anthropic.com is a loopback stand-in and the
-// inference leg is a REAL outbound connection carrying `Host: api.anthropic.com`
-// directed at it (hermetic — no patched worker, no credentials, no egress). Every
+// leg drives the REAL current environments-bridge control POSTs (environment
+// register §1 + session create §2, #124); api.anthropic.com is a loopback stand-in
+// and the inference leg is a REAL outbound connection carrying `Host:
+// api.anthropic.com` directed at it (hermetic — no patched worker, no credentials,
+// no egress). Every
 // "reached X" below is grounded in a receiver's OWN record (the server's session
 // map; the stand-in's request log), never a client's self-report. The later
 // credentialed suite swaps the stand-in + synthetic leg for a real worker and the
@@ -62,7 +64,7 @@ afterEach(async () => {
 
 describe("ccctl e2e: inference is untouched by control-channel redirection (skeleton)", () => {
   describe("Rule: session-control traffic goes to the local server", () => {
-    it("registration and worker-channel traffic reach the local server (AC-1)", async () => {
+    it("environment-register and session-create traffic reach the local server (AC-1)", async () => {
       const server = await startLocalServer();
       const standIn = await startAnthropicStandIn();
 
@@ -71,6 +73,7 @@ describe("ccctl e2e: inference is untouched by control-channel redirection (skel
       expect(control.receivedBy).toBe("local-server");
       // ...and it is NOT observed reaching api.anthropic.com.
       expect(standIn.received).toHaveLength(0);
+      expect(server.environments.size).toBe(1);
       expect(server.sessions.size).toBe(1);
     });
   });
