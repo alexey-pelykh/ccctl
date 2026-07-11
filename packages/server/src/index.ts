@@ -5,25 +5,33 @@
  * `@ccctl/server` — the local server.
  *
  * Terminates the patched Claude Code worker's native `stream-json` control
- * transport. This slice implements session registration (bridge-protocol §1): a
- * worker `POST /v1/code/sessions` is accepted, a {@link Session} is created, and
- * the response hands back the session **id** plus the **`ws_url`** the worker
- * opens its worker-channel WebSocket to.
+ * transport. This slice implements two legs of the bridge:
  *
- * The account OAuth Bearer presented on the register request (bridge-protocol
- * §4) is received and treated as a strict NON-PERSISTING pass-through — its
- * presence is required, but it is never captured into session state, never
- * logged, and never echoed. There is no downstream consumer in this slice, so
- * the credential is validated and dropped; forwarding it to `api.anthropic.com`
- * (via {@link AccountBearer.reveal}) lands with the worker-channel item.
+ *   - Session registration (bridge-protocol §1): a worker `POST /v1/code/sessions`
+ *     is accepted, a {@link Session} is created, and the response hands back the
+ *     session **id** plus the **`ws_url`** the worker opens its worker-channel to.
+ *   - The worker channel itself (bridge-protocol §2/§3): the worker then opens a
+ *     WebSocket to that `ws_url` and streams `worker_status` frames, from which the
+ *     server derives the session's `activity`. The upgrade is handled in
+ *     {@link handleWorkerChannelUpgrade}; this module only wires it onto the HTTP
+ *     server.
  *
- * Still stubs, landing in later items: the worker-channel WebSocket, the SSE
- * relay to the UI ({@link CcctlServer.broadcast}), and UI→worker command
- * dispatch ({@link CcctlServer.dispatch}).
+ * The account OAuth Bearer is presented on BOTH the register request AND the
+ * worker-channel WebSocket connect (bridge-protocol §4). On each, it is received
+ * and treated as a strict NON-PERSISTING pass-through — its presence is required,
+ * but it is never captured into session state, never logged, and never echoed: the
+ * credential is validated for receipt and dropped. Forwarding it to
+ * `api.anthropic.com` for the live session (via {@link AccountBearer.reveal}) lands
+ * with a later item.
+ *
+ * Still stubs, landing in later items: the SSE relay to the UI
+ * ({@link CcctlServer.broadcast}) and UI→worker command dispatch
+ * ({@link CcctlServer.dispatch}).
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import type { Duplex } from "node:stream";
 import {
   formatAuthority,
   SESSIONS_CREATE_PATH,
@@ -35,6 +43,8 @@ import {
   type Session,
 } from "@ccctl/core";
 import { toRegisterResponseWire } from "./register-wire.js";
+import { parseBearer } from "./bearer.js";
+import { handleWorkerChannelUpgrade } from "./worker-channel.js";
 
 // Re-export the register-response wire boundary (the snake_case DTO + mapper,
 // ADR-001 / #108) on the public surface, so a contract consumer — the e2e
@@ -75,29 +85,15 @@ export interface CcctlServer {
 /** Mutable per-server state shared with the request handler. */
 interface RegisterState {
   readonly sessions: Map<string, Session>;
+  /**
+   * The live worker-channel socket per session id. An upgraded socket is DETACHED
+   * from the HTTP server, so neither `closeIdleConnections()` nor
+   * `closeAllConnections()` manages it — the server tracks them here to enforce one
+   * channel per session and to tear them down on {@link CcctlServer.close}.
+   */
+  readonly workerChannels: Map<string, Duplex>;
   /** Provisional at construction; finalized with the resolved port once bound. */
   address: HostEndpoint;
-}
-
-/**
- * Extract the token from an `Authorization: Bearer <token>` header, or `null`
- * when the header is absent, uses a different scheme, or carries an empty token.
- * The scheme match is case-insensitive (RFC 7235); the token is trimmed.
- */
-function parseBearer(header: string | undefined): string | null {
-  if (header === undefined) {
-    return null;
-  }
-  const separator = header.indexOf(" ");
-  if (separator === -1) {
-    return null;
-  }
-  const scheme = header.slice(0, separator);
-  const token = header.slice(separator + 1).trim();
-  if (scheme.toLowerCase() !== "bearer" || token === "") {
-    return null;
-  }
-  return token;
 }
 
 /** Write a JSON body with the given status; flushes any headers already set. */
@@ -185,7 +181,16 @@ function createHandle(httpServer: Server, state: RegisterState): CcctlServer {
             resolve();
           }
         });
-        // Release idle keep-alive sockets so a quiescent server closes promptly
+        // Tear down live worker-channel sockets explicitly. A worker channel is
+        // long-lived and, once upgraded, is DETACHED from the HTTP server — so
+        // `closeIdleConnections()` (and even `closeAllConnections()`) never touch it,
+        // yet `close()` still waits on it at the socket layer. Without this, a
+        // shutdown with a live channel hangs forever. This slice drops the channel
+        // abruptly; a graceful WS close handshake is a later concern.
+        for (const socket of state.workerChannels.values()) {
+          socket.destroy();
+        }
+        // Release idle keep-alive HTTP sockets so a quiescent server closes promptly
         // instead of waiting on pooled client connections.
         httpServer.closeIdleConnections();
       });
@@ -202,6 +207,7 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
   const host = config.host ?? DEFAULT_HOST;
   const state: RegisterState = {
     sessions: new Map<string, Session>(),
+    workerChannels: new Map<string, Duplex>(),
     address: { host, port: config.port },
   };
 
@@ -212,6 +218,18 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
       if (!res.headersSent) {
         writeError(res, 500, "ccctl: internal server error");
       }
+    }
+  });
+
+  // The worker opens its worker-channel WebSocket to the minted `ws_url`, which
+  // points back at this server (bridge-protocol §2). Node surfaces that as an
+  // `upgrade` event; `handleWorkerChannelUpgrade` fails closed on anything that is
+  // not a well-formed upgrade for a known session carrying the account Bearer.
+  httpServer.on("upgrade", (req, socket, head) => {
+    try {
+      handleWorkerChannelUpgrade(req, socket, head, state);
+    } catch {
+      socket.destroy();
     }
   });
 

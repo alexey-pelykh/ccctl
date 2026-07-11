@@ -10,8 +10,13 @@ types.
 
 `startServer` accepts session registration today: a worker
 `POST /v1/code/sessions` (bridge-protocol §1) creates a session and hands back
-its **id** plus the **`ws_url`** the worker opens its channel to. The account
-Bearer on that request (§4) is received and treated as a strict non-persisting
-pass-through — never stored on the session, never logged. One session only at
-this slice. The worker-channel WebSocket, the SSE relay (`broadcast`), and
-UI→worker `dispatch` remain typed stubs, landing in later items.
+its **id** plus the **`ws_url`** the worker opens its channel to. The worker then
+opens a WebSocket to that `ws_url` (bridge-protocol §2) — the ccctl server is the
+WebSocket server — and streams `worker_status` frames (§3), from which the server
+derives the session's live `activity` (running / requires_action / idle) via the
+`@ccctl/core` model. The account Bearer on both the register request and the
+worker-channel connect (§4) is received and treated as a strict non-persisting
+pass-through — required, but never stored on the session, never logged. One
+session only at this slice; the worker channel just reads and surfaces the raw
+state (fuller classification and the idle timer land in later items). The SSE
+relay (`broadcast`) and UI→worker `dispatch` remain typed stubs.
