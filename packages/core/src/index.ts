@@ -13,9 +13,11 @@
  * and the streaming {@link ControlFrameDecoder}) is implemented and tested; the
  * network primitives and session model further down are still skeletons whose
  * shapes capture the intended contract, not yet a working implementation. The
- * bridge-protocol face (register → worker channel, `worker_status` frames, and
- * the non-persisting account Bearer) likewise models the contract at the type
- * level — the shapes and pure derivations, no transport I/O.
+ * bridge-protocol face (the environments-bridge flow — environment register →
+ * session create → work poll → per-session worker channel — its two credential
+ * classes, and the `worker_status` frames) likewise models the contract at the
+ * type level: the shapes, the version pin, the fail-closed drift guards, and the
+ * pure derivations — no transport I/O.
  */
 
 // ---------------------------------------------------------------------------
@@ -266,8 +268,8 @@ export type SessionStatus = "connecting" | "ready" | "busy" | "closed" | "errore
  */
 export interface Session {
   /**
-   * Session identity — the **session id from the register response**
-   * ({@link RegisterResponse.sessionId}, contract §1), server-assigned and
+   * Session identity — the **session id from the session-create response**
+   * ({@link SessionCreateResponse.sessionId}, contract §2), server-assigned and
    * distinct from any worker-side id. {@link sessionFromRegister} keys a session
    * on it.
    */
@@ -302,44 +304,106 @@ export function createSession(id: string, now: number = Date.now()): Session {
 }
 
 // ---------------------------------------------------------------------------
-// bridge protocol — register → worker channel
+// bridge protocol — environments-bridge flow
 //
-// ccctl interoperates with Claude Code's native Agent-SDK stream-json control
-// transport (the `--sdk-url` steering channel). The local server terminates the
-// transport for a session; the flow it models is:
+// ccctl interoperates with the current Claude Code build's native control
+// transport. The local server terminates the transport; the flow it models has
+// four legs:
 //
-//   1. Register — the worker issues `POST /v1/code/sessions`; the response
-//      carries a session id and a `ws_url` (the worker-channel URL).
-//   2. Worker channel — the worker opens a WebSocket to `ws_url` speaking
-//      stream-json (the NDJSON `ControlFrame`s above); transcript events flow
-//      server-ward and steer input worker-ward over the one channel.
-//   3. `worker_status` frames on that channel drive per-session state.
+//   §1. Environment register — `POST /v1/environments/bridge` with the account
+//       Bearer; the body carries the machine / directory / branch / repository
+//       and a max-sessions cap; the response is an environment id.
+//   §2. Session create — `POST /v1/sessions` with the account Bearer; the body
+//       carries the session context (model, cwd), a source, and a permission
+//       mode; the response is `{ session_id, ws_url }`.
+//   §3. Work poll — `GET /v1/environments/{env}/work/poll`, long-polled with a
+//       SCOPED per-environment token (NOT the account Bearer), delivering work
+//       items (`create_session` / `resume_session` / `user_turn` / `steer`),
+//       each acked (`…/work/{id}/ack`) or stopped (`…/work/{id}/stop`).
+//   §4. Per-session worker channel — a WebSocket per session speaking
+//       stream-json (the NDJSON `ControlFrame`s above); the turn (prompt →
+//       inference) and steer travel over it, and `worker_status` frames flow
+//       server-ward to drive per-session state.
 //
 // This is the contract FACE only: the shapes plus pure derivations. Transport
-// I/O (the fetch, the WebSocket client) is the server's job and is not here.
+// I/O (the fetch, the WebSocket client, the long-poll loop) is the server's job
+// and is not here. It replaces the earlier single-step `POST /v1/code/sessions`
+// register model (#6): as #6/#10 anticipated, the path is build-specific — the
+// versioned paths below are PINNED, and unknown shapes carried over them fail
+// closed on drift (see {@link workItemFromValue}, {@link isPermissionMode}).
 // ---------------------------------------------------------------------------
 
+// --- version pin & pinned paths ---
+
 /**
- * The build-specific session-create path, pinned to a concrete API version.
- * Pinning makes a drift in the worker's transport a loud, fail-closed mismatch
- * rather than a silent wrong-endpoint call; bumping it is a deliberate,
- * reviewed change.
+ * The pinned bridge-protocol API version every path below lives under. Pinning
+ * makes a worker-transport drift a loud, fail-closed mismatch rather than a
+ * silent wrong-endpoint call; bumping it is a deliberate, reviewed change.
+ */
+export const BRIDGE_PROTOCOL_API_VERSION = "v1";
+
+/** The environments collection base — the root of §1 and §3. Private: consumers use the builders below. */
+const ENVIRONMENTS_PATH = `/${BRIDGE_PROTOCOL_API_VERSION}/environments`;
+
+/** Environment-register path (§1): `POST` with the account Bearer → an environment id. */
+export const ENVIRONMENTS_BRIDGE_PATH = `${ENVIRONMENTS_PATH}/bridge`;
+
+/** Session-create path (§2): `POST` with the account Bearer → `{ session_id, ws_url }`. */
+export const SESSIONS_PATH = `/${BRIDGE_PROTOCOL_API_VERSION}/sessions`;
+
+/** The per-environment work base (`/v1/environments/{env}/work`), parent of poll / ack / stop. */
+function environmentWorkPath(environmentId: string): string {
+  return `${ENVIRONMENTS_PATH}/${environmentId}/work`;
+}
+
+/**
+ * Work-poll path for an environment (§3): long-polled with the scoped
+ * per-environment token. The environment id is path-interpolated, so this is a
+ * builder rather than a constant.
+ */
+export function environmentWorkPollPath(environmentId: string): string {
+  return `${environmentWorkPath(environmentId)}/poll`;
+}
+
+/** Ack path for one work item (§3): `POST` with the scoped per-environment token. */
+export function workAckPath(environmentId: string, workId: string): string {
+  return `${environmentWorkPath(environmentId)}/${workId}/ack`;
+}
+
+/** Stop path for one work item (§3): `POST` with the scoped per-environment token. */
+export function workStopPath(environmentId: string, workId: string): string {
+  return `${environmentWorkPath(environmentId)}/${workId}/stop`;
+}
+
+/**
+ * The previous build's single-step register path (`POST /v1/code/sessions`, #6),
+ * retained ONLY because the not-yet-realigned `@ccctl/server` register handler
+ * and the `@ccctl/e2e` harness still resolve it. The current flow splits that
+ * step into environment-register ({@link ENVIRONMENTS_BRIDGE_PATH}) and
+ * session-create ({@link SESSIONS_PATH}); this constant is removed once those
+ * consumers realign (their own W2 items). New code targets {@link SESSIONS_PATH}.
  */
 export const SESSIONS_CREATE_PATH = "/v1/code/sessions";
 
 // --- credentials ---
 //
-// Two credentials ride the bridge, with opposite persistence rules:
+// Two credential CLASSES ride the bridge, on opposite legs and with opposite
+// privilege — modelling both is AC-3:
 //
-//   - The account OAuth Bearer (`Authorization: Bearer …`) is presented on BOTH
-//     the register request and the worker-WebSocket connect. It is a strict
+//   - The account OAuth Bearer (`Authorization: Bearer …`) authorizes the two
+//     POSTs that reach Anthropic — environment register (§1) and session create
+//     (§2) — and the per-session worker WebSocket (§4). It is a strict
 //     NON-PERSISTING pass-through — forwarded only to api.anthropic.com for the
 //     live session, and NEVER logged, persisted, or replayed. Modelled as an
 //     opaque `AccountBearer` so a leak into a log or snapshot is a *type* error
 //     (it is neither a string nor a `JsonValue`), backed by runtime redaction.
-//   - A scoped session-ingress token rides as a payload field and does NOT
-//     replace the Bearer. Being scoped, it is an ordinary branded string that
-//     legitimately travels inside the JSON body.
+//   - The scoped per-environment token authorizes the work-poll leg (§3) and its
+//     ack/stop — and ONLY that leg. It deliberately does NOT ride §1/§2/§4, and
+//     it is NEVER the account Bearer: presenting a distinct, environment-scoped
+//     credential on work-poll IS the Bearer boundary (#60). Being scoped (its
+//     leak compromises one environment's work queue, not the account), it is an
+//     ordinary branded string that may travel on the wire — but a request
+//     carrying it is projected to a token-free descriptor before it is logged.
 
 /**
  * Opaque holder for the account OAuth Bearer. By construction it cannot leak
@@ -385,84 +449,307 @@ export class AccountBearer {
   }
 }
 
-/** Nominal brand for {@link SessionIngressToken}. */
-declare const sessionIngressTokenBrand: unique symbol;
+/** Nominal brand for {@link EnvironmentToken}. */
+declare const environmentTokenBrand: unique symbol;
 
 /**
- * A scoped session-ingress token. It rides as a field in the register payload
- * and does NOT replace the {@link AccountBearer}. Branded so it cannot be
- * confused with an arbitrary string, yet still a `string` (hence a
- * {@link JsonValue}) because it legitimately travels inside the JSON body.
+ * A scoped per-environment token — the credential the work-poll leg (§3) and its
+ * ack/stop present, in place of (never alongside) the {@link AccountBearer}.
+ * Branded so it cannot be confused with an arbitrary string, yet still a
+ * `string` (hence a {@link JsonValue}) because, being environment-scoped, it may
+ * legitimately travel on the wire. Its provisioning is the transport's concern
+ * and out of this face's scope; here it is the typed credential class the §3
+ * shapes require, and its type — distinct from {@link AccountBearer} — is what
+ * makes "work-poll is not authorized by the account Bearer" a compile-time fact.
  */
-export type SessionIngressToken = string & {
-  readonly [sessionIngressTokenBrand]: never;
+export type EnvironmentToken = string & {
+  readonly [environmentTokenBrand]: never;
 };
 
-/** Tag a raw string as a {@link SessionIngressToken}. */
-export function sessionIngressToken(value: string): SessionIngressToken {
-  return value as SessionIngressToken;
+/** Tag a raw string as an {@link EnvironmentToken}. */
+export function environmentToken(value: string): EnvironmentToken {
+  return value as EnvironmentToken;
 }
 
-// --- register (session create) ---
+// --- §1 environment register ---
 
 /**
- * The JSON body of a {@link RegisterRequest}: everything that legitimately
- * travels in the `POST /v1/code/sessions` payload. A {@link JsonObject} by
- * construction — it carries the scoped {@link SessionIngressToken}, never the
- * {@link AccountBearer} (which rides in the `Authorization` header, modelled as
- * the sibling field on {@link RegisterRequest}). This is precisely the
+ * The JSON body of an {@link EnvironmentRegisterRequest}: the environment ccctl
+ * is bridging — its machine, working directory, branch, repository — plus the
+ * cap on concurrent sessions the environment will accept. A {@link JsonObject}
+ * by construction; it carries NO credential (the account Bearer rides the
+ * sibling `authorization` field, structurally outside the body), so it is the
  * loggable/persistable projection of a register: the Bearer is absent because
  * the body has no field able to hold it.
  */
-export interface RegisterRequestBody {
-  readonly sessionIngressToken: SessionIngressToken;
+export interface EnvironmentRegisterRequestBody {
+  /** Stable identifier for the machine ccctl runs on. */
+  readonly machineId: string;
+  /** Absolute working directory the environment is rooted at. */
+  readonly directory: string;
+  /** Git branch checked out in {@link EnvironmentRegisterRequestBody.directory}. */
+  readonly branch: string;
+  /** Repository the environment is working in (e.g. `owner/repo`). */
+  readonly repository: string;
+  /** Upper bound on concurrent sessions this environment will accept. */
+  readonly maxSessions: number;
 }
 
 /**
- * A `POST /v1/code/sessions` request. The account Bearer sits in
+ * A `POST /v1/environments/bridge` request (§1). The account Bearer sits in
  * `authorization` (the `Authorization: Bearer …` header) — structurally OUTSIDE
- * the JSON {@link RegisterRequestBody}, so it can never be serialized as part
- * of the payload. Use {@link loggableRegisterRequest} for the Bearer-free view.
+ * the JSON {@link EnvironmentRegisterRequestBody}, so it can never be serialized
+ * as part of the payload. Use {@link loggableEnvironmentRegisterRequest} for the
+ * Bearer-free view.
  */
-export interface RegisterRequest {
+export interface EnvironmentRegisterRequest {
   /** `Authorization: Bearer …` — non-persisting pass-through, never in `body`. */
   readonly authorization: AccountBearer;
-  /** The JSON payload (carries the scoped session-ingress token). */
-  readonly body: RegisterRequestBody;
+  /** The JSON payload (machine/dir/branch/repo + max-sessions cap). */
+  readonly body: EnvironmentRegisterRequestBody;
 }
 
 /**
- * The `POST /v1/code/sessions` response: the newly-created session id and the
- * `ws_url` the worker opens its channel to. A {@link JsonObject} carrying no
- * credentials, so it is safe to persist and log.
+ * The `POST /v1/environments/bridge` response (§1): the server-assigned
+ * environment id later interpolated into the work-poll path
+ * ({@link environmentWorkPollPath}). A {@link JsonObject} carrying no credential,
+ * so it is safe to persist and log.
  */
-export interface RegisterResponse {
+export interface EnvironmentRegisterResponse {
+  /** Server-assigned environment identifier. */
+  readonly environmentId: string;
+}
+
+/**
+ * Project an {@link EnvironmentRegisterRequest} to its Bearer-free, loggable
+ * view — its JSON body. Because {@link EnvironmentRegisterRequestBody} has no
+ * field able to hold an {@link AccountBearer}, this IS the "omit by
+ * construction" guarantee (#60): a register cannot be routed through a log
+ * without dropping the Bearer.
+ */
+export function loggableEnvironmentRegisterRequest(
+  request: EnvironmentRegisterRequest,
+): EnvironmentRegisterRequestBody {
+  return request.body;
+}
+
+// --- §2 session create ---
+
+/**
+ * The Claude Code permission modes a session can be created under. Pinned to the
+ * current build's set ({@link PERMISSION_MODES}); an unrecognized mode fails
+ * closed via {@link isPermissionMode} rather than being silently accepted
+ * (drift), mirroring the control-frame codec's discriminant validation.
+ */
+export type PermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan";
+
+/** The pinned {@link PermissionMode} set, in one place, for the guard and tests. */
+export const PERMISSION_MODES: readonly PermissionMode[] = ["default", "acceptEdits", "bypassPermissions", "plan"];
+
+/** Runtime guard for {@link PermissionMode} — fails closed on an unknown mode (drift). */
+export function isPermissionMode(value: unknown): value is PermissionMode {
+  return typeof value === "string" && (PERMISSION_MODES as readonly string[]).includes(value);
+}
+
+/** The session context a create carries: which model, and the working directory. */
+export interface SessionContext {
+  /** Model the session runs (a Claude model id). */
+  readonly model: string;
+  /** Working directory the session is rooted at. */
+  readonly cwd: string;
+}
+
+/**
+ * The JSON body of a {@link SessionCreateRequest}: the session context, the
+ * source that initiated the session, and the permission mode it runs under. A
+ * {@link JsonObject} by construction, carrying NO credential (the account Bearer
+ * rides the sibling `authorization` field) — the loggable projection of a create.
+ */
+export interface SessionCreateRequestBody {
+  /** The model + cwd the session runs with. */
+  readonly context: SessionContext;
+  /** What initiated the session (e.g. a UI action, a dequeued work item). */
+  readonly source: string;
+  /** Permission mode the session runs under. */
+  readonly permissionMode: PermissionMode;
+}
+
+/**
+ * A `POST /v1/sessions` request (§2). The account Bearer sits in `authorization`,
+ * structurally OUTSIDE the JSON {@link SessionCreateRequestBody}, so it can never
+ * be serialized as part of the payload. Use {@link loggableSessionCreateRequest}
+ * for the Bearer-free view.
+ */
+export interface SessionCreateRequest {
+  /** `Authorization: Bearer …` — non-persisting pass-through, never in `body`. */
+  readonly authorization: AccountBearer;
+  /** The JSON payload (session context + source + permission mode). */
+  readonly body: SessionCreateRequestBody;
+}
+
+/**
+ * The `POST /v1/sessions` response (§2): the newly-created session id and the
+ * `ws_url` the per-session worker channel (§4) is opened to. A {@link JsonObject}
+ * carrying no credential, so it is safe to persist and log.
+ */
+export interface SessionCreateResponse {
   /** Server-assigned session identifier. */
   readonly sessionId: string;
-  /** The worker-channel WebSocket URL (`ws_url`). */
+  /** The per-session worker-channel WebSocket URL (`ws_url`). */
   readonly wsUrl: string;
 }
 
 /**
- * Project a {@link RegisterRequest} to its Bearer-free, loggable view — its JSON
- * body. Because {@link RegisterRequestBody} has no field able to hold an
- * {@link AccountBearer}, this IS the "omit by construction" guarantee: a
- * register cannot be routed through a log without dropping the Bearer.
+ * The register response, retained as an alias of {@link SessionCreateResponse}
+ * for the not-yet-realigned `@ccctl/server` / `@ccctl/e2e` consumers: the current
+ * flow's session-create (§2) returns the same `{ sessionId, wsUrl }` shape the
+ * previous single-step register did (#6). New code names
+ * {@link SessionCreateResponse}; this alias is removed once those consumers
+ * realign (their own W2 items).
  */
-export function loggableRegisterRequest(request: RegisterRequest): RegisterRequestBody {
+export type RegisterResponse = SessionCreateResponse;
+
+/** Project a {@link SessionCreateRequest} to its Bearer-free, loggable JSON body. */
+export function loggableSessionCreateRequest(request: SessionCreateRequest): SessionCreateRequestBody {
   return request.body;
 }
 
-// --- worker channel ---
+// --- §3 work poll ---
 
 /**
- * Parameters to open the worker-channel WebSocket. The {@link AccountBearer} is
- * presented AGAIN here (`Authorization: Bearer …` on the WS connect), modelled
- * the same opaque way; {@link loggableWorkerChannelConnect} yields the
- * Bearer-free view for diagnostics.
+ * The kinds of work item the work-poll leg (§3) delivers: start a new session,
+ * resume an existing one, deliver a user turn, or steer a running one. Pinned to
+ * the current build's set ({@link WORK_ITEM_KINDS}); an unknown kind fails closed
+ * via {@link isWorkItemKind} / {@link workItemFromValue} rather than being
+ * dispatched (drift).
+ */
+export type WorkItemKind = "create_session" | "resume_session" | "user_turn" | "steer";
+
+/** The pinned {@link WorkItemKind} set, in one place, for the guard and tests. */
+export const WORK_ITEM_KINDS: readonly WorkItemKind[] = ["create_session", "resume_session", "user_turn", "steer"];
+
+/** Runtime guard for {@link WorkItemKind} — fails closed on an unknown kind (drift). */
+export function isWorkItemKind(value: unknown): value is WorkItemKind {
+  return typeof value === "string" && (WORK_ITEM_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * One work item delivered by a poll (§3), discriminated on {@link WorkItemKind}.
+ * `id` is the handle the ack/stop paths ({@link workAckPath} / {@link workStopPath})
+ * address; `payload` is the kind-specific body, validated per-kind downstream —
+ * the framing layer here pins only the discriminant, exactly as the control-frame
+ * codec above validates a frame's `type` and leaves the payload to consumers.
+ * Modelling the four kinds as a union makes a dispatcher's `switch` exhaustive:
+ * adding a fifth kind is a compile error until every consumer handles it.
+ */
+export interface CreateSessionWork {
+  readonly kind: "create_session";
+  readonly id: string;
+  readonly payload?: JsonObject;
+}
+/** A poll item asking to resume an existing session (§3). */
+export interface ResumeSessionWork {
+  readonly kind: "resume_session";
+  readonly id: string;
+  readonly payload?: JsonObject;
+}
+/** A poll item delivering a user turn to a session (§3). */
+export interface UserTurnWork {
+  readonly kind: "user_turn";
+  readonly id: string;
+  readonly payload?: JsonObject;
+}
+/** A poll item steering a running session (§3). */
+export interface SteerWork {
+  readonly kind: "steer";
+  readonly id: string;
+  readonly payload?: JsonObject;
+}
+
+/** Any item the work-poll leg (§3) can deliver. */
+export type WorkItem = CreateSessionWork | ResumeSessionWork | UserTurnWork | SteerWork;
+
+/**
+ * Parse an arbitrary decoded value into a {@link WorkItem}, or `null` if it is
+ * not a well-formed one. Defensive/fail-closed over a value off the wire: a
+ * missing or non-string `id`, an unknown `kind` (drift), or a `payload` that is
+ * present but not a JSON object all yield `null` rather than a half-typed item.
+ * The single fail-closed seam for §3 — mirroring {@link decodeControlFrame}'s
+ * discriminant-only validation — so a drifted work item cannot be dispatched.
+ */
+export function workItemFromValue(value: unknown): WorkItem | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const { id, kind, payload } = value as { id?: unknown; kind?: unknown; payload?: unknown };
+  if (typeof id !== "string" || !isWorkItemKind(kind)) {
+    return null;
+  }
+  if (payload !== undefined && (typeof payload !== "object" || payload === null || Array.isArray(payload))) {
+    return null;
+  }
+  return payload === undefined ? { kind, id } : { kind, id, payload: payload as JsonObject };
+}
+
+/**
+ * A work-poll request (§3): the scoped {@link EnvironmentToken} (NOT the account
+ * Bearer) authorizing the long-poll on `environmentId`. {@link loggableWorkPoll}
+ * projects it to a token-free descriptor before it reaches a log — the scoped
+ * token is dropped by projection rather than omitted by construction (the
+ * account-Bearer discipline it deliberately contrasts with, #60).
+ */
+export interface WorkPollRequest {
+  /** The environment being polled (from {@link EnvironmentRegisterResponse.environmentId}). */
+  readonly environmentId: string;
+  /** Scoped per-environment credential — never the account Bearer (§3, Bearer boundary #60). */
+  readonly authorization: EnvironmentToken;
+}
+
+/**
+ * A work item ack/stop (§3): scoped-token-authorized, addressing one work item by
+ * id (the target of {@link workAckPath} / {@link workStopPath}).
+ */
+export interface WorkItemAction {
+  /** The environment the work item belongs to. */
+  readonly environmentId: string;
+  /** The {@link WorkItem.id} being acked or stopped. */
+  readonly workId: string;
+  /** Scoped per-environment credential — never the account Bearer. */
+  readonly authorization: EnvironmentToken;
+}
+
+/** The token-free, loggable descriptor of a {@link WorkPollRequest}. */
+export interface WorkPollDescriptor {
+  readonly environmentId: string;
+}
+
+/** The token-free, loggable descriptor of a {@link WorkItemAction}. */
+export interface WorkItemActionDescriptor {
+  readonly environmentId: string;
+  readonly workId: string;
+}
+
+/** Project a {@link WorkPollRequest} to its scoped-token-free, loggable descriptor. */
+export function loggableWorkPoll(request: WorkPollRequest): WorkPollDescriptor {
+  return { environmentId: request.environmentId };
+}
+
+/** Project a {@link WorkItemAction} to its scoped-token-free, loggable descriptor. */
+export function loggableWorkItemAction(action: WorkItemAction): WorkItemActionDescriptor {
+  return { environmentId: action.environmentId, workId: action.workId };
+}
+
+// --- §4 per-session worker channel ---
+
+/**
+ * Parameters to open the per-session worker-channel WebSocket (§4). The `wsUrl`
+ * comes from {@link SessionCreateResponse.wsUrl}; the {@link AccountBearer} is
+ * presented on the WS connect (`Authorization: Bearer …`), the same
+ * non-persisting account credential that reached §1/§2, modelled the same opaque
+ * way; {@link loggableWorkerChannelConnect} yields the Bearer-free view.
  */
 export interface WorkerChannelConnect {
-  /** The `ws_url` from {@link RegisterResponse.wsUrl}. */
+  /** The `ws_url` from {@link SessionCreateResponse.wsUrl}. */
   readonly wsUrl: string;
   /** `Authorization: Bearer …` — the same non-persisting account credential. */
   readonly authorization: AccountBearer;
@@ -640,9 +927,12 @@ export function sessionLiveness(
 }
 
 /**
- * Create a session keyed on the **register-response session id** (contract §1):
- * identity is {@link RegisterResponse.sessionId}, never a worker-side id. The
- * explicit, single tie from a register response to {@link createSession}.
+ * Create a session keyed on the **session-create response session id** (contract
+ * §2): identity is {@link SessionCreateResponse.sessionId}, never a worker-side
+ * id. The explicit, single tie from a session-create response to
+ * {@link createSession}. (`response` is typed {@link RegisterResponse}, the
+ * retained alias of {@link SessionCreateResponse}, so the not-yet-realigned
+ * `@ccctl/server` caller keeps compiling.)
  */
 export function sessionFromRegister(response: RegisterResponse, now: number = Date.now()): Session {
   return createSession(response.sessionId, now);
@@ -707,15 +997,23 @@ type IsJson<T> = [T] extends [JsonValue]
  * The compile-time credential-omission contract, exported so it has a referent
  * (and is therefore evaluated, not dropped as unused). Each element is a proof:
  * the account {@link AccountBearer} is NOT JSON — so a leak into a log/snapshot
- * is a type error — while {@link RegisterResponse}, {@link RegisterRequestBody},
- * {@link LoggableWorkerChannelConnect}, the {@link SessionActivity} derived from
- * a `worker_status` frame, and the {@link Session} snapshot ARE JSON, provably
- * free of the credential.
+ * is a type error (#60) — while the loggable §1/§2 request bodies and responses,
+ * the §3 token-free descriptors, the §4 loggable connect, the
+ * {@link SessionActivity} derived from a `worker_status` frame, and the
+ * {@link Session} snapshot ARE JSON, provably free of the account credential.
+ * (The scoped {@link EnvironmentToken} is a branded string that legitimately
+ * travels on the wire, so it is omitted by PROJECTION — {@link loggableWorkPoll}
+ * to the token-free {@link WorkPollDescriptor}, whose JSON-safety is proven here
+ * — unlike the account Bearer, which is omitted by CONSTRUCTION.)
  */
 export type BridgeCredentialJsonProofs = [
   Assert<IsJson<AccountBearer> extends true ? false : true>,
-  Assert<IsJson<RegisterResponse>>,
-  Assert<IsJson<RegisterRequestBody>>,
+  Assert<IsJson<EnvironmentRegisterRequestBody>>,
+  Assert<IsJson<EnvironmentRegisterResponse>>,
+  Assert<IsJson<SessionCreateRequestBody>>,
+  Assert<IsJson<SessionCreateResponse>>,
+  Assert<IsJson<WorkPollDescriptor>>,
+  Assert<IsJson<WorkItemActionDescriptor>>,
   Assert<IsJson<LoggableWorkerChannelConnect>>,
   Assert<IsJson<SessionActivity>>,
   Assert<IsJson<Session>>,
