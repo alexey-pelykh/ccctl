@@ -24,9 +24,11 @@
  * `api.anthropic.com` for the live session (via {@link AccountBearer.reveal}) lands
  * with a later item.
  *
- * Still stubs, landing in later items: the SSE relay to the UI
- * ({@link CcctlServer.broadcast}) and UI→worker command dispatch
- * ({@link CcctlServer.dispatch}).
+ * UI→worker steer dispatch ({@link CcctlServer.dispatch}) relays one
+ * `control_request` worker-ward over the same worker channel (bridge-protocol §2);
+ * the codec (`@ccctl/core`'s control-frame encoder) and the WebSocket framing are
+ * reused, never re-implemented. Still a stub, landing in a later item: the SSE relay
+ * to the UI ({@link CcctlServer.broadcast}).
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -44,7 +46,7 @@ import {
 } from "@ccctl/core";
 import { toRegisterResponseWire } from "./register-wire.js";
 import { parseBearer } from "./bearer.js";
-import { handleWorkerChannelUpgrade } from "./worker-channel.js";
+import { dispatchToWorkerChannel, handleWorkerChannelUpgrade } from "./worker-channel.js";
 
 // Re-export the register-response wire boundary (the snake_case DTO + mapper,
 // ADR-001 / #108) on the public surface, so a contract consumer — the e2e
@@ -76,7 +78,11 @@ export interface CcctlServer {
   readonly sessions: ReadonlyMap<string, Session>;
   /** Forward a worker control event to all subscribed UI clients (SSE). */
   broadcast(sessionId: string, event: ControlEvent): void;
-  /** Re-frame an inbound UI command as a control request for the worker. */
+  /**
+   * Relay one UI-issued steer to the worker as a control request written over the
+   * session's worker-channel WebSocket (bridge-protocol §2). Throws if the session
+   * has no live worker channel.
+   */
   dispatch(sessionId: string, request: ControlRequest): void;
   /** Stop accepting connections and release the port. */
   close(): Promise<void>;
@@ -169,8 +175,8 @@ function createHandle(httpServer: Server, state: RegisterState): CcctlServer {
     broadcast(_sessionId: string, _event: ControlEvent): void {
       throw new Error("ccctl: broadcast (SSE relay to UI) is not implemented yet");
     },
-    dispatch(_sessionId: string, _request: ControlRequest): void {
-      throw new Error("ccctl: dispatch (UI command to worker) is not implemented yet");
+    dispatch(sessionId: string, request: ControlRequest): void {
+      dispatchToWorkerChannel(state, sessionId, request);
     },
     close(): Promise<void> {
       return new Promise<void>((resolve, reject) => {

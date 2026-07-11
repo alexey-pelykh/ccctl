@@ -114,7 +114,26 @@ describe("encodeWsFrame / closeFramePayload", () => {
     expect(frame.subarray(2).toString("utf8")).toBe("pong");
   });
 
-  it("refuses a control payload that needs an extended length", () => {
-    expect(() => encodeWsFrame(WsOpcode.Pong, Buffer.alloc(126))).toThrow(WsProtocolError);
+  it("encodes a 16-bit extended-length text frame at the 126-byte boundary", () => {
+    const payload = Buffer.alloc(126, 0x61); // 126 'a's — the smallest 16-bit-length payload.
+    const frame = encodeWsFrame(WsOpcode.Text, payload);
+    // FIN+text (0x81), the 126 marker (0x7e, no mask bit), then the 16-bit length 0x007e.
+    expect([...frame.subarray(0, 4)]).toEqual([0x81, 0x7e, 0x00, 0x7e]);
+    expect(frame.subarray(4)).toEqual(payload);
+  });
+
+  it("encodes the 16-bit length ceiling (0xffff)", () => {
+    const payload = Buffer.alloc(0xffff, 0x62);
+    const frame = encodeWsFrame(WsOpcode.Text, payload);
+    expect([...frame.subarray(0, 4)]).toEqual([0x81, 0x7e, 0xff, 0xff]);
+    expect(frame.length).toBe(4 + 0xffff);
+  });
+
+  it("encodes a 64-bit extended-length text frame one past the 16-bit ceiling", () => {
+    const payload = Buffer.alloc(0x10000, 0x63); // 65536 bytes — forces the 64-bit form.
+    const frame = encodeWsFrame(WsOpcode.Text, payload);
+    // FIN+text (0x81), the 127 marker (0x7f, no mask bit), then the 64-bit length 0x0000000000010000.
+    expect([...frame.subarray(0, 10)]).toEqual([0x81, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]);
+    expect(frame.subarray(10)).toEqual(payload);
   });
 });

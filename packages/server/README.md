@@ -18,5 +18,7 @@ derives the session's live `activity` (running / requires_action / idle) via the
 worker-channel connect (§4) is received and treated as a strict non-persisting
 pass-through — required, but never stored on the session, never logged. One
 session only at this slice; the worker channel just reads and surfaces the raw
-state (fuller classification and the idle timer land in later items). The SSE
-relay (`broadcast`) and UI→worker `dispatch` remain typed stubs.
+state (fuller classification and the idle timer land in later items). UI→worker
+`dispatch` relays one steer worker-ward over that same worker channel, re-framed as
+a `control_request` (§2); the SSE relay (`broadcast`) to the UI remains a typed
+stub, as does the HTTP/`fetch` ingress that will call `dispatch` from the browser.

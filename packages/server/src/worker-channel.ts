@@ -42,7 +42,9 @@ import type { Duplex } from "node:stream";
 import {
   applyWorkerStatusFrame,
   ControlFrameDecoder,
+  encodeControlFrame,
   SESSIONS_CREATE_PATH,
+  type ControlRequest,
   type Session,
   type SessionStatus,
 } from "@ccctl/core";
@@ -250,6 +252,30 @@ export function handleWorkerChannelUpgrade(
   if (head.length > 0) {
     onData(head);
   }
+}
+
+/**
+ * Relay one steer message worker-ward over an open worker channel — the write
+ * counterpart to the read path above (bridge-protocol §2: "steer input flows
+ * worker-ward over this one channel"). Looks up the session's live worker-channel
+ * socket, serializes the {@link ControlRequest} to its NDJSON line with
+ * `@ccctl/core`'s {@link encodeControlFrame} — the SAME codec the read path decodes,
+ * so the framing stays symmetric and is never re-implemented — and writes it as a
+ * single UNMASKED WebSocket text frame ({@link encodeWsFrame}, server→client per
+ * RFC 6455 §5.1). The trailing newline `encodeControlFrame` appends is the NDJSON
+ * delimiter that lets the worker's own decoder emit the line without buffering.
+ *
+ * Fails closed: a session with no live channel (never connected, or already reaped)
+ * throws rather than silently dropping the steer — {@link WorkerChannelState.workerChannels}
+ * is the source of truth for a live channel, so its absence IS "not connected". The
+ * UI-facing caller (`CcctlServer.dispatch`) surfaces that to the UI.
+ */
+export function dispatchToWorkerChannel(state: WorkerChannelState, sessionId: string, request: ControlRequest): void {
+  const socket = state.workerChannels.get(sessionId);
+  if (socket === undefined) {
+    throw new Error(`ccctl: no live worker channel for session ${sessionId}`);
+  }
+  socket.write(encodeWsFrame(WsOpcode.Text, Buffer.from(encodeControlFrame(request), "utf8")));
 }
 
 /**
