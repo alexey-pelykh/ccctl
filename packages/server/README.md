@@ -20,5 +20,14 @@ pass-through — required, but never stored on the session, never logged. One
 session only at this slice; the worker channel just reads and surfaces the raw
 state (fuller classification and the idle timer land in later items). UI→worker
 `dispatch` relays one steer worker-ward over that same worker channel, re-framed as
-a `control_request` (§2); the SSE relay (`broadcast`) to the UI remains a typed
-stub, as does the HTTP/`fetch` ingress that will call `dispatch` from the browser.
+a `control_request` (§2).
+
+The browser-facing transport pair relays that one session to the UI. Downstream,
+every inbound `control_event` fans out to subscribed clients over **Server-Sent
+Events** at `GET /api/events` (`broadcast`), each event carrying a
+`Last-Event-ID`-compatible id so a reconnecting client reconciles the gap it
+missed. Upstream, the browser steers back with a `fetch` **POST** to
+`/api/command`, which the server re-frames as a `control_request` and `dispatch`es
+onto the worker channel. Browser-facing auth — the deferred local-server credential
+boundary — is a later item; the loopback UI ingress is unauthenticated at this
+slice (the account Bearer is the worker's credential, never the browser's).
