@@ -145,7 +145,11 @@ importers:
         specifier: ^4.1.9
         version: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(vite@8.1.4(@types/node@25.9.5)(esbuild@0.28.1)(tsx@4.23.0))
 
-  packages/web-ui: {}
+  packages/web-ui:
+    devDependencies:
+      vitest:
+        specifier: ^4.1.9
+        version: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(vite@8.1.4(@types/node@25.9.5)(esbuild@0.28.1)(tsx@4.23.0))
 
 packages:
 
