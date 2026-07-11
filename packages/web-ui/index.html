@@ -38,13 +38,20 @@
         color: #999;
         font-style: italic;
       }
-      #prompt-form {
+      /* A steer we sent, echoed back so it reads as ours, not the worker's. */
+      #events li[data-outbound] {
+        color: #1d4ed8;
+      }
+      .steer-form {
         margin-top: 1rem;
         display: flex;
         gap: 0.5rem;
       }
-      #prompt-input {
+      .steer-form input {
         flex: 1;
+      }
+      .steer-actions {
+        margin-top: 1rem;
       }
     </style>
   </head>
@@ -58,10 +65,25 @@
       <section id="activity" aria-live="polite" hidden></section>
       <h2>Transcript</h2>
       <ul id="events" aria-live="polite"></ul>
-      <form id="prompt-form">
+      <!-- Upstream steer controls (#16): input / redirect / approve. Each POSTs a
+           control_request to the server, which relays it to the worker channel. -->
+      <form id="prompt-form" class="steer-form">
         <input id="prompt-input" name="prompt" type="text" autocomplete="off" placeholder="Send to session…" />
         <button type="submit">Send</button>
       </form>
+      <form id="redirect-form" class="steer-form">
+        <input
+          id="redirect-input"
+          name="redirect"
+          type="text"
+          autocomplete="off"
+          placeholder="Redirect the current turn…"
+        />
+        <button type="submit">Redirect</button>
+      </form>
+      <div class="steer-actions">
+        <button id="approve-button" type="button">Approve</button>
+      </div>
     </main>
     <!-- Zero-build: plain ES modules, no framework and no bundler. -->
     <script type="module" src="./src/app.js"></script>
