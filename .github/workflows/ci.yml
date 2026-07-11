@@ -63,11 +63,12 @@ jobs:
         run: pnpm run lint:code
 
   # End-to-end gate, wired after typecheck + unit tests (`needs: test`). The
-  # packages/e2e suite is currently `describe.todo`/`it.todo` placeholders, so this
-  # runs clean (0 tests, exit 0) with no live worker or credentials. The real specs
-  # — which drive a patched worker and reach api.anthropic.com — land in a later
-  # wave and will gate on their own env (turbo passes CCCTL_E2E / CCCTL_SDK_URL /
-  # ANTHROPIC_API_KEY through to the `test:e2e` task).
+  # packages/e2e suite runs the hermetic, loopback-only inference-untouched
+  # skeleton (no live worker or credentials) alongside the remaining
+  # `describe.todo` placeholders. The credentialed specs — which drive a patched
+  # worker and reach api.anthropic.com — land in a later wave and will gate on
+  # their own env (turbo passes CCCTL_E2E / CCCTL_SDK_URL / ANTHROPIC_API_KEY
+  # through to the `test:e2e` task).
   e2e:
     runs-on: ubuntu-latest
     needs: test
