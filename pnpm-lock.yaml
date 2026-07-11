@@ -93,6 +93,9 @@ importers:
       '@ccctl/server':
         specifier: workspace:*
         version: link:../server
+      '@ccctl/web-ui':
+        specifier: workspace:*
+        version: link:../web-ui
     devDependencies:
       '@types/node':
         specifier: ^25
