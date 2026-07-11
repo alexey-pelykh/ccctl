@@ -36,6 +36,13 @@ import {
 } from "@ccctl/core";
 import { toRegisterResponseWire } from "./register-wire.js";
 
+// Re-export the register-response wire boundary (the snake_case DTO + mapper,
+// ADR-001 / #108) on the public surface, so a contract consumer — the e2e
+// harness's register round-trip (#109), a future worker client — asserts against
+// the PINNED wire type instead of re-transcribing its shape. The mapper and its
+// exact serialized bytes are golden-tested in register-wire.test.ts.
+export { toRegisterResponseWire, type RegisterResponseWire } from "./register-wire.js";
+
 /** Configuration for a ccctl server instance. */
 export interface ServerConfig {
   /** Loopback port the local HTTP server binds to. `0` selects an ephemeral port. */
