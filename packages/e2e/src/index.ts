@@ -15,8 +15,12 @@
  * but must never intercept or reroute model traffic — billing and inference
  * stay on Anthropic under the user's own subscription.
  *
- * This is a placeholder: the scenario constants below name the intended shape;
- * no harness is wired yet.
+ * The scenario constants below name the intended shape. The AC-5 skeleton of the
+ * last leg is now wired: {@link assertInferenceUntouched} (the pure guarantee)
+ * plus the `traffic-harness` that grounds it in real, receiver-observed
+ * connections — see `inference-untouched.e2e.test.ts`. The full happy path
+ * (patched worker → SSE) and a real egress to api.anthropic.com land in a later,
+ * credentialed wave.
  */
 
 /** The host that inference MUST continue to reach, unproxied. */
@@ -34,3 +38,8 @@ export const CONTROL_PLANE_SCENARIO: E2EScenario = {
   name: "patched worker -> server -> SSE, inference unproxied",
   inferenceHost: ANTHROPIC_INFERENCE_HOST,
 };
+
+// The inference-untouched guarantee (the load-bearing correctness claim) and the
+// skeleton harness that grounds it in real, receiver-observed connections.
+export * from "./inference-guarantee.js";
+export * from "./traffic-harness.js";
