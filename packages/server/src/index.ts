@@ -4,54 +4,58 @@
 /**
  * `@ccctl/server` — the local server.
  *
- * Terminates the patched Claude Code worker's native `stream-json` control
- * transport. This slice implements two legs of the bridge:
+ * Terminates the current Claude Code build's native `stream-json` control
+ * transport: the **environments-bridge** flow (bridge-protocol §1–§4).
  *
- *   - Session registration (bridge-protocol §1): a worker `POST /v1/code/sessions`
- *     is accepted, a {@link Session} is created, and the response hands back the
- *     session **id** plus the **`ws_url`** the worker opens its worker-channel to.
- *   - The worker channel itself (bridge-protocol §2/§3): the worker then opens a
- *     WebSocket to that `ws_url` and streams `worker_status` frames, from which the
- *     server derives the session's `activity`. The upgrade is handled in
- *     {@link handleWorkerChannelUpgrade}; this module only wires it onto the HTTP
- *     server.
+ *   - §1 **Environment register** — `POST /v1/environments/bridge` (account Bearer)
+ *     mints an environment id + a scoped work-poll token.
+ *   - §2 **Session create** — `POST /v1/sessions` (account Bearer) creates a
+ *     {@link Session} and returns `{ session_id, ws_url }`.
+ *   - §3 **Work delivery** — `GET /v1/environments/{env}/work/poll`, long-polled and
+ *     authorized by the SCOPED per-environment token (never the account Bearer),
+ *     delivering `create_session` / `resume_session` / `user_turn` / `steer` work
+ *     items, each acked or stopped. §1–§3 live in `environments-bridge.ts`.
+ *   - §4 **Per-session worker channel** — the worker opens a WebSocket to the minted
+ *     `ws_url` and streams `stream-json` frames; the server derives the session's
+ *     `activity` and relays a turn/steer worker-ward. Handled in `worker-channel.ts`
+ *     ({@link handleWorkerChannelUpgrade} / {@link CcctlServer.dispatch}).
  *
- * The account OAuth Bearer is presented on BOTH the register request AND the
- * worker-channel WebSocket connect (bridge-protocol §4). On each, it is received
- * and treated as a strict NON-PERSISTING pass-through — its presence is required,
- * but it is never captured into session state, never logged, and never echoed: the
- * credential is validated for receipt and dropped. Forwarding it to
- * `api.anthropic.com` for the live session (via {@link AccountBearer.reveal}) lands
- * with a later item.
+ * **Two-token credential boundary (HARD, #60).** The account OAuth Bearer rides
+ * §1/§2/§4 and is a strict NON-PERSISTING pass-through — validated for receipt and
+ * dropped, never captured into state, a response, or a log. The work-poll leg (§3)
+ * is authorized INSTEAD by the scoped per-environment token, so presenting the
+ * account Bearer there fails closed. (Forwarding the account Bearer to
+ * `api.anthropic.com` for the live session lands with the credentialed wave; this
+ * slice validates receipt only.)
  *
- * UI→worker steer dispatch ({@link CcctlServer.dispatch}) relays one
- * `control_request` worker-ward over the same worker channel (bridge-protocol §2);
- * the codec (`@ccctl/core`'s control-frame encoder) and the WebSocket framing are
- * reused, never re-implemented.
+ * **Retained legacy register.** The superseded single-step register
+ * (`POST /v1/code/sessions`, {@link handleLegacyRegister}) is kept as transitional
+ * compat so the not-yet-realigned `@ccctl/e2e` harness stays green; it is removed
+ * with the e2e realign (#124). New code targets the §1/§2 flow above.
  *
- * The browser-facing transport pair completes the relay (#13). Downstream: the
- * worker channel fans every inbound `control_event` out to subscribed UI clients
- * over Server-Sent Events (`GET /api/events`, {@link CcctlServer.broadcast} /
- * `handleEventStream`), each event carrying a `Last-Event-ID`-compatible id so a
- * reconnecting client reconciles the gap. Upstream: the browser steers back with a
- * `fetch` POST (`POST /api/command`, `handleUiCommand`) that re-frames the command
- * as a `control_request` and calls {@link CcctlServer.dispatch}. Browser-facing
- * auth (the deferred local-server credential boundary) is a later item — the
- * loopback UI ingress is unauthenticated at this slice.
+ * **Browser-facing transport pair (#13).** The worker channel fans every inbound
+ * `control_event` out to subscribed UI clients over Server-Sent Events
+ * (`GET /api/events`, {@link CcctlServer.broadcast}); the browser steers back with a
+ * `fetch` POST (`POST /api/command`) re-framed as a `control_request` and relayed
+ * via {@link CcctlServer.dispatch}. Loopback UI ingress is unauthenticated at this
+ * slice (browser-facing auth is a later item).
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { Duplex } from "node:stream";
 import {
+  createSession,
+  ENVIRONMENTS_BRIDGE_PATH,
   formatAuthority,
   SESSIONS_CREATE_PATH,
-  sessionFromRegister,
+  SESSIONS_PATH,
   type ControlEvent,
   type ControlRequest,
   type HostEndpoint,
-  type RegisterResponse,
   type Session,
+  type SessionCreateResponse,
+  type WorkItem,
 } from "@ccctl/core";
 import { toRegisterResponseWire } from "./register-wire.js";
 import { parseBearer } from "./bearer.js";
@@ -67,6 +71,18 @@ import {
 import { COMMAND_PATH, handleUiCommand } from "./ui-command.js";
 import { writeError, writeJson } from "./http-response.js";
 import {
+  DEFAULT_WORK_POLL_TIMEOUT_MS,
+  enqueueWork,
+  handleEnvironmentRegister,
+  handleSessionCreate,
+  handleWorkAck,
+  handleWorkPoll,
+  handleWorkStop,
+  matchWorkPath,
+  settlePendingPolls,
+  type EnvironmentRecord,
+} from "./environments-bridge.js";
+import {
   DEFAULT_HOST,
   LOCAL_SERVER_AUTH_ENV,
   requireLocalServerAuth,
@@ -74,17 +90,17 @@ import {
   WILDCARD_BIND_HOST,
 } from "./startup.js";
 
-// Re-export the register-response wire boundary (the snake_case DTO + mapper,
-// ADR-001 / #108) on the public surface, so a contract consumer — the e2e
-// harness's register round-trip (#109), a future worker client — asserts against
-// the PINNED wire type instead of re-transcribing its shape. The mapper and its
-// exact serialized bytes are golden-tested in register-wire.test.ts.
+// Re-export the register/session-create response wire boundary (the snake_case DTO
+// + mapper, ADR-001 / #108) on the public surface, so a contract consumer — the e2e
+// harness's register round-trip (#109), a future worker client — asserts against the
+// PINNED wire type instead of re-transcribing its shape. The mapper and its exact
+// serialized bytes are golden-tested in register-wire.test.ts.
 export { toRegisterResponseWire, type RegisterResponseWire } from "./register-wire.js";
 
-// Re-export the baseline startup guarantees (#14) on the public surface. The
-// daemon (@ccctl/cli's `serve`) applies them before binding, and any embedder
-// gets the same refuse-start-without-auth + localhost-bind baseline. Defined and
-// unit-tested in startup.ts; DEFAULT_HOST is also consumed internally below.
+// Re-export the baseline startup guarantees (#14) on the public surface. The daemon
+// (@ccctl/cli's `serve`) applies them before binding, and any embedder gets the same
+// refuse-start-without-auth + localhost-bind baseline. Defined and unit-tested in
+// startup.ts; DEFAULT_HOST is also consumed internally below.
 export { DEFAULT_HOST, LOCAL_SERVER_AUTH_ENV, requireLocalServerAuth, resolveBindHost, WILDCARD_BIND_HOST };
 
 /** Configuration for a ccctl server instance. */
@@ -93,33 +109,49 @@ export interface ServerConfig {
   port: number;
   /** Host to bind. Defaults to loopback so nothing is exposed off-box. */
   host?: string;
+  /**
+   * Long-poll hold (ms) before an empty `…/work/poll` answers with an empty batch.
+   * Defaults to {@link DEFAULT_WORK_POLL_TIMEOUT_MS}; a test passes a short value for
+   * a deterministic timeout.
+   */
+  workPollTimeoutMs?: number;
 }
 
-/** A running ccctl server: the relay between worker channel and UI. */
+/** A running ccctl server: the relay between the environments-bridge worker and the UI. */
 export interface CcctlServer {
   /**
    * The address the server actually bound. When {@link ServerConfig.port} is `0`
-   * this carries the resolved ephemeral port — so callers can always learn where
-   * to reach the server, and where the `ws_url`s it mints point.
+   * this carries the resolved ephemeral port — so callers can always learn where to
+   * reach the server, and where the `ws_url`s it mints point.
    */
   readonly address: HostEndpoint;
   /** Sessions currently tracked by this server, keyed by ccctl session id. */
   readonly sessions: ReadonlyMap<string, Session>;
+  /** Environments registered on this server (§1), keyed by environment id. */
+  readonly environments: ReadonlyMap<string, EnvironmentRecord>;
+  /**
+   * Enqueue one work item for an environment (§3 ingress) — the server-side hook a
+   * UI action or launch feeds; the worker's next poll delivers it (or a held poll
+   * receives it immediately). Returns `false` when the environment is unknown.
+   */
+  enqueueWork(environmentId: string, item: WorkItem): boolean;
   /** Forward a worker control event to all subscribed UI clients (SSE). */
   broadcast(sessionId: string, event: ControlEvent): void;
   /**
    * Relay one UI-issued steer to the worker as a control request written over the
-   * session's worker-channel WebSocket (bridge-protocol §2). Throws if the session
-   * has no live worker channel.
+   * session's worker-channel WebSocket (§4). Throws if the session has no live
+   * worker channel.
    */
   dispatch(sessionId: string, request: ControlRequest): void;
   /** Stop accepting connections and release the port. */
   close(): Promise<void>;
 }
 
-/** Mutable per-server state shared with the request handler. */
-interface RegisterState {
+/** Mutable per-server state shared with the request handler and the bridge legs. */
+interface ServerState {
   readonly sessions: Map<string, Session>;
+  /** Environments registered via §1, keyed by environment id (owns the §3 work queue + scoped token). */
+  readonly environments: Map<string, EnvironmentRecord>;
   /**
    * The live worker-channel socket per session id. An upgraded socket is DETACHED
    * from the HTTP server, so neither `closeIdleConnections()` nor
@@ -129,69 +161,60 @@ interface RegisterState {
   readonly workerChannels: Map<string, Duplex>;
   /** The UI Server-Sent Events relay state — subscribers + Last-Event-ID replay buffer. */
   readonly events: EventStreamState;
+  /** Long-poll hold (ms) for an empty `…/work/poll`. */
+  readonly workPollTimeoutMs: number;
   /** Provisional at construction; finalized with the resolved port once bound. */
   address: HostEndpoint;
 }
 
 /**
- * Handle one HTTP request against the register contract. Fails closed on every
- * branch that is not a well-formed `POST /v1/code/sessions` carrying the account
- * Bearer, and — at this slice — accepts a single session only.
+ * Handle the retained legacy single-step register (`POST /v1/code/sessions`) — kept
+ * as transitional compat for the not-yet-realigned e2e harness (#124). Fails closed
+ * on every branch that is not a well-formed POST carrying the account Bearer, and —
+ * at this slice — accepts a single session only. New workers use the §1/§2 flow.
  */
-function handleRegister(req: IncomingMessage, res: ServerResponse, state: RegisterState): void {
-  // Pin the build-specific path (bridge-protocol §1); anything else is a 404 so
-  // a worker-transport drift is a loud wrong-endpoint miss, not a silent accept.
-  const { pathname } = new URL(req.url ?? "/", "http://localhost");
-  if (pathname !== SESSIONS_CREATE_PATH) {
-    writeError(res, 404, `ccctl: no route for ${pathname}`);
-    return;
-  }
+function handleLegacyRegister(req: IncomingMessage, res: ServerResponse, state: ServerState): void {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
     writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on ${SESSIONS_CREATE_PATH}`);
     return;
   }
-
-  // Bridge-protocol §4: the account Bearer must be present on the register
-  // request. Validate receipt and fail closed if it is absent or malformed. The
-  // caller never binds the credential — parseBearer's return is compared and
-  // discarded — so it cannot reach session state, the response, or a log (there
-  // is no logging in this module). Forwarding it to api.anthropic.com (via
-  // AccountBearer.reveal) lands with the worker-channel item.
+  // The account Bearer must be present (bridge-protocol §5). Validate receipt and
+  // fail closed if absent/malformed; the caller never binds it — parseBearer's return
+  // is compared and discarded — so it cannot reach session state, the response, or a
+  // log (there is no logging in this module).
   if (parseBearer(req.headers.authorization) === null) {
     res.setHeader("WWW-Authenticate", "Bearer");
     writeError(res, 401, "ccctl: missing or malformed `Authorization: Bearer` credential");
     return;
   }
-
-  // One session only at this slice; multiplexing is a later item, so a second
-  // registration fails closed rather than silently replacing the live session.
+  // One session only at this slice; a second registration fails closed rather than
+  // silently replacing the live session.
   if (state.sessions.size >= 1) {
     writeError(res, 409, "ccctl: a session already exists (one session only at this slice)");
     return;
   }
 
   const sessionId = randomUUID();
-  const response: RegisterResponse = {
+  const response: SessionCreateResponse = {
     sessionId,
     wsUrl: `ws://${formatAuthority(state.address.host, state.address.port)}${SESSIONS_CREATE_PATH}/${sessionId}/ws`,
   };
-  state.sessions.set(sessionId, sessionFromRegister(response));
+  state.sessions.set(sessionId, createSession(sessionId));
   // Serialize through the boundary DTO: the wire body is snake_case
-  // (`session_id` / `ws_url`) per ADR-001, while `response` stays core's camelCase
-  // RegisterResponse. `toRegisterResponseWire` is the single, golden-tested seam
-  // that owns the camel↔snake asymmetry — never write `response` to the wire
-  // directly, or a future reader "fixing" the mismatch reintroduces the drift.
+  // (`session_id` / `ws_url`) per ADR-001. `toRegisterResponseWire` is the single,
+  // golden-tested seam that owns the camel↔snake asymmetry — never write `response`
+  // to the wire directly, or a future reader "fixing" the mismatch reintroduces drift.
   writeJson(res, 201, toRegisterResponseWire(response));
 }
 
 /**
- * Route one HTTP request. The browser-facing UI transport pair is matched first —
- * `GET /api/events` (SSE relay) and `POST /api/command` (steer ingress) — and
- * everything else falls through to the worker-facing register handler, which owns
- * the `/v1/code/*` bridge surface and fails closed (404) on any other path.
+ * Route one HTTP request. The browser-facing UI transport pair is matched first
+ * (`GET /api/events`, `POST /api/command`), then the environments-bridge legs (§1
+ * environment register, §2 session create, §3 work poll / ack / stop), and finally
+ * the retained legacy register. Anything else falls through to a fail-closed 404.
  */
-function handleRequest(req: IncomingMessage, res: ServerResponse, state: RegisterState): void {
+function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerState): void {
   const { pathname } = new URL(req.url ?? "/", "http://localhost");
   if (pathname === EVENTS_PATH) {
     handleEventStream(req, res, state.events);
@@ -201,14 +224,44 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: Registe
     handleUiCommand(req, res, state);
     return;
   }
-  handleRegister(req, res, state);
+  if (pathname === ENVIRONMENTS_BRIDGE_PATH) {
+    handleEnvironmentRegister(req, res, state);
+    return;
+  }
+  if (pathname === SESSIONS_PATH) {
+    handleSessionCreate(req, res, state);
+    return;
+  }
+  const work = matchWorkPath(pathname);
+  if (work !== null) {
+    switch (work.kind) {
+      case "poll":
+        handleWorkPoll(req, res, state, work.environmentId);
+        return;
+      case "ack":
+        handleWorkAck(req, res, state, work.environmentId, work.workId);
+        return;
+      case "stop":
+        handleWorkStop(req, res, state, work.environmentId, work.workId);
+        return;
+    }
+  }
+  if (pathname === SESSIONS_CREATE_PATH) {
+    handleLegacyRegister(req, res, state);
+    return;
+  }
+  writeError(res, 404, `ccctl: no route for ${pathname}`);
 }
 
 /** Assemble the public {@link CcctlServer} handle over a bound HTTP server. */
-function createHandle(httpServer: Server, state: RegisterState): CcctlServer {
+function createHandle(httpServer: Server, state: ServerState): CcctlServer {
   return {
     address: state.address,
     sessions: state.sessions,
+    environments: state.environments,
+    enqueueWork(environmentId: string, item: WorkItem): boolean {
+      return enqueueWork(state, environmentId, item);
+    },
     // At this single-session slice there is one event stream, so the sessionId is
     // accepted for the forthcoming per-session partition (multiplexing) but is not
     // yet used to route — the one stream IS the one session's.
@@ -227,6 +280,12 @@ function createHandle(httpServer: Server, state: RegisterState): CcctlServer {
             resolve();
           }
         });
+        // Settle any held work-polls (§3 long-poll). A poll held open on an empty
+        // queue is an in-flight request `close()` waits on and an armed timer that
+        // keeps the loop alive — without this, shutting down while a worker is
+        // mid-poll hangs for up to workPollTimeoutMs. Same rationale as the SSE /
+        // worker-channel teardown below.
+        settlePendingPolls(state);
         // End open SSE streams. An SSE response holds its connection open
         // indefinitely and is never "idle", so `closeIdleConnections()` below would
         // leave it — and `close()` would hang waiting on it. Ending them lets a
@@ -251,15 +310,17 @@ function createHandle(httpServer: Server, state: RegisterState): CcctlServer {
 
 /**
  * Start the local relay server. Resolves once it is listening, with a
- * {@link CcctlServer} whose {@link CcctlServer.address} reports the bound host
- * and (possibly ephemeral) port. Rejects if the socket fails to bind.
+ * {@link CcctlServer} whose {@link CcctlServer.address} reports the bound host and
+ * (possibly ephemeral) port. Rejects if the socket fails to bind.
  */
 export function startServer(config: ServerConfig): Promise<CcctlServer> {
   const host = config.host ?? DEFAULT_HOST;
-  const state: RegisterState = {
+  const state: ServerState = {
     sessions: new Map<string, Session>(),
+    environments: new Map<string, EnvironmentRecord>(),
     workerChannels: new Map<string, Duplex>(),
     events: createEventStreamState(),
+    workPollTimeoutMs: config.workPollTimeoutMs ?? DEFAULT_WORK_POLL_TIMEOUT_MS,
     address: { host, port: config.port },
   };
 
@@ -274,9 +335,9 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
   });
 
   // The worker opens its worker-channel WebSocket to the minted `ws_url`, which
-  // points back at this server (bridge-protocol §2). Node surfaces that as an
-  // `upgrade` event; `handleWorkerChannelUpgrade` fails closed on anything that is
-  // not a well-formed upgrade for a known session carrying the account Bearer.
+  // points back at this server (§4). Node surfaces that as an `upgrade` event;
+  // `handleWorkerChannelUpgrade` fails closed on anything that is not a well-formed
+  // upgrade for a known session carrying the account Bearer.
   httpServer.on("upgrade", (req, socket, head) => {
     try {
       handleWorkerChannelUpgrade(req, socket, head, state);

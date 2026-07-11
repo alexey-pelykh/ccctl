@@ -44,6 +44,7 @@ import {
   ControlFrameDecoder,
   encodeControlFrame,
   SESSIONS_CREATE_PATH,
+  SESSIONS_PATH,
   type ControlRequest,
   type Session,
   type SessionStatus,
@@ -297,21 +298,31 @@ export function dispatchToWorkerChannel(state: WorkerChannelState, sessionId: st
 }
 
 /**
- * Extract the session id from a worker-channel path
- * (`/v1/code/sessions/{sessionId}/ws`), or `null` when the path is not a
+ * The worker-channel path bases a `ws_url` may be minted under: the current flow's
+ * session-create ({@link SESSIONS_PATH} → `/v1/sessions/{id}/ws`) and the retained
+ * legacy register ({@link SESSIONS_CREATE_PATH} → `/v1/code/sessions/{id}/ws`).
+ * Neither is a prefix of the other, so match order is irrelevant.
+ */
+const WORKER_CHANNEL_PATH_BASES: readonly string[] = [SESSIONS_PATH, SESSIONS_CREATE_PATH];
+
+/**
+ * Extract the session id from a worker-channel path (`{base}/{sessionId}/ws`, for a
+ * base in {@link WORKER_CHANNEL_PATH_BASES}), or `null` when the path is not a
  * worker-channel URL or carries an empty / nested session segment.
  */
 function matchWorkerChannelPath(pathname: string): string | null {
-  const prefix = `${SESSIONS_CREATE_PATH}/`;
   const suffix = "/ws";
-  if (!pathname.startsWith(prefix) || !pathname.endsWith(suffix)) {
+  if (!pathname.endsWith(suffix)) {
     return null;
   }
-  const sessionId = pathname.slice(prefix.length, pathname.length - suffix.length);
-  if (sessionId === "" || sessionId.includes("/")) {
-    return null;
+  for (const base of WORKER_CHANNEL_PATH_BASES) {
+    const prefix = `${base}/`;
+    if (pathname.startsWith(prefix)) {
+      const sessionId = pathname.slice(prefix.length, pathname.length - suffix.length);
+      return sessionId === "" || sessionId.includes("/") ? null : sessionId;
+    }
   }
-  return sessionId;
+  return null;
 }
 
 /** Update a session's transport-lifecycle `status`, leaving its other dimensions untouched. */

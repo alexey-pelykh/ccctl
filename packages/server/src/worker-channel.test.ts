@@ -9,6 +9,7 @@ import {
   DEFAULT_REQUIRES_ACTION_DETAIL,
   encodeControlFrame,
   SESSIONS_CREATE_PATH,
+  SESSIONS_PATH,
   type ControlEvent,
   type ControlRequest,
   type WorkerStatus,
@@ -37,7 +38,7 @@ afterEach(async () => {
   }
 });
 
-/** Register a session over the real HTTP endpoint and return its id. */
+/** Register a session over the real (legacy) HTTP endpoint and return its id. */
 async function registerSession(server: CcctlServer): Promise<string> {
   const { host, port } = server.address;
   const res = await fetch(`http://${host}:${port}${SESSIONS_CREATE_PATH}`, {
@@ -47,6 +48,22 @@ async function registerSession(server: CcctlServer): Promise<string> {
   });
   const payload = (await res.json()) as { session_id: string };
   return payload.session_id;
+}
+
+/** Create a session over the CURRENT §2 flow (`POST /v1/sessions`) and return its id + minted ws path. */
+async function createBridgeSession(server: CcctlServer): Promise<{ sessionId: string; wsPath: string }> {
+  const { host, port } = server.address;
+  const res = await fetch(`http://${host}:${port}${SESSIONS_PATH}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${ACCOUNT_BEARER}` },
+    body: JSON.stringify({
+      context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
+      source: "ui",
+      permission_mode: "default",
+    }),
+  });
+  const payload = (await res.json()) as { session_id: string; ws_url: string };
+  return { sessionId: payload.session_id, wsPath: new URL(payload.ws_url).pathname };
 }
 
 type UpgradeOutcome =
@@ -211,6 +228,26 @@ describe("worker channel — WebSocket at ws_url", () => {
     const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
     expect(outcome.kind).toBe("upgrade");
     await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
+  });
+
+  it("opens the channel at the §2-minted /v1/sessions/{id}/ws and reaches ready with the account Bearer (AC#1, current flow)", async () => {
+    const server = await startTestServer();
+    const { sessionId, wsPath } = await createBridgeSession(server);
+    // The current flow mints the worker channel under /v1/sessions/{id}/ws, not the legacy base.
+    expect(wsPath).toBe(`${SESSIONS_PATH}/${sessionId}/ws`);
+    expect(server.sessions.get(sessionId)?.status).toBe("connecting");
+
+    // The account Bearer is ACCEPTED on the §4 upgrade over the current-flow path, and
+    // the session moves connecting → ready — the §2→§4 seam end to end.
+    const outcome = await openWorkerChannel(server, wsPath);
+    expect(outcome.kind).toBe("upgrade");
+    await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
+
+    // A worker_status frame derives activity over the current-flow channel too.
+    if (outcome.kind === "upgrade") {
+      sendWorkerStatus(outcome.socket, "running");
+      await waitFor(() => server.sessions.get(sessionId)?.activity.kind === "running");
+    }
   });
 
   it("reads worker_status frames and surfaces the tri-state activity (AC#2)", async () => {

@@ -10,10 +10,9 @@ import {
   isSessionStale,
   recordHeartbeat,
   sessionActivityFromFrame,
-  sessionFromRegister,
   sessionLiveness,
   type ControlFrame,
-  type RegisterResponse,
+  type SessionCreateResponse,
   type WorkerStatusEvent,
 } from "./index.js";
 
@@ -84,13 +83,13 @@ describe("session identity (AC: identity is the register-response session id)", 
     });
   });
 
-  it("sessionFromRegister takes identity from RegisterResponse.sessionId, not the ws_url", () => {
-    const response: RegisterResponse = {
-      sessionId: "sess-from-register",
-      wsUrl: "wss://127.0.0.1:8787/v1/code/sessions/sess-from-register/ws",
+  it("a session keys on the SessionCreateResponse.sessionId, not the ws_url (§2 identity)", () => {
+    const response: SessionCreateResponse = {
+      sessionId: "sess-from-create",
+      wsUrl: "wss://127.0.0.1:8787/v1/sessions/sess-from-create/ws",
     };
-    const session = sessionFromRegister(response, T0);
-    expect(session.id).toBe("sess-from-register");
+    const session = createSession(response.sessionId, T0);
+    expect(session.id).toBe("sess-from-create");
     expect(session.createdAt).toBe(T0);
   });
 });
