@@ -27,8 +27,17 @@
  * UI→worker steer dispatch ({@link CcctlServer.dispatch}) relays one
  * `control_request` worker-ward over the same worker channel (bridge-protocol §2);
  * the codec (`@ccctl/core`'s control-frame encoder) and the WebSocket framing are
- * reused, never re-implemented. Still a stub, landing in a later item: the SSE relay
- * to the UI ({@link CcctlServer.broadcast}).
+ * reused, never re-implemented.
+ *
+ * The browser-facing transport pair completes the relay (#13). Downstream: the
+ * worker channel fans every inbound `control_event` out to subscribed UI clients
+ * over Server-Sent Events (`GET /api/events`, {@link CcctlServer.broadcast} /
+ * `handleEventStream`), each event carrying a `Last-Event-ID`-compatible id so a
+ * reconnecting client reconciles the gap. Upstream: the browser steers back with a
+ * `fetch` POST (`POST /api/command`, `handleUiCommand`) that re-frames the command
+ * as a `control_request` and calls {@link CcctlServer.dispatch}. Browser-facing
+ * auth (the deferred local-server credential boundary) is a later item — the
+ * loopback UI ingress is unauthenticated at this slice.
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -47,6 +56,16 @@ import {
 import { toRegisterResponseWire } from "./register-wire.js";
 import { parseBearer } from "./bearer.js";
 import { dispatchToWorkerChannel, handleWorkerChannelUpgrade } from "./worker-channel.js";
+import {
+  broadcastEvent,
+  closeEventStreams,
+  createEventStreamState,
+  EVENTS_PATH,
+  handleEventStream,
+  type EventStreamState,
+} from "./event-stream.js";
+import { COMMAND_PATH, handleUiCommand } from "./ui-command.js";
+import { writeError, writeJson } from "./http-response.js";
 
 // Re-export the register-response wire boundary (the snake_case DTO + mapper,
 // ADR-001 / #108) on the public surface, so a contract consumer — the e2e
@@ -98,21 +117,10 @@ interface RegisterState {
    * channel per session and to tear them down on {@link CcctlServer.close}.
    */
   readonly workerChannels: Map<string, Duplex>;
+  /** The UI Server-Sent Events relay state — subscribers + Last-Event-ID replay buffer. */
+  readonly events: EventStreamState;
   /** Provisional at construction; finalized with the resolved port once bound. */
   address: HostEndpoint;
-}
-
-/** Write a JSON body with the given status; flushes any headers already set. */
-function writeJson(res: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body);
-  res.setHeader("Content-Type", "application/json");
-  res.writeHead(status);
-  res.end(payload);
-}
-
-/** Write a `{ error }` JSON body with the given status. */
-function writeError(res: ServerResponse, status: number, message: string): void {
-  writeJson(res, status, { error: message });
 }
 
 /**
@@ -167,13 +175,35 @@ function handleRegister(req: IncomingMessage, res: ServerResponse, state: Regist
   writeJson(res, 201, toRegisterResponseWire(response));
 }
 
+/**
+ * Route one HTTP request. The browser-facing UI transport pair is matched first —
+ * `GET /api/events` (SSE relay) and `POST /api/command` (steer ingress) — and
+ * everything else falls through to the worker-facing register handler, which owns
+ * the `/v1/code/*` bridge surface and fails closed (404) on any other path.
+ */
+function handleRequest(req: IncomingMessage, res: ServerResponse, state: RegisterState): void {
+  const { pathname } = new URL(req.url ?? "/", "http://localhost");
+  if (pathname === EVENTS_PATH) {
+    handleEventStream(req, res, state.events);
+    return;
+  }
+  if (pathname === COMMAND_PATH) {
+    handleUiCommand(req, res, state);
+    return;
+  }
+  handleRegister(req, res, state);
+}
+
 /** Assemble the public {@link CcctlServer} handle over a bound HTTP server. */
 function createHandle(httpServer: Server, state: RegisterState): CcctlServer {
   return {
     address: state.address,
     sessions: state.sessions,
-    broadcast(_sessionId: string, _event: ControlEvent): void {
-      throw new Error("ccctl: broadcast (SSE relay to UI) is not implemented yet");
+    // At this single-session slice there is one event stream, so the sessionId is
+    // accepted for the forthcoming per-session partition (multiplexing) but is not
+    // yet used to route — the one stream IS the one session's.
+    broadcast(_sessionId: string, event: ControlEvent): void {
+      broadcastEvent(state.events, event);
     },
     dispatch(sessionId: string, request: ControlRequest): void {
       dispatchToWorkerChannel(state, sessionId, request);
@@ -187,6 +217,11 @@ function createHandle(httpServer: Server, state: RegisterState): CcctlServer {
             resolve();
           }
         });
+        // End open SSE streams. An SSE response holds its connection open
+        // indefinitely and is never "idle", so `closeIdleConnections()` below would
+        // leave it — and `close()` would hang waiting on it. Ending them lets a
+        // quiescent server shut down promptly.
+        closeEventStreams(state.events);
         // Tear down live worker-channel sockets explicitly. A worker channel is
         // long-lived and, once upgraded, is DETACHED from the HTTP server — so
         // `closeIdleConnections()` (and even `closeAllConnections()`) never touch it,
@@ -214,12 +249,13 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
   const state: RegisterState = {
     sessions: new Map<string, Session>(),
     workerChannels: new Map<string, Duplex>(),
+    events: createEventStreamState(),
     address: { host, port: config.port },
   };
 
   const httpServer = createServer((req, res) => {
     try {
-      handleRegister(req, res, state);
+      handleRequest(req, res, state);
     } catch {
       if (!res.headersSent) {
         writeError(res, 500, "ccctl: internal server error");

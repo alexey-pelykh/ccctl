@@ -49,6 +49,7 @@ import {
   type SessionStatus,
 } from "@ccctl/core";
 import { parseBearer } from "./bearer.js";
+import { broadcastEvent, type EventStreamState } from "./event-stream.js";
 import {
   closeFramePayload,
   computeAcceptKey,
@@ -73,6 +74,12 @@ export interface WorkerChannelState {
    * APIs, so ownership is explicit here.
    */
   readonly workerChannels: Map<string, Duplex>;
+  /**
+   * The UI Server-Sent Events relay state. Every inbound `control_event` read off
+   * this channel is fanned out to subscribed UI clients through it (#13), so the
+   * read path is also the source of the browser's event stream.
+   */
+  readonly events: EventStreamState;
 }
 
 /**
@@ -167,13 +174,24 @@ export function handleWorkerChannelUpgrade(
   const applyLines = (text: string): void => {
     for (const result of decoder.push(text)) {
       // Malformed NDJSON lines are skipped: a bad line must not tear the channel
-      // down (the fail-closed-per-line policy the core decoder is built for), and a
-      // non-`worker_status` frame is a no-op inside applyWorkerStatusFrame.
-      if (result.ok) {
-        const session = state.sessions.get(sessionId);
-        if (session !== undefined) {
-          state.sessions.set(sessionId, applyWorkerStatusFrame(session, result.frame));
-        }
+      // down (the fail-closed-per-line policy the core decoder is built for).
+      if (!result.ok) {
+        continue;
+      }
+      const frame = result.frame;
+      // A `worker_status` frame advances the session's derived activity; any other
+      // frame is a no-op inside applyWorkerStatusFrame.
+      const session = state.sessions.get(sessionId);
+      if (session !== undefined) {
+        state.sessions.set(sessionId, applyWorkerStatusFrame(session, frame));
+      }
+      // Relay every control_event to subscribed UI clients over SSE (#13) — the
+      // read-path counterpart of the worker-ward steer relay below. State events
+      // (`worker_status`) and transcript events alike fan out to the browser; a
+      // control_request / control_response is not an "event" and is not relayed
+      // (broadcast is ControlEvent-typed).
+      if (frame.type === "control_event") {
+        broadcastEvent(state.events, frame);
       }
     }
   };
