@@ -25,6 +25,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import {
+  formatAuthority,
   SESSIONS_CREATE_PATH,
   sessionFromRegister,
   type ControlEvent,
@@ -89,12 +90,6 @@ function parseBearer(header: string | undefined): string | null {
     return null;
   }
   return token;
-}
-
-/** Format `host:port`, bracketing an IPv6 host per RFC 3986 (`[::1]:port`). */
-function formatAuthority(host: string, port: number): string {
-  const authority = host.includes(":") ? `[${host}]` : host;
-  return `${authority}:${port}`;
 }
 
 /** Write a JSON body with the given status; flushes any headers already set. */
