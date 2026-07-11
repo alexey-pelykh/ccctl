@@ -31,7 +31,6 @@ import {
   type ControlFrame,
   type EnvironmentRegisterRequest,
   type EnvironmentRegisterResponse,
-  type RegisterResponse,
   type SessionCreateRequest,
   type SessionCreateResponse,
   type WorkerChannelConnect,
@@ -139,13 +138,6 @@ describe("§2 session create", () => {
       wsUrl: "wss://127.0.0.1:8787/v1/sessions/sess-1/ws",
     };
     expect(JSON.parse(JSON.stringify(response))).toEqual(response);
-  });
-
-  it("RegisterResponse is the retained alias of SessionCreateResponse (consumer compat)", () => {
-    // Same shape both ways — the alias exists so `@ccctl/server` keeps compiling.
-    const asAlias: RegisterResponse = { sessionId: "sess-1", wsUrl: "wss://x/ws" };
-    const asCanonical: SessionCreateResponse = asAlias;
-    expect(asCanonical).toBe(asAlias);
   });
 
   it("isPermissionMode accepts exactly the pinned modes and fails closed on drift", () => {

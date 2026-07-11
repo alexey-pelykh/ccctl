@@ -2,17 +2,17 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { describe, expect, it } from "vitest";
-import type { RegisterResponse } from "@ccctl/core";
+import type { SessionCreateResponse } from "@ccctl/core";
 import { toRegisterResponseWire } from "./register-wire.js";
 
-// A fixed, credential-free RegisterResponse (core's camelCase model) and the
+// A fixed, credential-free SessionCreateResponse (core's camelCase model) and the
 // EXACT snake_case bytes it must serialize to. Hardcoding the golden string —
 // rather than deriving it from the input — is what makes this a drift sentinel:
 // a renamed key, a reordered field, an extra property, or a reverted casing all
-// change these bytes and fail closed (ADR-001; bridge-protocol §1). This pins
+// change these bytes and fail closed (ADR-001; bridge-protocol §1/§2). This pins
 // the wire shape deterministically, complementing the live-endpoint contract
 // test in index.test.ts.
-const CORE_RESPONSE: RegisterResponse = {
+const CORE_RESPONSE: SessionCreateResponse = {
   sessionId: "sess-1",
   wsUrl: "ws://127.0.0.1:8787/v1/code/sessions/sess-1/ws",
 };

@@ -270,8 +270,7 @@ export interface Session {
   /**
    * Session identity — the **session id from the session-create response**
    * ({@link SessionCreateResponse.sessionId}, contract §2), server-assigned and
-   * distinct from any worker-side id. {@link sessionFromRegister} keys a session
-   * on it.
+   * distinct from any worker-side id. {@link createSession} keys a session on it.
    */
   readonly id: string;
   /** Transport lifecycle state. */
@@ -377,11 +376,13 @@ export function workStopPath(environmentId: string, workId: string): string {
 
 /**
  * The previous build's single-step register path (`POST /v1/code/sessions`, #6),
- * retained ONLY because the not-yet-realigned `@ccctl/server` register handler
- * and the `@ccctl/e2e` harness still resolve it. The current flow splits that
- * step into environment-register ({@link ENVIRONMENTS_BRIDGE_PATH}) and
- * session-create ({@link SESSIONS_PATH}); this constant is removed once those
- * consumers realign (their own W2 items). New code targets {@link SESSIONS_PATH}.
+ * retained ONLY as transitional compat: the realigned `@ccctl/server` (#123) keeps
+ * a legacy register route on it while its own environments-bridge flow is the
+ * canonical path, and the not-yet-realigned `@ccctl/e2e` harness still drives it.
+ * The current flow splits that step into environment-register
+ * ({@link ENVIRONMENTS_BRIDGE_PATH}) and session-create ({@link SESSIONS_PATH});
+ * this constant — and the server's legacy route — are removed once the e2e
+ * realigns onto the current flow (#124). New code targets {@link SESSIONS_PATH}.
  */
 export const SESSIONS_CREATE_PATH = "/v1/code/sessions";
 
@@ -598,16 +599,6 @@ export interface SessionCreateResponse {
   /** The per-session worker-channel WebSocket URL (`ws_url`). */
   readonly wsUrl: string;
 }
-
-/**
- * The register response, retained as an alias of {@link SessionCreateResponse}
- * for the not-yet-realigned `@ccctl/server` / `@ccctl/e2e` consumers: the current
- * flow's session-create (§2) returns the same `{ sessionId, wsUrl }` shape the
- * previous single-step register did (#6). New code names
- * {@link SessionCreateResponse}; this alias is removed once those consumers
- * realign (their own W2 items).
- */
-export type RegisterResponse = SessionCreateResponse;
 
 /** Project a {@link SessionCreateRequest} to its Bearer-free, loggable JSON body. */
 export function loggableSessionCreateRequest(request: SessionCreateRequest): SessionCreateRequestBody {
@@ -924,18 +915,6 @@ export function sessionLiveness(
   staleAfterMs: number = DEFAULT_HEARTBEAT_STALE_AFTER_MS,
 ): SessionLiveness {
   return isSessionStale(session, now, staleAfterMs) ? "stale" : "live";
-}
-
-/**
- * Create a session keyed on the **session-create response session id** (contract
- * §2): identity is {@link SessionCreateResponse.sessionId}, never a worker-side
- * id. The explicit, single tie from a session-create response to
- * {@link createSession}. (`response` is typed {@link RegisterResponse}, the
- * retained alias of {@link SessionCreateResponse}, so the not-yet-realigned
- * `@ccctl/server` caller keeps compiling.)
- */
-export function sessionFromRegister(response: RegisterResponse, now: number = Date.now()): Session {
-  return createSession(response.sessionId, now);
 }
 
 /**
