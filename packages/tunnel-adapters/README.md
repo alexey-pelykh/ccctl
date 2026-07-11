@@ -1,6 +1,6 @@
 # @ccctl/tunnel-adapters
 
-Pluggable tunnel adapters for [ccctl](../../README.md). Defines one `ITunnel`
+Pluggable tunnel adapters for [ccctl](../../README.md). Defines one `Tunnel`
 lifecycle contract with interchangeable implementations, so
 [`@ccctl/cli`](../cli) can expose the loopback-bound
 [`@ccctl/server`](../server) through whichever backend the user prefers without
@@ -14,6 +14,6 @@ Depends on [`@ccctl/core`](../core) for `HostEndpoint`.
 with no real tailnet) to `serve` the endpoint over the tailnet — reachable only
 inside the tailnet, so **no public IP and no open inbound port**, in deliberate
 contrast to `tailscale funnel` — then resolves the node's tailnet host. The rest
-of the `ITunnel` lifecycle (`status`, `teardown`), Tailscale ACL provisioning
+of the `Tunnel` lifecycle (`status`, `teardown`), Tailscale ACL provisioning
 and mandatory tunnel-auth, and the `CloudflareTunnel` / `HeadscaleTunnel`
 backends land in later items and remain typed stubs.

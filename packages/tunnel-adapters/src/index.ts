@@ -4,7 +4,7 @@
 /**
  * `@ccctl/tunnel-adapters` — pluggable tunnel adapters.
  *
- * One {@link ITunnel} lifecycle contract with interchangeable implementations,
+ * One {@link Tunnel} lifecycle contract with interchangeable implementations,
  * so the CLI can expose the loopback-bound {@link https://ccctl | @ccctl/server}
  * through the user's tunnel of choice (Tailscale, Cloudflare, Headscale, …)
  * without the rest of the system knowing which. A tunnel's job is to make the
@@ -13,7 +13,7 @@
  *
  * This slice implements Tailscale {@link TailscaleTunnel.establish | establish}
  * — bringing the tunnel up over the tailnet, reachable with no public IP and no
- * open inbound port. The rest of the {@link ITunnel} lifecycle (`status`,
+ * open inbound port. The rest of the {@link Tunnel} lifecycle (`status`,
  * `teardown`) and the Cloudflare / Headscale backends are still typed stubs.
  */
 
@@ -25,7 +25,7 @@ import { formatAuthority, isLoopbackHost, type HostEndpoint } from "@ccctl/core"
 export type TunnelKind = "tailscale" | "cloudflare" | "headscale";
 
 /**
- * A tunnel brought up by {@link ITunnel.establish}: the public host clients
+ * A tunnel brought up by {@link Tunnel.establish}: the public host clients
  * reach the loopback-bound server at. This host is exactly what the patched
  * worker's `--sdk-url` allowlist must then be told to permit.
  */
@@ -45,7 +45,7 @@ export interface EstablishedTunnel {
  * implementations. This slice defines `establish`; the rest of the lifecycle
  * (`status`, `teardown`) lands in a later item.
  */
-export interface ITunnel {
+export interface Tunnel {
   /** Which backend this tunnel drives. */
   readonly kind: TunnelKind;
   /**
@@ -121,7 +121,7 @@ interface TailscaleSelf {
 }
 
 /**
- * Tailscale {@link ITunnel}. `establish` brings the loopback endpoint up over
+ * Tailscale {@link Tunnel}. `establish` brings the loopback endpoint up over
  * the tailnet with `tailscale serve` — reachable only inside the tailnet, so no
  * public IP and no open inbound port (in deliberate contrast to `tailscale
  * funnel`, which is public and is NOT used) — then resolves the node's tailnet
@@ -131,7 +131,7 @@ interface TailscaleSelf {
  * tunnel-auth land with the complete adapter, and `status` / `teardown` with
  * the rest of the lifecycle.
  */
-export class TailscaleTunnel implements ITunnel {
+export class TailscaleTunnel implements Tunnel {
   readonly kind = "tailscale" as const;
 
   readonly #runner: CommandRunner;
@@ -221,7 +221,7 @@ function tailnetHostFromSelf(self: TailscaleSelf): string | null {
 
 /**
  * Shared skeleton behaviour for the not-yet-implemented backends: a rejected
- * `establish`, never a synchronous throw — so every {@link ITunnel} reports
+ * `establish`, never a synchronous throw — so every {@link Tunnel} reports
  * failure the one way (a rejection a caller's `.catch` sees), matching the real
  * Tailscale path.
  */
@@ -229,8 +229,8 @@ function notImplemented(kind: TunnelKind): Promise<never> {
   return Promise.reject(new Error(`ccctl: ${kind} tunnel adapter is not implemented yet (skeleton)`));
 }
 
-/** Stub {@link ITunnel} for Cloudflare Tunnel. */
-export class CloudflareTunnel implements ITunnel {
+/** Stub {@link Tunnel} for Cloudflare Tunnel. */
+export class CloudflareTunnel implements Tunnel {
   readonly kind = "cloudflare" as const;
 
   establish(_local: HostEndpoint): Promise<EstablishedTunnel> {
@@ -238,8 +238,8 @@ export class CloudflareTunnel implements ITunnel {
   }
 }
 
-/** Stub {@link ITunnel} for Headscale (self-hosted Tailscale control plane). */
-export class HeadscaleTunnel implements ITunnel {
+/** Stub {@link Tunnel} for Headscale (self-hosted Tailscale control plane). */
+export class HeadscaleTunnel implements Tunnel {
   readonly kind = "headscale" as const;
 
   establish(_local: HostEndpoint): Promise<EstablishedTunnel> {
@@ -252,7 +252,7 @@ export class HeadscaleTunnel implements ITunnel {
  * singleton) because a tunnel is a stateful lifecycle object: each `establish`
  * gets its own instance so a later `status` / `teardown` acts on the right one.
  */
-export const ADAPTERS: Record<TunnelKind, () => ITunnel> = {
+export const ADAPTERS: Record<TunnelKind, () => Tunnel> = {
   tailscale: () => new TailscaleTunnel(),
   cloudflare: () => new CloudflareTunnel(),
   headscale: () => new HeadscaleTunnel(),
