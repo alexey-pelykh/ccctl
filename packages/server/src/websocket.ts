@@ -97,17 +97,32 @@ export function computeAcceptKey(secWebSocketKey: string): string {
 
 /**
  * Encode a single UNMASKED server→client frame (RFC 6455 §5.1: server frames are
- * never masked). Scoped to the small control frames the worker channel emits
- * (close, pong), so it only handles payloads shorter than 126 bytes — the 7-bit
- * length form — which is all a close code or a pong echo needs.
+ * never masked) as one unfragmented message (FIN set). Handles all three §5.2
+ * payload-length forms: the 7-bit form (<126 bytes — a close code, a pong echo),
+ * the 16-bit extended form (126–65535 bytes), and the 64-bit extended form
+ * (larger). This carries both the tiny control frames the channel emits back AND a
+ * worker-ward steer line, whose `control_request` NDJSON routinely exceeds 126
+ * bytes (a steer prompt is easily longer). All three header layouts are pinned
+ * against golden vectors in the tests.
  */
 export function encodeWsFrame(opcode: number, payload: Buffer = Buffer.alloc(0)): Buffer {
-  if (payload.length >= 126) {
-    throw new WsProtocolError(`ccctl: encodeWsFrame handles only <126-byte control payloads, got ${payload.length}`);
+  const length = payload.length;
+  let header: Buffer;
+  if (length < 126) {
+    header = Buffer.alloc(2);
+    header.writeUInt8(0x80 | opcode, 0); // FIN set; single-frame message.
+    header.writeUInt8(length, 1); // no mask bit; 7-bit length.
+  } else if (length <= 0xffff) {
+    header = Buffer.alloc(4);
+    header.writeUInt8(0x80 | opcode, 0); // FIN set.
+    header.writeUInt8(126, 1); // no mask bit; a 16-bit extended length follows.
+    header.writeUInt16BE(length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header.writeUInt8(0x80 | opcode, 0); // FIN set.
+    header.writeUInt8(127, 1); // no mask bit; a 64-bit extended length follows.
+    header.writeBigUInt64BE(BigInt(length), 2);
   }
-  const header = Buffer.alloc(2);
-  header.writeUInt8(0x80 | opcode, 0); // FIN set; single-frame control message.
-  header.writeUInt8(payload.length, 1); // no mask bit; 7-bit length.
   return Buffer.concat([header, payload]);
 }
 

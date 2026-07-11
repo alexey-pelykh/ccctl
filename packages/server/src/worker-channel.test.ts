@@ -10,6 +10,7 @@ import {
   encodeControlFrame,
   SESSIONS_CREATE_PATH,
   type ControlEvent,
+  type ControlRequest,
   type WorkerStatus,
 } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
@@ -142,6 +143,52 @@ function maskedCloseFrame(code: number): Buffer {
 function unmaskedTextFrame(text: string): Buffer {
   const payload = Buffer.from(text, "utf8");
   return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+}
+
+/**
+ * Decode the server→client text frames a fake worker receives — the read-path mirror
+ * of `maskedTextFrame`. Server frames are UNMASKED (RFC 6455 §5.1), so there is no
+ * mask key; all three §5.2 length forms are handled. Hand-rolled and independent of
+ * the server codec it exercises. Returns the UTF-8 payload of each complete Text
+ * frame; a partial trailing frame is left for the next chunk.
+ */
+function readServerTextFrames(buffer: Buffer): string[] {
+  const texts: string[] = [];
+  let offset = 0;
+  while (offset + 2 <= buffer.length) {
+    const b0 = buffer.readUInt8(offset);
+    const b1 = buffer.readUInt8(offset + 1);
+    const opcode = b0 & 0x0f;
+    if ((b1 & 0x80) !== 0) {
+      throw new Error("server→client frame is masked (RFC 6455 §5.1 requires server frames to be unmasked)");
+    }
+    let length = b1 & 0x7f;
+    let dataOffset = offset + 2;
+    if (length === 126) {
+      if (offset + 4 > buffer.length) break;
+      length = buffer.readUInt16BE(offset + 2);
+      dataOffset = offset + 4;
+    } else if (length === 127) {
+      if (offset + 10 > buffer.length) break;
+      length = Number(buffer.readBigUInt64BE(offset + 2));
+      dataOffset = offset + 10;
+    }
+    if (dataOffset + length > buffer.length) break; // payload not yet fully buffered.
+    if (opcode === 0x1) {
+      texts.push(buffer.subarray(dataOffset, dataOffset + length).toString("utf8"));
+    }
+    offset = dataOffset + length;
+  }
+  return texts;
+}
+
+/** Accumulate a fake worker socket's inbound bytes and expose the decoded server text frames. */
+function collectServerTextFrames(socket: Socket): () => string[] {
+  let buffer = Buffer.alloc(0);
+  socket.on("data", (chunk: Buffer) => {
+    buffer = Buffer.concat([buffer, chunk]);
+  });
+  return () => readServerTextFrames(buffer);
 }
 
 /** Poll `predicate` until it holds or the timeout lapses (the receiver-grounded wait). */
@@ -329,5 +376,127 @@ describe("worker channel — WebSocket at ws_url", () => {
     // protocol error → the server closes with 1002 and reaps the channel.
     outcome.socket.write(unmaskedTextFrame("this frame is not masked\n"));
     await waitFor(() => server.sessions.get(sessionId)?.status === "closed");
+  });
+});
+
+// The steer verbs the UI can send (issue #12 AC). The transport is subtype-agnostic —
+// each verb is just a control_request with its own subtype/payload — so the three
+// share one delivery assertion, parametrized to pin the AC's exact wording.
+const STEERS: ReadonlyArray<{ verb: string; request: ControlRequest }> = [
+  {
+    verb: "send",
+    request: { type: "control_request", id: "s1", subtype: "prompt", payload: { text: "continue please" } },
+  },
+  {
+    verb: "approve",
+    request: { type: "control_request", id: "a1", subtype: "approve", payload: { toolUseId: "tool-42" } },
+  },
+  {
+    verb: "redirect",
+    request: { type: "control_request", id: "r1", subtype: "interrupt", payload: { reason: "stop, do X instead" } },
+  },
+];
+
+describe("worker channel — steer relay (UI → worker, §2)", () => {
+  it.each(STEERS)("writes a $verb steer to the correct session's worker WebSocket (AC#1)", async ({ request }) => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    if (outcome.kind !== "upgrade") {
+      throw new Error(`expected an upgrade, got ${outcome.kind}`);
+    }
+    await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
+    const frames = collectServerTextFrames(outcome.socket);
+
+    server.dispatch(sessionId, request);
+
+    // The steer lands on the worker channel as exactly the NDJSON control_request
+    // line the core codec emits — same encoder the read path decodes.
+    await waitFor(() => frames().length === 1);
+    expect(frames()[0]).toBe(encodeControlFrame(request));
+    expect(JSON.parse(frames()[0]?.trimEnd() ?? "null")).toEqual(request);
+  });
+
+  it("delivers the steer over the live channel of a running session — the turn continues (AC#2)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    if (outcome.kind !== "upgrade") {
+      throw new Error(`expected an upgrade, got ${outcome.kind}`);
+    }
+    const frames = collectServerTextFrames(outcome.socket);
+
+    // Drive the session to `running`, then steer it: the steer rides the SAME open
+    // worker channel the worker is streaming on, so it reaches the in-flight turn.
+    sendWorkerStatus(outcome.socket, "running");
+    await waitFor(() => server.sessions.get(sessionId)?.activity.kind === "running");
+
+    const request: ControlRequest = {
+      type: "control_request",
+      id: "t1",
+      subtype: "prompt",
+      payload: { text: "keep going" },
+    };
+    server.dispatch(sessionId, request);
+
+    await waitFor(() => frames().length === 1);
+    expect(JSON.parse(frames()[0]?.trimEnd() ?? "null")).toEqual(request);
+    // The channel stays live after steering — the turn continues, not torn down.
+    expect(server.sessions.get(sessionId)?.status).toBe("ready");
+  });
+
+  it("writes a large steer that needs an extended-length frame (>126 bytes)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    if (outcome.kind !== "upgrade") {
+      throw new Error(`expected an upgrade, got ${outcome.kind}`);
+    }
+    await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
+    const frames = collectServerTextFrames(outcome.socket);
+
+    // A realistic "send" steer whose prompt alone pushes the NDJSON line well past
+    // the 126-byte 7-bit length form — the frame the pre-#12 encoder refused.
+    const request: ControlRequest = {
+      type: "control_request",
+      id: "big-1",
+      subtype: "prompt",
+      payload: { text: "x".repeat(500) },
+    };
+    expect(encodeControlFrame(request).length).toBeGreaterThan(126);
+
+    server.dispatch(sessionId, request);
+
+    await waitFor(() => frames().length === 1);
+    expect(frames()[0]).toBe(encodeControlFrame(request));
+    expect(JSON.parse(frames()[0]?.trimEnd() ?? "null")).toEqual(request);
+  });
+
+  it("fails closed when steering a session with no live worker channel", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const request: ControlRequest = { type: "control_request", id: "x", subtype: "prompt" };
+
+    // Registered, but the worker has not opened its channel yet: no socket to write to.
+    expect(() => server.dispatch(sessionId, request)).toThrow(/no live worker channel/);
+    // An unknown session id likewise fails closed — the steer is keyed to THE
+    // session's channel, never broadcast.
+    expect(() => server.dispatch("does-not-exist", request)).toThrow(/no live worker channel/);
+  });
+
+  it("stops delivering steers once the channel is reaped (fail-closed after close)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    if (outcome.kind !== "upgrade") {
+      throw new Error(`expected an upgrade, got ${outcome.kind}`);
+    }
+    await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
+
+    outcome.socket.write(maskedCloseFrame(1000));
+    await waitFor(() => server.sessions.get(sessionId)?.status === "closed");
+
+    const request: ControlRequest = { type: "control_request", id: "late", subtype: "prompt" };
+    expect(() => server.dispatch(sessionId, request)).toThrow(/no live worker channel/);
   });
 });
