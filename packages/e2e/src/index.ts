@@ -15,12 +15,18 @@
  * but must never intercept or reroute model traffic — billing and inference
  * stay on Anthropic under the user's own subscription.
  *
- * The scenario constants below name the intended shape. The AC-5 skeleton of the
- * last leg is now wired: {@link assertInferenceUntouched} (the pure guarantee)
- * plus the `traffic-harness` that grounds it in real, receiver-observed
- * connections — see `inference-untouched.e2e.test.ts`. The full happy path
- * (patched worker → SSE) and a real egress to api.anthropic.com land in a later,
- * credentialed wave.
+ * The scenario constants below name the intended shape. Two skeletons are now
+ * wired, hermetically (loopback only, no patched worker or credentials):
+ *
+ *   - the AC-5 inference-untouched guarantee — {@link assertInferenceUntouched}
+ *     (the pure claim) plus the `traffic-harness` that grounds it in real,
+ *     receiver-observed connections (see `inference-untouched.e2e.test.ts`); and
+ *   - the one-session control-plane flow — register → server → phone view + steer,
+ *     driven end-to-end by `one-session-harness` (see `one-session-flow.e2e.test.ts`),
+ *     which PRODUCES the control-leg fixture the AC-5 assertion runs against.
+ *
+ * The full happy path with a REAL patched worker and a real egress to
+ * api.anthropic.com lands in a later, credentialed wave.
  */
 
 /** The host that inference MUST continue to reach, unproxied. */
@@ -39,7 +45,10 @@ export const CONTROL_PLANE_SCENARIO: E2EScenario = {
   inferenceHost: ANTHROPIC_INFERENCE_HOST,
 };
 
-// The inference-untouched guarantee (the load-bearing correctness claim) and the
-// skeleton harness that grounds it in real, receiver-observed connections.
+// The inference-untouched guarantee (the load-bearing correctness claim), the
+// traffic harness that grounds it in real, receiver-observed connections, and the
+// one-session flow harness (register → server → phone view + steer) that produces
+// the control-leg fixture it consumes.
 export * from "./inference-guarantee.js";
 export * from "./traffic-harness.js";
+export * from "./one-session-harness.js";

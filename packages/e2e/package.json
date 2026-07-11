@@ -27,6 +27,7 @@
   "dependencies": {
     "@ccctl/cli": "workspace:*",
     "@ccctl/core": "workspace:*",
-    "@ccctl/server": "workspace:*"
+    "@ccctl/server": "workspace:*",
+    "@ccctl/web-ui": "workspace:*"
   }
 }
