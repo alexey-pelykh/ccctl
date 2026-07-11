@@ -66,6 +66,13 @@ import {
 } from "./event-stream.js";
 import { COMMAND_PATH, handleUiCommand } from "./ui-command.js";
 import { writeError, writeJson } from "./http-response.js";
+import {
+  DEFAULT_HOST,
+  LOCAL_SERVER_AUTH_ENV,
+  requireLocalServerAuth,
+  resolveBindHost,
+  WILDCARD_BIND_HOST,
+} from "./startup.js";
 
 // Re-export the register-response wire boundary (the snake_case DTO + mapper,
 // ADR-001 / #108) on the public surface, so a contract consumer — the e2e
@@ -74,6 +81,12 @@ import { writeError, writeJson } from "./http-response.js";
 // exact serialized bytes are golden-tested in register-wire.test.ts.
 export { toRegisterResponseWire, type RegisterResponseWire } from "./register-wire.js";
 
+// Re-export the baseline startup guarantees (#14) on the public surface. The
+// daemon (@ccctl/cli's `serve`) applies them before binding, and any embedder
+// gets the same refuse-start-without-auth + localhost-bind baseline. Defined and
+// unit-tested in startup.ts; DEFAULT_HOST is also consumed internally below.
+export { DEFAULT_HOST, LOCAL_SERVER_AUTH_ENV, requireLocalServerAuth, resolveBindHost, WILDCARD_BIND_HOST };
+
 /** Configuration for a ccctl server instance. */
 export interface ServerConfig {
   /** Loopback port the local HTTP server binds to. `0` selects an ephemeral port. */
@@ -81,9 +94,6 @@ export interface ServerConfig {
   /** Host to bind. Defaults to loopback so nothing is exposed off-box. */
   host?: string;
 }
-
-/** Default loopback bind host — nothing is exposed without an explicit tunnel. */
-export const DEFAULT_HOST = "127.0.0.1";
 
 /** A running ccctl server: the relay between worker channel and UI. */
 export interface CcctlServer {

@@ -31,3 +31,13 @@ missed. Upstream, the browser steers back with a `fetch` **POST** to
 onto the worker channel. Browser-facing auth — the deferred local-server credential
 boundary — is a later item; the loopback UI ingress is unauthenticated at this
 slice (the account Bearer is the worker's credential, never the browser's).
+
+Two **baseline startup guarantees** ride along from the skeleton, exported for the
+daemon ([`@ccctl/cli`](../cli)'s `serve`) to apply before it binds: `requireLocalServerAuth`
+refuses to start when no local-server auth is configured — there is no
+unauthenticated mode, even on loopback — and `resolveBindHost` keeps the listener
+on loopback (`127.0.0.1`), refusing the `0.0.0.0` wildcard so nothing is exposed
+off-box. This is start-time refusal, distinct from the per-request UI-ingress auth
+above, which stays deferred. Both are the minimal slice: the full credential
+boundary (a config-file source, an actionable error, every start path) is a later
+item, as is the complete non-loopback bind refusal (`::`, LAN, public).
