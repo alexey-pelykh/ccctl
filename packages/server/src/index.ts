@@ -34,6 +34,7 @@ import {
   type RegisterResponse,
   type Session,
 } from "@ccctl/core";
+import { toRegisterResponseWire } from "./register-wire.js";
 
 /** Configuration for a ccctl server instance. */
 export interface ServerConfig {
@@ -149,7 +150,12 @@ function handleRegister(req: IncomingMessage, res: ServerResponse, state: Regist
     wsUrl: `ws://${formatAuthority(state.address.host, state.address.port)}${SESSIONS_CREATE_PATH}/${sessionId}/ws`,
   };
   state.sessions.set(sessionId, sessionFromRegister(response));
-  writeJson(res, 201, response);
+  // Serialize through the boundary DTO: the wire body is snake_case
+  // (`session_id` / `ws_url`) per ADR-001, while `response` stays core's camelCase
+  // RegisterResponse. `toRegisterResponseWire` is the single, golden-tested seam
+  // that owns the camel↔snake asymmetry — never write `response` to the wire
+  // directly, or a future reader "fixing" the mismatch reintroduces the drift.
+  writeJson(res, 201, toRegisterResponseWire(response));
 }
 
 /** Assemble the public {@link CcctlServer} handle over a bound HTTP server. */

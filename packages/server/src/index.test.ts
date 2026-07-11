@@ -57,16 +57,46 @@ describe("startServer — POST /v1/code/sessions (register)", () => {
     const server = await startTestServer();
     const res = await register(server);
     expect(res.status).toBe(201);
-    const payload = (await res.json()) as { sessionId: string; wsUrl: string };
-    expect(typeof payload.sessionId).toBe("string");
-    expect(payload.sessionId.length).toBeGreaterThan(0);
+    // The wire body is snake_case per ADR-001 (the boundary DTO), even though
+    // core's RegisterResponse stays camelCase internally.
+    const payload = (await res.json()) as { session_id: string; ws_url: string };
+    expect(typeof payload.session_id).toBe("string");
+    expect(payload.session_id.length).toBeGreaterThan(0);
     const { host, port } = server.address;
-    expect(payload.wsUrl).toBe(`ws://${host}:${port}${SESSIONS_CREATE_PATH}/${payload.sessionId}/ws`);
+    expect(payload.ws_url).toBe(`ws://${host}:${port}${SESSIONS_CREATE_PATH}/${payload.session_id}/ws`);
+  });
+
+  it("pins the EXACT snake_case wire shape of the register response body (golden/contract, ADR-001)", async () => {
+    const server = await startTestServer();
+    const res = await register(server);
+    expect(res.status).toBe(201);
+    expect(res.headers.get("content-type")).toBe("application/json");
+
+    // Read the RAW bytes so key order and the absence of extra keys are pinned,
+    // not just the parsed value. The session id (a UUID) and the bound port are
+    // dynamic, so the golden is reconstructed from the observed id + address and
+    // compared byte-for-byte: any casing / shape / ordering drift fails closed
+    // (bridge-protocol §1). This is the live-endpoint half of the contract; the
+    // deterministic mapper golden lives in register-wire.test.ts.
+    const raw = await res.text();
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+
+    // Exactly session_id + ws_url, snake_case, in that order — no camelCase leak
+    // from core, no stray fields.
+    expect(Object.keys(parsed)).toEqual(["session_id", "ws_url"]);
+    expect(parsed).not.toHaveProperty("sessionId");
+    expect(parsed).not.toHaveProperty("wsUrl");
+
+    const sessionId = parsed.session_id as string;
+    const { host, port } = server.address;
+    const expectedWsUrl = `ws://${host}:${port}${SESSIONS_CREATE_PATH}/${sessionId}/ws`;
+    expect(raw).toBe(`{"session_id":"${sessionId}","ws_url":"${expectedWsUrl}"}`);
+    expect(parsed.ws_url).toBe(expectedWsUrl);
   });
 
   it("creates and tracks the session keyed by its id (AC#2)", async () => {
     const server = await startTestServer();
-    const { sessionId } = (await (await register(server)).json()) as { sessionId: string };
+    const { session_id: sessionId } = (await (await register(server)).json()) as { session_id: string };
     expect(server.sessions.size).toBe(1);
     const session = server.sessions.get(sessionId);
     expect(session).toBeDefined();
@@ -78,8 +108,8 @@ describe("startServer — POST /v1/code/sessions (register)", () => {
   it("mints a fresh session id per registration", async () => {
     const a = await startTestServer();
     const b = await startTestServer();
-    const idA = ((await (await register(a)).json()) as { sessionId: string }).sessionId;
-    const idB = ((await (await register(b)).json()) as { sessionId: string }).sessionId;
+    const idA = ((await (await register(a)).json()) as { session_id: string }).session_id;
+    const idB = ((await (await register(b)).json()) as { session_id: string }).session_id;
     expect(idA).not.toBe(idB);
   });
 
