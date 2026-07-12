@@ -23,39 +23,45 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   (e2e) exercise it — hermetic, no patched worker or credentials, so it gates on
   every run.
 
-- **Bridge wire-conformance oracle (#124)** — `bridge-wire-conformance.ts` pins the
+- **Bridge wire-conformance oracle (#130/#131)** — `bridge-wire-conformance.ts` pins the
   current environments-bridge flow's snake_case contract face **independently** of
-  the server's own serializers (`{ environment_id, work_poll_token }` §1,
-  `{ session_id, ws_url }` §2, `{ work: WorkItem[] }` §3 through core's fail-closed
-  `workItemFromValue`) and asserts the **real** `@ccctl/server` speaks it —
-  `assertServerSpeaksBridgeContract`, including the **two-token boundary** (the account
-  Bearer opens §1/§2 but is refused on the §3 work-poll, which the scoped
-  per-environment token opens). Pinning the shapes independently is what makes a green
-  run imply **interoperability, not just internal consistency**: a server drift off the
-  current face fails the gate. `wire-conformance.e2e.test.ts` runs it against the real
-  server on every hermetic run; the pure per-leg shape assertions are unit-tested in
-  `bridge-wire-conformance.test.ts`. The mock bridge's driving helpers here
-  (`registerEnvironment`, `createSession`, `pollWork`, `ackWork`) are the single place
-  the harness speaks the current flow.
+  the server's own serializers (`{ environment_id }` §1, `{ session_id }` §2 — **no**
+  `ws_url` — and a **single** `{ id, secret, data }` work item §3, **not** a
+  `{ work: [...] }` envelope, whose `secret` decodes to
+  `{ version, session_ingress_token, api_base_url }`) and asserts the **real**
+  `@ccctl/server` speaks it — `assertServerSpeaksBridgeContract`, including the
+  **two-credential boundary** (the account Bearer opens §1/§2 — and those legs 401
+  without it — while the §3 poll is **uncredentialed** and the §4/§5 channel is
+  authorized by the locally-minted ingress token, never the account Bearer). Pinning the
+  shapes independently is what makes a green run imply **interoperability, not just
+  internal consistency**: a server drift off the current face fails the gate.
+  `wire-conformance.e2e.test.ts` runs it against the real server on every hermetic run;
+  the pure per-leg shape assertions are unit-tested in `bridge-wire-conformance.test.ts`.
+  The mock bridge's driving helpers here (`registerEnvironment`, `createSession`,
+  `pollWork`) are the single place the harness speaks the current flow.
 
-- **One-session control-plane flow (skeleton)** — `one-session-harness.ts` drives
-  the whole walking-skeleton round-trip end-to-end against the real `@ccctl/server`
+- **One-session control-plane flow (captured SSE wire, #131)** — `one-session-harness.ts`
+  drives the whole walking-skeleton round-trip end-to-end against the real `@ccctl/server`
   over the **current environments-bridge flow**: the bridge **registers its
   environment** (`POST /v1/environments/bridge`, §1), a session is **created**
-  (`POST /v1/sessions`, §2), the bridge **polls for work** with its scoped token
-  (`GET …/work/poll`, §3) and acks the session-dispatch item, a stand-in worker opens
-  the **worker channel** at the minted `ws_url` (`/v1/sessions/{id}/ws`, §4), a stand-in
-  phone **views** the session over **SSE** (`GET /api/events`) as the worker emits a
-  `control_event`, and the phone **steers** it (`POST /api/command`) — the server
-  re-framing that steer onto the worker channel. Every hop is grounded in the
-  receiver's own record (the server's environments + session maps, the poll body the
-  bridge received, the phone's SSE log, the worker's inbound frames), never a sender's
+  (`POST /v1/sessions`, §2, which auto-enqueues its work item), the bridge **polls for
+  work** with **no credential** (`GET …/work/poll`, §3) and receives the **single**
+  session-dispatch item whose `secret` decodes to the per-session ingress token, a
+  stand-in worker opens the per-session channel over **HTTP + SSE** (`worker/register` →
+  held-open `worker/events/stream` → `PUT worker` status, §4/§5), a stand-in phone
+  **views** the session over **SSE** (`GET /api/events`), and the phone **steers** it
+  (`POST /api/command`) — a `prompt` the server injects as a `{ type: "user" }`
+  `client_event` turn the worker **reads** off its downstream and acks
+  (`worker/events/delivery`), after which the worker relays a transcript back up
+  `worker/events` that the phone views. Every hop is grounded in the receiver's own
+  record (the server's environments + session maps, the poll body the bridge received,
+  the phone's SSE log, the worker's inbound `client_event` frames), never a sender's
   self-report. The phone legs run the **real** [`@ccctl/web-ui`](../web-ui) view
   (`transcript.js`, #15) and steer (`command.js`, #16) logic, not a re-implementation.
   The flow **produces the control-leg fixture** the inference-untouched assertion
   consumes; `one-session-flow.e2e.test.ts` drives it and feeds
   `assertInferenceUntouched` — hermetic (loopback only, no patched worker or
-  credentials), so it gates on every run. Its pure WebSocket/SSE framing helpers are
+  credentials), so it gates on every run. Its pure SSE parsing helpers are
   unit-tested in `one-session-harness.test.ts`.
 
 ## What is still a placeholder

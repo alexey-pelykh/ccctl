@@ -134,7 +134,8 @@ export async function observeControlLeg(options: ControlLegOptions): Promise<Obs
     throw new Error("ccctl e2e: local server did not record the registered environment");
   }
   // §2 — create the session; grounded in the server's own sessions record. The helper
-  // also asserts the minted ws_url points at THIS server's per-session worker channel.
+  // asserts the response IS the pinned `{ session_id }` wire (no ws_url — the SSE control
+  // path never reads one, #130).
   const { sessionId } = await createSession(server, bearer);
   if (server.sessions.size !== sessionsBefore + 1 || !server.sessions.has(sessionId)) {
     throw new Error("ccctl e2e: local server did not record the created session");

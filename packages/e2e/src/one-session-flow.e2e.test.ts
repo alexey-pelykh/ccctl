@@ -8,24 +8,24 @@ import { ANTHROPIC_INFERENCE_HOST } from "./index.js";
 import { assertInferenceUntouched, InferenceGuaranteeViolation } from "./inference-guarantee.js";
 import { driveOneSessionFlow, waitFor, type OneSessionFlow } from "./one-session-harness.js";
 import { observeInferenceLeg, startInferenceStandIn, type InferenceStandIn } from "./traffic-harness.js";
-// The REAL phone client logic — the EventSource transcript view (#15) and the
-// fetch-POST steer builder (#16). Imported and exercised so the flow runs the
-// actual UI decode/build code, never a re-implemented stand-in of it.
+// The REAL phone client logic — the SSE transcript decode (#15) and the fetch-POST
+// steer builder (#16). Imported and exercised so the flow runs the actual UI
+// decode/build code, never a re-implemented stand-in of it.
 import { processEventData } from "@ccctl/web-ui/src/transcript.js";
 import { describeCommand, inputCommand } from "@ccctl/web-ui/src/command.js";
 
-// Skeleton E2E for the one-session control-plane flow (issue #19, traces E2E-B-002),
-// re-pointed onto the CURRENT environments-bridge flow (#124): environment register →
-// session-create → work-poll → per-session worker channel → phone view + steer, driven
-// end-to-end against the REAL @ccctl/server on loopback with a stand-in worker + phone
-// (hermetic — no patched worker, no credentials, no egress). Every "reached X" is
-// grounded in the receiver's OWN record (the server's environments + session maps; the
-// poll body the bridge received; the phone's SSE log; the worker's inbound frames),
-// never a sender's self-report — the same posture the inference-untouched legs hold. The
-// flow this harness drives PRODUCES the control-leg fixture that the AC-5 assertion (#18,
-// assertInferenceUntouched) runs against; the later credentialed suite swaps the
-// stand-ins for a real worker + browser and a real api.anthropic.com, and the assertion
-// does not change.
+// The captured-wire SSE golden for the one-session control-plane flow (issue #131,
+// traces E2E-B-002): environment register → session-create → work-poll → per-session
+// HTTP+SSE worker channel → phone view + steer, driven end-to-end against the REAL
+// @ccctl/server on loopback with a stand-in worker + phone (hermetic — no patched
+// worker, no credentials, no egress). Every "reached X" is grounded in the receiver's
+// OWN record (the server's environments + session maps; the poll body the bridge
+// received; the phone's SSE log; the worker's inbound client_event frames), never a
+// sender's self-report — the same posture the inference-untouched legs hold. It FAILS
+// on ANY leg divergence (the harness throws on the first unmet ground), and it PRODUCES
+// the control-leg fixture the AC-5 assertion (#18, assertInferenceUntouched) runs
+// against; the later credentialed suite swaps the stand-ins for a real worker + browser
+// and a real api.anthropic.com, and the assertion does not change.
 
 const ACCOUNT_BEARER = "oauth-account-secret-e2e-flow";
 const EXPECTATION = { inferenceHost: ANTHROPIC_INFERENCE_HOST } as const;
@@ -47,8 +47,8 @@ async function startAnthropicStandIn(): Promise<InferenceStandIn> {
 }
 
 // Close each flow's stand-in phone + worker sockets FIRST, then the servers and
-// stand-ins, so no client write races a closing server and no listener leaks
-// across the serial e2e run.
+// stand-ins, so no client write races a closing server and no listener leaks across the
+// serial e2e run.
 afterEach(async () => {
   while (flows.length > 0) {
     await flows.pop()?.close();
@@ -61,9 +61,9 @@ afterEach(async () => {
   }
 });
 
-describe("ccctl e2e: one-session flow — register → server → phone view + steer (skeleton)", () => {
-  describe("Rule: the harness drives the one-session flow end-to-end", () => {
-    it("registers, views a transcript event over SSE, and steers over the worker channel (AC-1)", async () => {
+describe("ccctl e2e: one-session flow — register → server → phone view + steer (captured SSE wire, #131)", () => {
+  describe("Rule: the golden drives the one-session flow end-to-end over the observed SSE wire", () => {
+    it("registers, polls the session work item, injects a turn, and relays a transcript over SSE (AC-1)", async () => {
       const server = await startLocalServer();
       const standIn = await startAnthropicStandIn();
 
@@ -80,23 +80,43 @@ describe("ccctl e2e: one-session flow — register → server → phone view + s
       expect(server.environments.has(flow.environmentId)).toBe(true);
 
       // session-create (§2) — the local server recorded exactly the one session, keyed by
-      // the wire session_id, and the minted ws_url points back at THIS server for THAT
-      // session (the current /v1/sessions/{id}/ws worker channel, not the legacy path).
+      // the wire session_id; it stays `connecting` (activity, not status, is the tri-state)
+      // and the worker's idle status derived `idle` activity (#130).
       expect(server.sessions.size).toBe(1);
       expect(server.sessions.has(flow.sessionId)).toBe(true);
-      expect(server.sessions.get(flow.sessionId)?.status).toBe("ready");
-      expect(flow.wsUrl).toContain(`/v1/sessions/${flow.sessionId}/ws`);
+      expect(server.sessions.get(flow.sessionId)?.status).toBe("connecting");
+      expect(server.sessions.get(flow.sessionId)?.activity.kind).toBe("idle");
 
-      // work-poll (§3) — the bridge received the session-dispatch work item over the poll
-      // (grounded in the poll body it got back), correlated to the created session.
-      expect(flow.workItem).toEqual({
-        kind: "create_session",
-        id: "e2e-create-session",
-        payload: { session_id: flow.sessionId },
+      // work-poll (§3) — the bridge received a SINGLE session-dispatch item over the
+      // uncredentialed poll (grounded in the poll body it got back), correlated to the
+      // created session, with a decodable work-secret (NOT a { work: [...] } envelope, #130).
+      expect(flow.workItem.data).toEqual({ type: "session", id: flow.sessionId });
+      expect(typeof flow.workItem.id).toBe("string");
+      expect(flow.workItem.id.length).toBeGreaterThan(0);
+      expect(flow.workSecret.version).toBe(1);
+      expect(flow.workSecret.api_base_url).toBe(`http://${formatAuthority(server.address.host, server.address.port)}`);
+
+      // two-credential boundary (#130) — the per-session ingress token in the work-secret
+      // is a locally-minted credential, NOT the account Bearer (which rode §1/§2 only).
+      expect(typeof flow.workSecret.session_ingress_token).toBe("string");
+      expect(flow.workSecret.session_ingress_token.length).toBeGreaterThan(0);
+      expect(flow.workSecret.session_ingress_token).not.toBe(ACCOUNT_BEARER);
+
+      // phone STEER (#16) — the phone's `prompt` was INJECTED as a { type: "user" } turn
+      // the worker read off its held-open downstream (grounded in the worker's own record),
+      // carrying the REAL builder's text and this session's id.
+      expect(flow.injectedTurn).toMatchObject({
+        type: "user",
+        message: { role: "user", content: [{ type: "text", text: "continue please" }] },
+        parent_tool_use_id: null,
+        session_id: flow.sessionId,
       });
+      expect(typeof (flow.injectedTurn as { uuid?: unknown }).uuid).toBe("string");
+      expect(describeCommand(flow.steer)).toBe("continue please");
 
-      // phone VIEW (#15) — the phone saw the worker's transcript event over SSE with the
-      // monotonic Last-Event-ID, and the REAL UI decode classifies it as a transcript line.
+      // phone VIEW (#15) — the worker's UPSTREAM transcript event was relayed to the phone
+      // over SSE with the monotonic Last-Event-ID, and the REAL UI decode classifies it as
+      // a transcript line.
       expect(flow.viewed.id).toBe("1");
       expect(JSON.parse(flow.viewed.data)).toEqual(flow.transcriptEvent);
       expect(processEventData(flow.viewed.data)).toEqual({
@@ -105,34 +125,26 @@ describe("ccctl e2e: one-session flow — register → server → phone view + s
         summary: "hi from the worker",
       });
 
-      // phone STEER (#16) — the worker received the phone's verb re-framed as a
-      // control_request carrying the SERVER-minted id and the REAL builder's payload.
-      expect(flow.relayedSteer).toEqual({
-        type: "control_request",
-        id: flow.steerId,
-        subtype: "prompt",
-        payload: { text: "continue please" },
-      });
-      expect(describeCommand(flow.steer)).toBe("continue please");
-
       // ...and nothing crossed to the api.anthropic.com stand-in in the whole flow.
       expect(standIn.received).toHaveLength(0);
     });
 
-    it("derives session activity from a worker_status frame and the phone views it as the current turn (#11 + #15)", async () => {
+    it("derives session activity from a PUT worker status and the phone views a status frame as the current turn (#130 + #15)", async () => {
       const server = await startLocalServer();
       const standIn = await startAnthropicStandIn();
 
       const flow = await driveOneSessionFlow({ server, bearer: ACCOUNT_BEARER, standIn });
       flows.push(flow);
 
-      // The worker reports it is running: the server derives the tri-state activity off the
-      // worker channel (#11 read path)...
-      flow.worker.emitEvent({ type: "control_event", subtype: "worker_status", payload: { status: "running" } });
+      // The worker reports it is running via the §4 PUT status gate: the server derives the
+      // tri-state activity off it (#130 status-gate path)...
+      await flow.worker.putStatus("running");
       await waitFor(() => server.sessions.get(flow.sessionId)?.activity.kind === "running");
 
-      // ...and the phone views that same frame over SSE, which the REAL UI decode renders as the
-      // current turn rather than a transcript line (#15).
+      // ...and a worker_status control event RELAYED up the §5 events leg is viewed by the
+      // phone over SSE, which the REAL UI decode renders as the current turn, not a
+      // transcript line (#15).
+      await flow.worker.emitEvent({ type: "control_event", subtype: "worker_status", payload: { status: "running" } });
       await waitFor(() => flow.ui.viewed().length >= 2);
       const activityView = flow.ui.viewed().at(-1);
       expect(activityView).toBeDefined();
