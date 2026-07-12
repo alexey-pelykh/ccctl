@@ -13,10 +13,15 @@ Depends on [`@ccctl/core`](../core) for `HostEndpoint`.
 `tailscale` CLI behind an injectable `CommandRunner` seam (so it is unit-tested
 with no real tailnet): `establish(local)` runs `serve` to bring the endpoint up
 over the tailnet — reachable only inside the tailnet, so **no public IP and no
-open inbound port**, in deliberate contrast to `tailscale funnel` — then
-resolves the node's tailnet host; `status()` reports whether the tunnel is up
-and the host it is reachable at; and `teardown()` turns that same serve mapping
-back off, releasing it cleanly. The instance tracks what it served, so
-`status` / `teardown` act on exactly the mapping `establish` brought up.
-Tailscale ACL provisioning and mandatory tunnel-auth, and the `CloudflareTunnel`
-/ `HeadscaleTunnel` backends, land in later items and remain typed stubs.
+open inbound port**, in deliberate contrast to `tailscale funnel` — then reads
+`tailscale status` once to both **enforce mandatory tunnel-auth** (it refuses
+unless the node is an authenticated, connected tailnet member, so an
+unauthorized device can never reach the daemon) and resolve the node's tailnet
+host; `status()` reports whether the tunnel is up and the host it is reachable
+at; and `teardown()` turns that same serve mapping back off, releasing it
+cleanly. The instance tracks what it served, so `status` / `teardown` act on
+exactly the mapping `establish` brought up. Which authenticated devices may
+reach the endpoint is governed by the tailnet's own **ACL policy** —
+operator-owned central state the adapter relies on and deliberately never
+provisions or overwrites. The `CloudflareTunnel` / `HeadscaleTunnel` backends
+land in later items and remain typed stubs.
