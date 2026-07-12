@@ -31,6 +31,11 @@ function base(server: CcctlServer): string {
   return `http://${host}:${port}`;
 }
 
+/** The per-session steer-ingress path (#20). */
+function commandPath(sessionId: string): string {
+  return `/api/sessions/${sessionId}/command`;
+}
+
 /** Create a §2 session and return its id. */
 async function registerSession(server: CcctlServer): Promise<string> {
   const res = await fetch(`${base(server)}${SESSIONS_PATH}`, {
@@ -54,9 +59,9 @@ async function registerWorker(server: CcctlServer, sessionId: string): Promise<v
   });
 }
 
-/** POST a UI command; a string body is sent verbatim, anything else is JSON-encoded. */
-function postCommand(server: CcctlServer, body: unknown): Promise<Response> {
-  return fetch(`${base(server)}/api/command`, {
+/** POST a UI steer to a session; a string body is sent verbatim, anything else is JSON-encoded. */
+function postCommand(server: CcctlServer, sessionId: string, body: unknown): Promise<Response> {
+  return fetch(`${base(server)}${commandPath(sessionId)}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: typeof body === "string" ? body : JSON.stringify(body),
@@ -135,12 +140,12 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void
   }
 }
 
-describe("UI command ingress — fetch POST /api/command (#13)", () => {
+describe("UI command ingress — per-session fetch POST /api/sessions/{id}/command (#13/#20)", () => {
   it("relays a prompt command as a { type: 'user' } turn (202, the load-bearing turn #130)", async () => {
     const server = await startTestServer();
     const { sessionId, frames } = await readyWorker(server);
 
-    const res = await postCommand(server, { subtype: "prompt", payload: { text: "continue please" } });
+    const res = await postCommand(server, sessionId, { subtype: "prompt", payload: { text: "continue please" } });
     expect(res.status).toBe(202);
     const { id } = (await res.json()) as { id: string };
     expect(typeof id).toBe("string");
@@ -158,9 +163,9 @@ describe("UI command ingress — fetch POST /api/command (#13)", () => {
 
   it("relays a non-prompt verb as a control_request carrying the server-minted id", async () => {
     const server = await startTestServer();
-    const { frames } = await readyWorker(server);
+    const { sessionId, frames } = await readyWorker(server);
 
-    const res = await postCommand(server, { subtype: "interrupt", payload: { reason: "stop" } });
+    const res = await postCommand(server, sessionId, { subtype: "interrupt", payload: { reason: "stop" } });
     expect(res.status).toBe(202);
     const { id } = (await res.json()) as { id: string };
 
@@ -171,10 +176,10 @@ describe("UI command ingress — fetch POST /api/command (#13)", () => {
 
   it("mints a fresh correlation id per command (the browser does not choose it)", async () => {
     const server = await startTestServer();
-    const { frames } = await readyWorker(server);
+    const { sessionId, frames } = await readyWorker(server);
 
-    const first = (await (await postCommand(server, { subtype: "interrupt" })).json()) as { id: string };
-    const second = (await (await postCommand(server, { subtype: "interrupt" })).json()) as { id: string };
+    const first = (await (await postCommand(server, sessionId, { subtype: "interrupt" })).json()) as { id: string };
+    const second = (await (await postCommand(server, sessionId, { subtype: "interrupt" })).json()) as { id: string };
     expect(first.id).not.toBe(second.id);
 
     await waitFor(() => frames().length === 2);
@@ -184,9 +189,9 @@ describe("UI command ingress — fetch POST /api/command (#13)", () => {
 
   it("forwards a control_request that carries no payload", async () => {
     const server = await startTestServer();
-    const { frames } = await readyWorker(server);
+    const { sessionId, frames } = await readyWorker(server);
 
-    const res = await postCommand(server, { subtype: "interrupt" });
+    const res = await postCommand(server, sessionId, { subtype: "interrupt" });
     expect(res.status).toBe(202);
 
     await waitFor(() => frames().length === 1);
@@ -195,35 +200,65 @@ describe("UI command ingress — fetch POST /api/command (#13)", () => {
     expect(payload).not.toHaveProperty("payload");
   });
 
-  it("fails closed when the session has no live worker channel (409)", async () => {
+  it("steers ONLY the addressed session — a steer never reaches another session's worker (#20)", async () => {
     const server = await startTestServer();
-    await registerSession(server);
+    const sessionA = await readyWorker(server);
+    const sessionB = await readyWorker(server);
+
+    // Steer ONLY session A. Session B's worker must never receive the frame.
+    const res = await postCommand(server, sessionA.sessionId, { subtype: "interrupt", payload: { reason: "stop-A" } });
+    expect(res.status).toBe(202);
+
+    await waitFor(() => sessionA.frames().length === 1);
+    // Give any (erroneous) cross-wired delivery to B a chance to land before asserting absence.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(sessionA.frames()).toHaveLength(1);
+    expect(sessionB.frames()).toHaveLength(0);
+    const payloadA = sessionA.frames()[0].data.payload as Record<string, unknown>;
+    expect(payloadA).toMatchObject({ type: "control_request", subtype: "interrupt", payload: { reason: "stop-A" } });
+
+    // The converse: steering B reaches only B, leaving A's single frame untouched.
+    await postCommand(server, sessionB.sessionId, { subtype: "interrupt", payload: { reason: "stop-B" } });
+    await waitFor(() => sessionB.frames().length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(sessionB.frames()).toHaveLength(1);
+    expect(sessionA.frames()).toHaveLength(1);
+    const payloadB = sessionB.frames()[0].data.payload as Record<string, unknown>;
+    expect(payloadB).toMatchObject({ payload: { reason: "stop-B" } });
+  });
+
+  it("fails closed when the addressed session has no live worker channel (409)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
     // Registered, but the worker never opened its downstream: nothing to relay to.
-    const res = await postCommand(server, { subtype: "prompt", payload: { text: "hi" } });
+    const res = await postCommand(server, sessionId, { subtype: "prompt", payload: { text: "hi" } });
     expect(res.status).toBe(409);
   });
 
-  it("fails closed when no session is registered (404)", async () => {
+  it("fails closed when the addressed session id is unknown (404)", async () => {
     const server = await startTestServer();
-    const res = await postCommand(server, { subtype: "interrupt" });
+    const res = await postCommand(server, "00000000-0000-0000-0000-000000000000", { subtype: "interrupt" });
     expect(res.status).toBe(404);
   });
 
   it("rejects a malformed command body, including a blank prompt (400)", async () => {
     const server = await startTestServer();
-    await registerSession(server);
-    expect((await postCommand(server, "this is not json")).status).toBe(400);
-    expect((await postCommand(server, { payload: { text: "no subtype" } })).status).toBe(400);
-    expect((await postCommand(server, { subtype: "" })).status).toBe(400);
-    expect((await postCommand(server, { subtype: "prompt", payload: "not-an-object" })).status).toBe(400);
+    const sessionId = await registerSession(server);
+    expect((await postCommand(server, sessionId, "this is not json")).status).toBe(400);
+    expect((await postCommand(server, sessionId, { payload: { text: "no subtype" } })).status).toBe(400);
+    expect((await postCommand(server, sessionId, { subtype: "" })).status).toBe(400);
+    expect((await postCommand(server, sessionId, { subtype: "prompt", payload: "not-an-object" })).status).toBe(400);
     // A prompt with no / blank text is a 400 before any relay is attempted.
-    expect((await postCommand(server, { subtype: "prompt" })).status).toBe(400);
-    expect((await postCommand(server, { subtype: "prompt", payload: { text: "   " } })).status).toBe(400);
+    expect((await postCommand(server, sessionId, { subtype: "prompt" })).status).toBe(400);
+    expect((await postCommand(server, sessionId, { subtype: "prompt", payload: { text: "   " } })).status).toBe(400);
   });
 
-  it("rejects a non-POST method on /api/command (405)", async () => {
+  it("rejects a non-POST method on a session command path (405)", async () => {
     const server = await startTestServer();
-    const res = await fetch(`${base(server)}/api/command`, { method: "GET" });
+    const sessionId = await registerSession(server);
+    const res = await fetch(`${base(server)}${commandPath(sessionId)}`, { method: "GET" });
     expect(res.status).toBe(405);
     expect(res.headers.get("allow")).toBe("POST");
   });

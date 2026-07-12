@@ -2,13 +2,14 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 /**
- * The UI event stream — the Server-Sent Events (SSE) relay to the browser (#13).
+ * The UI event stream — the per-session Server-Sent Events (SSE) relay to the browser
+ * (#13, partitioned per session by #20).
  *
- * This is the downstream half of the zero-build UI transport pair: the worker
- * channel (`worker-channel.ts`) fans every payload it reads off the worker's
- * upstream `POST …/worker/events` leg (§5) out to subscribed UI clients here, and
- * the browser's `EventSource` reads them off `GET /api/events`. The upstream half —
- * the browser's `fetch` POST that steers the worker — is `ui-command.ts`.
+ * This is the downstream half of the zero-build UI transport pair: the worker channel
+ * (`worker-channel.ts`) fans every payload it reads off a session's upstream
+ * `POST …/worker/events` leg (§5) out to the UI clients subscribed to THAT SESSION here,
+ * and the browser's `EventSource` reads them off `GET /api/sessions/{id}/events`. The
+ * upstream half — the browser's `fetch` POST that steers a session — is `ui-command.ts`.
  *
  * The relayed payload is a RAW worker event ({@link JsonValue}) — a `stream-json`
  * message off the `--sdk-url` control transport, not necessarily a `control_event`.
@@ -19,32 +20,32 @@
  * What this slice guarantees:
  *   1. Every relayed event carries a monotonic **`Last-Event-ID`-compatible id**
  *      (SSE's `id:` field). EventSource replays the last id it saw on reconnect,
- *      so the id is what lets a client reconcile the gap it missed. Consuming that
- *      id in the UI / e2e is a later item (#15/#16/#19); the server-side seam —
- *      emitting the id AND replaying past it — lands here so the promise is real.
- *   2. A bounded per-stream **replay buffer**: on reconnect the server replays the
+ *      so the id is what lets a client reconcile the gap it missed. The id is
+ *      PER SESSION — each session's stream has its own monotonic cursor, so a
+ *      reconnect resumes exactly that session's backlog.
+ *   2. A bounded per-session **replay buffer**: on reconnect the server replays the
  *      retained events AFTER the client's `Last-Event-ID`, then goes live. A fresh
  *      connection (no cursor) is NOT replayed the backlog — it starts live.
  *
- * Single-session slice: the server tracks one session (the register / worker
- * channel both enforce it), so there is ONE event stream and every subscriber is
- * viewing that one session. Partitioning the stream per session — routing a
- * `broadcast` to only that session's subscribers — lands with multiplexing, a
- * later item; until then the one stream IS the one session's.
+ * **Per-session partitioning (#20).** Each session id owns its OWN {@link EventStreamState}
+ * relay — subscribers, replay buffer, and event-id cursor are independent — held in the
+ * {@link SessionEventRelays} registry. A `broadcast` for session A reaches ONLY session A's
+ * subscribers; session B's stream never sees it. This IS the "event relay routed to the
+ * correct session, never cross-wired" contract: cross-wiring is structurally impossible
+ * because the session id selects the relay before a single byte is written. A relay is
+ * created lazily (first subscribe OR first broadcast for that session), so a worker event
+ * that arrives before any UI subscriber is still retained for a later reconnect.
  *
- * Browser-facing auth is deferred: the loopback UI ingress is unauthenticated at
- * this slice (the account Bearer is the WORKER's credential, riding §1/§2 —
- * register + session-create — ONLY; the per-session ingress token authorizes the
- * §4/§5 worker channel, never the browser). The local-server credential boundary —
- * how the UI/tunnel authenticates — is the deferred security item.
+ * Browser-facing auth is deferred: the loopback UI ingress is unauthenticated at this
+ * slice (the account Bearer is the WORKER's credential, riding §1/§2 — register +
+ * session-create — ONLY; the per-session ingress token authorizes the §4/§5 worker
+ * channel, never the browser). The local-server credential boundary — how the UI/tunnel
+ * authenticates — is the deferred security item.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { JsonValue } from "@ccctl/core";
+import type { JsonValue, Session } from "@ccctl/core";
 import { writeError } from "./http-response.js";
-
-/** The same-origin path the browser's `EventSource` subscribes to. */
-export const EVENTS_PATH = "/api/events";
 
 /**
  * How many recent events a stream retains for `Last-Event-ID` reconnect replay.
@@ -61,9 +62,9 @@ interface BufferedEvent {
   readonly chunk: string;
 }
 
-/** The per-server SSE relay state: live subscribers plus the replay buffer. */
+/** The per-SESSION SSE relay state: live subscribers plus the replay buffer. */
 export interface EventStreamState {
-  /** The open SSE responses (one per connected UI client). */
+  /** The open SSE responses (one per connected UI client viewing this session). */
   readonly subscribers: Set<ServerResponse>;
   /** Recent events retained for `Last-Event-ID` reconnect replay (bounded). */
   readonly buffer: BufferedEvent[];
@@ -71,9 +72,49 @@ export interface EventStreamState {
   nextEventId: number;
 }
 
-/** A fresh, empty relay state — one per server. */
+/**
+ * The per-server registry of per-session SSE relays, keyed by session id. A session's
+ * relay is created lazily (see {@link relayFor}); the registry never cross-wires two
+ * sessions because a broadcast / subscribe selects the relay by id first.
+ */
+export type SessionEventRelays = Map<string, EventStreamState>;
+
+/**
+ * The per-server state the UI SSE relay reads: the session registry (to validate a
+ * subscribe targets a real session) and the per-session relays. A structural subset of
+ * the overall {@link CcctlServer} state, so this module stays decoupled from the HTTP
+ * wiring in `index.ts`.
+ */
+export interface UiEventStreamState {
+  /** Sessions tracked by the server, keyed by ccctl session id (a subscribe 404s an unknown one). */
+  readonly sessions: ReadonlyMap<string, Session>;
+  /** The per-session SSE relays. */
+  readonly eventRelays: SessionEventRelays;
+}
+
+/** A fresh, empty per-session relay. */
 export function createEventStreamState(): EventStreamState {
   return { subscribers: new Set<ServerResponse>(), buffer: [], nextEventId: 1 };
+}
+
+/** A fresh, empty per-session relay registry — one per server. */
+export function createSessionEventRelays(): SessionEventRelays {
+  return new Map<string, EventStreamState>();
+}
+
+/**
+ * Get-or-create a session's relay. The single lazy-create seam shared by both the
+ * subscribe path ({@link handleEventStream}) and the broadcast path
+ * ({@link broadcastEvent}), so both see the SAME relay instance for a session and a
+ * worker event that predates any subscriber is still buffered for a later reconnect.
+ */
+export function relayFor(relays: SessionEventRelays, sessionId: string): EventStreamState {
+  let relay = relays.get(sessionId);
+  if (relay === undefined) {
+    relay = createEventStreamState();
+    relays.set(sessionId, relay);
+  }
+  return relay;
 }
 
 /**
@@ -99,12 +140,15 @@ function writeChunk(res: ServerResponse, chunk: string): void {
 }
 
 /**
- * Relay one worker event payload to every subscribed UI client over SSE. Assigns
- * the next monotonic `Last-Event-ID` and retains the event in the bounded replay
- * buffer FIRST — regardless of whether anyone is currently subscribed — so a
- * client that reconnects afterwards can still reconcile the gap.
+ * Relay one worker event payload to every UI client subscribed to `sessionId`'s stream
+ * over SSE — and ONLY that session's subscribers (#20: never cross-wired). Assigns the
+ * next monotonic per-session `Last-Event-ID` and retains the event in that session's
+ * bounded replay buffer FIRST — regardless of whether anyone is currently subscribed —
+ * so a client that reconnects afterwards can still reconcile the gap. Lazily materializes
+ * the session's relay, so a worker event that arrives before any UI subscriber is buffered.
  */
-export function broadcastEvent(state: EventStreamState, payload: JsonValue): void {
+export function broadcastEvent(relays: SessionEventRelays, sessionId: string, payload: JsonValue): void {
+  const state = relayFor(relays, sessionId);
   const id = state.nextEventId++;
   const chunk = encodeSseEvent(id, payload);
   state.buffer.push({ id, chunk });
@@ -131,17 +175,28 @@ function parseLastEventId(header: string | string[] | undefined): number | null 
 }
 
 /**
- * Handle `GET /api/events` — subscribe the browser's `EventSource` to the SSE
- * event stream. On a reconnect carrying `Last-Event-ID`, replays the retained
- * events after that cursor before going live; a fresh connection starts live.
- * Non-GET methods fail closed with a 405.
+ * Handle `GET /api/sessions/{id}/events` — subscribe the browser's `EventSource` to
+ * `sessionId`'s SSE stream. Fails closed `404` for an unknown session (never opening a
+ * stream onto a session that does not exist) and `405` for a non-GET method. On a
+ * reconnect carrying `Last-Event-ID`, replays that session's retained events after the
+ * cursor before going live; a fresh connection starts live.
  */
-export function handleEventStream(req: IncomingMessage, res: ServerResponse, state: EventStreamState): void {
+export function handleEventStream(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: UiEventStreamState,
+  sessionId: string,
+): void {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
-    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on ${EVENTS_PATH}`);
+    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on the session events path`);
     return;
   }
+  if (!state.sessions.has(sessionId)) {
+    writeError(res, 404, `ccctl: no session ${sessionId}`);
+    return;
+  }
+  const relay = relayFor(state.eventRelays, sessionId);
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -154,34 +209,36 @@ export function handleEventStream(req: IncomingMessage, res: ServerResponse, sta
   // single-threaded, so no `broadcast` can interleave and be missed.
   res.write(": ccctl event stream\n\n");
 
-  // Reconnect reconciliation: replay everything retained after the client's
-  // cursor, then fall through to live delivery. A fresh connection (no cursor)
-  // is not flooded with the backlog.
+  // Reconnect reconciliation: replay everything this session retained after the
+  // client's cursor, then fall through to live delivery. A fresh connection (no
+  // cursor) is not flooded with the backlog.
   const lastEventId = parseLastEventId(req.headers["last-event-id"]);
   if (lastEventId !== null) {
-    for (const buffered of state.buffer) {
+    for (const buffered of relay.buffer) {
       if (buffered.id > lastEventId) {
         writeChunk(res, buffered.chunk);
       }
     }
   }
 
-  state.subscribers.add(res);
+  relay.subscribers.add(res);
   // Reap the subscriber when the browser disconnects, so a closed EventSource
   // never lingers as a dead write target.
   res.on("close", () => {
-    state.subscribers.delete(res);
+    relay.subscribers.delete(res);
   });
 }
 
 /**
- * End every open SSE stream and clear the subscriber set. Called from server
- * shutdown: an SSE response holds its connection open indefinitely, so
+ * End every open SSE stream across every session and clear each subscriber set. Called
+ * from server shutdown: an SSE response holds its connection open indefinitely, so
  * `httpServer.close()` would otherwise hang waiting on it.
  */
-export function closeEventStreams(state: EventStreamState): void {
-  for (const res of state.subscribers) {
-    res.end();
+export function closeEventStreams(relays: SessionEventRelays): void {
+  for (const relay of relays.values()) {
+    for (const res of relay.subscribers) {
+      res.end();
+    }
+    relay.subscribers.clear();
   }
-  state.subscribers.clear();
 }

@@ -3,7 +3,9 @@
 
 import { describe, it, expect } from "vitest";
 import {
-  COMMAND_PATH,
+  SESSIONS_PATH,
+  sessionEventsPath,
+  sessionCommandPath,
   INPUT_SUBTYPE,
   APPROVE_SUBTYPE,
   REDIRECT_SUBTYPE,
@@ -14,11 +16,16 @@ import {
 } from "./command.js";
 
 describe("wire constants", () => {
-  it("pins the command path and the three steer subtypes to the server contract", () => {
-    expect(COMMAND_PATH).toBe("/api/command");
+  it("pins the sessions path and the three steer subtypes to the server contract", () => {
+    expect(SESSIONS_PATH).toBe("/api/sessions");
     expect(INPUT_SUBTYPE).toBe("prompt");
     expect(APPROVE_SUBTYPE).toBe("approve");
     expect(REDIRECT_SUBTYPE).toBe("interrupt");
+  });
+
+  it("builds per-session view + steer paths that address exactly one session (#20)", () => {
+    expect(sessionEventsPath("sess-42")).toBe("/api/sessions/sess-42/events");
+    expect(sessionCommandPath("sess-42")).toBe("/api/sessions/sess-42/command");
   });
 });
 

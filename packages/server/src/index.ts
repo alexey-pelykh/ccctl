@@ -28,12 +28,15 @@
  * the §4/§5 channel is authorized (in the credentialed wave) by the per-session
  * ingress token the server minted into the work-secret, NEVER the account Bearer.
  *
- * **Browser-facing transport pair (#13).** The worker channel fans every payload off
- * its upstream `worker/events` leg (§5) out to subscribed UI clients over Server-Sent
- * Events (`GET /api/events`); the browser steers back with a `fetch` POST
- * (`POST /api/command`) the server pushes worker-ward as a `client_event` on the
- * session's downstream ({@link CcctlServer.injectTurn} is the programmatic form of the
- * turn-injection leg). Loopback UI ingress is unauthenticated at this slice.
+ * **Browser-facing session namespace (#13, session-addressed by #20).** The UI transport
+ * is per session: `GET /api/sessions` lists the tracked sessions; `GET
+ * /api/sessions/{id}/events` subscribes to one session's Server-Sent Events stream (the
+ * worker channel fans that session's upstream `worker/events` payloads (§5) out to ONLY
+ * its subscribers); and `POST /api/sessions/{id}/command` steers that one session (the
+ * server pushes it worker-ward as a `client_event` on the addressed session's downstream;
+ * {@link CcctlServer.injectTurn} is the programmatic form). Naming the session in the URL
+ * makes cross-wiring between sessions structurally impossible. Loopback UI ingress is
+ * unauthenticated at this slice.
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -53,12 +56,12 @@ import {
 } from "./worker-channel.js";
 import {
   closeEventStreams,
-  createEventStreamState,
-  EVENTS_PATH,
+  createSessionEventRelays,
   handleEventStream,
-  type EventStreamState,
+  type SessionEventRelays,
 } from "./event-stream.js";
-import { COMMAND_PATH, handleUiCommand } from "./ui-command.js";
+import { handleUiCommand } from "./ui-command.js";
+import { handleSessionsList, matchUiSessionRoute } from "./ui-sessions.js";
 import { writeError } from "./http-response.js";
 import {
   DEFAULT_WORK_POLL_TIMEOUT_MS,
@@ -142,8 +145,8 @@ interface ServerState {
   readonly environments: Map<string, EnvironmentRecord>;
   /** The live per-session worker channel (§4/§5): epoch + held-open downstream + seq. */
   readonly workerChannels: Map<string, WorkerChannelRecord>;
-  /** The UI Server-Sent Events relay state — subscribers + Last-Event-ID replay buffer. */
-  readonly events: EventStreamState;
+  /** The per-session UI Server-Sent Events relays — each session its own subscribers + replay buffer. */
+  readonly eventRelays: SessionEventRelays;
   /** Long-poll hold (ms) for an empty `…/work/poll`. */
   readonly workPollTimeoutMs: number;
   /** Provisional at construction; finalized with the resolved port once bound. */
@@ -151,20 +154,28 @@ interface ServerState {
 }
 
 /**
- * Route one HTTP request. The browser-facing UI transport pair is matched first
- * (`GET /api/events`, `POST /api/command`), then the environments-bridge legs (§1
- * environment register, §2 session create, §3 work poll) and the §4/§5 per-session
- * worker channel. Anything else falls through to a fail-closed 404.
+ * Route one HTTP request. The browser-facing session namespace is matched first
+ * (`GET /api/sessions` list, `GET /api/sessions/{id}/events` view, `POST
+ * /api/sessions/{id}/command` steer — all session-addressed, #20), then the
+ * environments-bridge legs (§1 environment register, §2 session create, §3 work poll)
+ * and the §4/§5 per-session worker channel. Anything else falls through to a fail-closed
+ * 404.
  */
 function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerState): void {
   const { pathname } = new URL(req.url ?? "/", "http://localhost");
-  if (pathname === EVENTS_PATH) {
-    handleEventStream(req, res, state.events);
-    return;
-  }
-  if (pathname === COMMAND_PATH) {
-    handleUiCommand(req, res, state);
-    return;
+  const uiSession = matchUiSessionRoute(pathname);
+  if (uiSession !== null) {
+    switch (uiSession.kind) {
+      case "list":
+        handleSessionsList(req, res, state);
+        return;
+      case "events":
+        handleEventStream(req, res, state, uiSession.sessionId);
+        return;
+      case "command":
+        handleUiCommand(req, res, state, uiSession.sessionId);
+        return;
+    }
   }
   if (pathname === ENVIRONMENTS_BRIDGE_PATH) {
     handleEnvironmentRegister(req, res, state);
@@ -232,11 +243,11 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
         // mid-poll hangs for up to workPollTimeoutMs. Same rationale as the SSE
         // teardown below.
         settlePendingPolls(state);
-        // End open SSE streams — both the UI relay (`/api/events`) and every held-open
-        // worker downstream (`worker/events/stream`). An SSE response holds its
-        // connection open indefinitely and is never "idle", so `closeIdleConnections()`
-        // below would leave it and `close()` would hang waiting on it.
-        closeEventStreams(state.events);
+        // End open SSE streams — every session's UI relay (`/api/sessions/{id}/events`)
+        // and every held-open worker downstream (`worker/events/stream`). An SSE response
+        // holds its connection open indefinitely and is never "idle", so
+        // `closeIdleConnections()` below would leave it and `close()` would hang waiting on it.
+        closeEventStreams(state.eventRelays);
         closeWorkerChannels(state);
         // Release idle keep-alive HTTP sockets so a quiescent server closes promptly
         // instead of waiting on pooled client connections.
@@ -257,7 +268,7 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     sessions: new Map<string, Session>(),
     environments: new Map<string, EnvironmentRecord>(),
     workerChannels: new Map<string, WorkerChannelRecord>(),
-    events: createEventStreamState(),
+    eventRelays: createSessionEventRelays(),
     workPollTimeoutMs: config.workPollTimeoutMs ?? DEFAULT_WORK_POLL_TIMEOUT_MS,
     address: { host, port: config.port },
   };

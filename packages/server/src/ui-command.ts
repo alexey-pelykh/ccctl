@@ -2,13 +2,16 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 /**
- * The UI command ingress — the browser's `fetch` POST that steers the worker (#13).
+ * The UI command ingress — the browser's `fetch` POST that steers a session's worker
+ * (#13, session-addressed by #20).
  *
  * This is the upstream half of the zero-build UI transport pair: the browser POSTs a
- * `{ subtype, payload? }` command to `POST /api/command`, and the server pushes it
- * worker-ward as a `client_event` frame down the session's held-open worker
+ * `{ subtype, payload? }` command to `POST /api/sessions/{id}/command`, and the server
+ * pushes it worker-ward as a `client_event` frame down THAT SESSION's held-open worker
  * downstream (§4/§5), reusing `worker-channel.ts`, never re-implementing the framing.
- * The downstream half — the SSE event stream the browser reads — is `event-stream.ts`.
+ * The steered session is named in the URL ({@link matchUiSessionRoute}), never inferred —
+ * so a steer for session A can never land on session B (#20: never cross-wired). The
+ * downstream half — the SSE event stream the browser reads — is `event-stream.ts`.
  *
  * The command's `subtype` selects the frame's `payload.type` (the worker's demux key):
  *
@@ -30,9 +33,6 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ControlRequest } from "@ccctl/core";
 import { writeError, writeJson } from "./http-response.js";
 import { dispatchControlRequest, injectUserTurn, type WorkerChannelState } from "./worker-channel.js";
-
-/** The same-origin path the browser POSTs UI steer commands to. */
-export const COMMAND_PATH = "/api/command";
 
 /** The "send input" steer verb — mapped to a `{ type: "user" }` turn injection (mirrors `@ccctl/web-ui`). */
 const INPUT_SUBTYPE = "prompt";
@@ -79,24 +79,24 @@ function parseUiCommand(bodyText: string): UiCommand | null {
   return { subtype, payload: payload as Record<string, unknown> };
 }
 
-/** Resolve the single current session id, or `null` when none is registered. */
-function currentSessionId(state: WorkerChannelState): string | null {
-  for (const id of state.sessions.keys()) {
-    return id;
-  }
-  return null;
-}
-
 /**
- * Handle `POST /api/command` — push a UI steer worker-ward as a `client_event` on the
- * session's worker downstream. Reads the body with a size cap, validates it, then
- * relays; answers `202` with the minted correlation id, or a fail-closed status on any
- * branch that cannot be relayed.
+ * Handle `POST /api/sessions/{id}/command` — push a UI steer worker-ward as a
+ * `client_event` on THAT session's worker downstream. The `sessionId` is named in the
+ * URL by the caller ({@link matchUiSessionRoute}), never inferred, so a steer addresses
+ * exactly one session (#20: never cross-wired). Reads the body with a size cap,
+ * validates it, then relays; answers `202` with the minted correlation id, or a
+ * fail-closed status on any branch that cannot be relayed (unknown session → 404,
+ * no live worker → 409).
  */
-export function handleUiCommand(req: IncomingMessage, res: ServerResponse, state: WorkerChannelState): void {
+export function handleUiCommand(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: WorkerChannelState,
+  sessionId: string,
+): void {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
-    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on ${COMMAND_PATH}`);
+    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on the session command path`);
     return;
   }
 
@@ -129,9 +129,8 @@ export function handleUiCommand(req: IncomingMessage, res: ServerResponse, state
       writeError(res, 400, "ccctl: malformed command (expected JSON `{ subtype, payload? }`)");
       return;
     }
-    const sessionId = currentSessionId(state);
-    if (sessionId === null) {
-      writeError(res, 404, "ccctl: no session to steer");
+    if (!state.sessions.has(sessionId)) {
+      writeError(res, 404, `ccctl: no session ${sessionId}`);
       return;
     }
     // A `prompt` steer needs a non-empty text before anything is relayed (400).
