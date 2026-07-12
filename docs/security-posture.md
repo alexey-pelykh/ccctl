@@ -77,6 +77,14 @@ never needs a public IP, never opens an inbound port, and never registers with
 claude.ai. The tunnel is the single path from outside the machine to the
 loopback-bound server.
 
+The Tailscale backend makes that tunnel's auth **mandatory**: it exposes the
+server with `tailscale serve` (tailnet-private — never the public `tailscale
+funnel`) and refuses to establish unless the node is an authenticated, connected
+tailnet member, so an unauthorized device can never reach the daemon. _Which_
+authenticated devices may reach it is then governed by the tailnet's own ACL
+policy — operator-owned central state the adapter relies on and deliberately
+never provisions or overwrites.
+
 ## Deferred to a later item
 
 This stub deliberately stops at the posture above. The complete security

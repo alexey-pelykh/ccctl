@@ -11,13 +11,17 @@
  * local {@link HostEndpoint} reachable and report back the public host the
  * worker's `--sdk-url` allowlist must then be told to permit.
  *
- * This item completes the Tailscale {@link Tunnel} lifecycle:
+ * This item completes the Tailscale {@link Tunnel} adapter:
  * {@link TailscaleTunnel.establish | establish} brings the tunnel up over the
- * tailnet (reachable with no public IP and no open inbound port),
+ * tailnet (no public IP and no open inbound port) and enforces mandatory
+ * tunnel-auth — it refuses unless the node is an authenticated, connected
+ * tailnet member, so an unauthorized device can never reach the daemon;
  * {@link TailscaleTunnel.status | status} reports whether it is up and the host
- * it is reachable at, and {@link TailscaleTunnel.teardown | teardown} releases
- * it cleanly. Tailscale ACL provisioning and mandatory tunnel-auth, and the
- * Cloudflare / Headscale backends, are still to come.
+ * it is reachable at; and {@link TailscaleTunnel.teardown | teardown} releases
+ * it cleanly. Which authenticated devices may reach the endpoint is governed by
+ * the tailnet's own ACL policy — operator-owned central state the adapter relies
+ * on and deliberately never provisions or overwrites. The Cloudflare / Headscale
+ * backends are still to come.
  */
 
 import { execFile } from "node:child_process";
@@ -150,9 +154,29 @@ export const defaultCommandRunner: CommandRunner = {
 const TAILSCALE_BIN = "tailscale";
 
 /**
- * The `Self` fields the adapter reads out of `tailscale status --json`. The CLI
- * emits far more; this is only the slice host resolution needs, and each field
- * is `unknown` because the process output is untrusted and read back defensively.
+ * The one `BackendState` (from `tailscale status --json`) that means the node is
+ * an authenticated, connected member of a tailnet. Every other state
+ * (`NeedsLogin`, `NeedsMachineAuth`, `Stopped`, `Starting`, `NoState`, …) means
+ * the tailnet's authentication is not in force, so the reachability guarantee
+ * mandatory tunnel-auth rests on does not hold — {@link requireTailnetAuth}
+ * refuses to establish in any of them.
+ */
+const TAILNET_RUNNING_STATE = "Running";
+
+/**
+ * The fields the adapter reads out of `tailscale status --json`. The CLI emits
+ * far more; this is only the slice establish needs — `BackendState` to enforce
+ * mandatory tunnel-auth and `Self` to resolve the reachable host — and each is
+ * `unknown` because the process output is untrusted and read back defensively.
+ */
+interface TailscaleStatus {
+  readonly BackendState?: unknown;
+  readonly Self?: unknown;
+}
+
+/**
+ * The `Self` fields host resolution needs, out of {@link TailscaleStatus}. Each
+ * is `unknown` for the same reason: the status JSON is untrusted CLI output.
  */
 interface TailscaleSelf {
   readonly DNSName?: unknown;
@@ -163,15 +187,20 @@ interface TailscaleSelf {
  * Tailscale {@link Tunnel}. `establish` brings the loopback endpoint up over
  * the tailnet with `tailscale serve` — reachable only inside the tailnet, so no
  * public IP and no open inbound port (in deliberate contrast to `tailscale
- * funnel`, which is public and is NOT used) — then resolves the node's tailnet
- * host from `tailscale status`. `status` reports the tracked lifecycle state (up
- * with the reachable host, or down) and `teardown` turns that same serve mapping
- * back off.
+ * funnel`, which is public and is NOT used) — then reads `tailscale status`
+ * once to both enforce mandatory tunnel-auth (it refuses unless the node is an
+ * authenticated, connected tailnet member) and resolve the node's tailnet host.
+ * `status` reports the tracked lifecycle state (up with the reachable host, or
+ * down) and `teardown` turns that same serve mapping back off.
  *
  * The instance tracks what it served, so `status` / `teardown` act on exactly
  * the mapping this `establish` brought up — a fresh instance per `establish`
- * (see {@link ADAPTERS}). ACL provisioning and mandatory tunnel-auth still land
- * with the complete adapter.
+ * (see {@link ADAPTERS}). Which authenticated devices may actually reach the
+ * endpoint is governed by the tailnet's own ACL policy — operator-owned central
+ * state the adapter relies on and deliberately never provisions or overwrites
+ * (mutating it per-establish would clobber the operator's hand-authored policy,
+ * exactly the blunt-instrument reach `teardown` avoids by not running `serve
+ * reset`).
  */
 export class TailscaleTunnel implements Tunnel {
   readonly kind = "tailscale" as const;
@@ -213,11 +242,13 @@ export class TailscaleTunnel implements Tunnel {
     // `formatAuthority` brackets an IPv6 loopback (`[::1]:port`), so `::1` — a
     // host `isLoopbackHost` accepts — yields a valid URL, not `http://::1:port`.
     await this.#runner.run(TAILSCALE_BIN, ["serve", "--bg", this.#serveTarget(local)]);
-    // The mapping is up now; record it before resolving the host so `teardown`
-    // can release it even if host resolution below throws.
+    // The mapping is up now; record it before verifying auth / resolving the host
+    // so `teardown` can release it even if either step below throws — a half-up
+    // serve (e.g. brought up on a node that turns out not to be authenticated)
+    // stays cleanly releasable.
     this.#servedLocal = local;
 
-    const established: EstablishedTunnel = { kind: this.kind, publicHost: await this.#resolveTailnetHost() };
+    const established: EstablishedTunnel = { kind: this.kind, publicHost: await this.#resolveReachableHost() };
     this.#established = established;
     return established;
   }
@@ -254,10 +285,22 @@ export class TailscaleTunnel implements Tunnel {
     return `http://${formatAuthority(local.host, local.port)}`;
   }
 
-  /** Resolve this node's tailnet host from `tailscale status --json`. */
-  async #resolveTailnetHost(): Promise<string> {
+  /**
+   * Read `tailscale status --json` ONCE and, from that single read, both enforce
+   * mandatory tunnel-auth and resolve this node's reachable tailnet host — in
+   * that order, so an unauthenticated node is refused before any reachable base
+   * is reported. Reusing the one status read host resolution already needs keeps
+   * the auth gate free of extra process I/O.
+   */
+  async #resolveReachableHost(): Promise<string> {
     const { stdout } = await this.#runner.run(TAILSCALE_BIN, ["status", "--json"]);
-    const host = tailnetHostFromSelf(parseTailscaleSelf(stdout));
+    const status = parseTailscaleStatus(stdout);
+    // Mandatory tunnel-auth: refuse unless the node is a Running, authenticated
+    // tailnet member — the precondition the "unauthorized device cannot reach the
+    // daemon" guarantee rests on. Checked before host resolution: never report a
+    // reachable base the tailnet's authentication is not actually backing.
+    requireTailnetAuth(status);
+    const host = tailnetHostFromSelf(selfFromStatus(status));
     if (host === null) {
       throw new Error(
         "ccctl: tailscale is serving but reported no tailnet host (DNSName / TailscaleIPs) — is it logged in?",
@@ -267,8 +310,8 @@ export class TailscaleTunnel implements Tunnel {
   }
 }
 
-/** Pull the `Self` object out of `tailscale status --json`, defensively. */
-function parseTailscaleSelf(stdout: string): TailscaleSelf {
+/** Parse `tailscale status --json` into its top-level object, defensively. */
+function parseTailscaleStatus(stdout: string): TailscaleStatus {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout) as unknown;
@@ -278,10 +321,35 @@ function parseTailscaleSelf(stdout: string): TailscaleSelf {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new Error("ccctl: tailscale status JSON is not an object");
   }
-  if (!("Self" in parsed)) {
+  // A non-null, non-array object; `TailscaleStatus`'s fields are all optional
+  // `unknown`, so it is already assignable — each field is narrowed at its use.
+  return parsed;
+}
+
+/**
+ * Enforce mandatory tunnel-auth: throw unless the status reports the node as a
+ * {@link TAILNET_RUNNING_STATE | Running} — authenticated and connected —
+ * tailnet member. Fail closed: any other, absent, or non-string `BackendState`
+ * is treated as auth-not-in-force and rejected, so the tunnel is never reported
+ * up in a posture where an unauthorized device might reach the daemon.
+ */
+function requireTailnetAuth(status: TailscaleStatus): void {
+  const { BackendState } = status;
+  if (BackendState === TAILNET_RUNNING_STATE) {
+    return;
+  }
+  const reported = typeof BackendState === "string" && BackendState.trim() !== "" ? BackendState : "unset";
+  throw new Error(
+    `ccctl: tailscale is not an authenticated tailnet member (BackendState=${reported}) — refusing to expose the daemon without mandatory tunnel-auth; run \`tailscale up\` to join a tailnet first`,
+  );
+}
+
+/** Pull the `Self` object out of a parsed {@link TailscaleStatus}, defensively. */
+function selfFromStatus(status: TailscaleStatus): TailscaleSelf {
+  if (!("Self" in status)) {
     throw new Error("ccctl: tailscale status JSON has no `Self` — cannot resolve the tailnet host");
   }
-  const self: unknown = parsed.Self;
+  const self: unknown = status.Self;
   if (typeof self !== "object" || self === null) {
     throw new Error("ccctl: tailscale status `Self` is not an object");
   }

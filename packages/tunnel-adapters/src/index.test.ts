@@ -39,9 +39,13 @@ function fakeRunner(handler: (call: RecordedCall) => CommandOutput): {
   return { runner, calls };
 }
 
-/** `tailscale status --json` output naming the node `host.tailnet.ts.net`. */
-function statusJson(self: Record<string, unknown>): CommandOutput {
-  return { stdout: JSON.stringify({ Self: self }), stderr: "" };
+/**
+ * `tailscale status --json` output for a node — authenticated (`BackendState:
+ * "Running"`) by default, so every existing establish path exercises the happy
+ * tunnel-auth case; pass a different `backendState` to exercise the auth gate.
+ */
+function statusJson(self: Record<string, unknown>, backendState = "Running"): CommandOutput {
+  return { stdout: JSON.stringify({ BackendState: backendState, Self: self }), stderr: "" };
 }
 
 const LOOPBACK: HostEndpoint = { host: "127.0.0.1", port: 4321 };
@@ -138,13 +142,18 @@ describe("TailscaleTunnel.establish (AC: brings a Tailscale tunnel up)", () => {
   });
 
   it("rejects when `tailscale status` JSON has no `Self`", async () => {
-    const { runner } = fakeRunner(tailscaleHandler({ stdout: JSON.stringify({ Peer: {} }), stderr: "" }));
+    // Authenticated (`Running`) so it clears the auth gate and reaches the Self check.
+    const { runner } = fakeRunner(
+      tailscaleHandler({ stdout: JSON.stringify({ BackendState: "Running", Peer: {} }), stderr: "" }),
+    );
 
     await expect(new TailscaleTunnel(runner).establish(LOOPBACK)).rejects.toThrow(/has no/);
   });
 
   it("rejects when `tailscale status` `Self` is not an object", async () => {
-    const { runner } = fakeRunner(tailscaleHandler({ stdout: JSON.stringify({ Self: "nope" }), stderr: "" }));
+    const { runner } = fakeRunner(
+      tailscaleHandler({ stdout: JSON.stringify({ BackendState: "Running", Self: "nope" }), stderr: "" }),
+    );
 
     await expect(new TailscaleTunnel(runner).establish(LOOPBACK)).rejects.toThrow(/Self.+not an object/);
   });
@@ -154,6 +163,57 @@ describe("TailscaleTunnel.establish (AC: brings a Tailscale tunnel up)", () => {
     const runner: CommandRunner = { run: () => Promise.reject(boom) };
 
     await expect(new TailscaleTunnel(runner).establish(LOOPBACK)).rejects.toBe(boom);
+  });
+});
+
+describe("TailscaleTunnel mandatory tunnel-auth (AC: an unauthorized device cannot reach the daemon)", () => {
+  it("refuses unless the node is an authenticated tailnet member (BackendState != Running)", async () => {
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." }, "NeedsLogin")));
+
+    await expect(new TailscaleTunnel(runner).establish(LOOPBACK)).rejects.toThrow(/mandatory tunnel-auth/);
+  });
+
+  it("names the reported backend state in the refusal, so the operator knows why", async () => {
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." }, "NeedsLogin")));
+
+    await expect(new TailscaleTunnel(runner).establish(LOOPBACK)).rejects.toThrow(/BackendState=NeedsLogin/);
+  });
+
+  it("fails closed when the status reports no BackendState at all", async () => {
+    // A well-formed status with a resolvable host but no `BackendState`: absence of
+    // proof of auth is treated as auth-not-in-force, never waved through.
+    const { runner } = fakeRunner(
+      tailscaleHandler({ stdout: JSON.stringify({ Self: { DNSName: "host.ts.net." } }), stderr: "" }),
+    );
+
+    await expect(new TailscaleTunnel(runner).establish(LOOPBACK)).rejects.toThrow(/mandatory tunnel-auth/);
+  });
+
+  it("leaves the serve releasable when the auth gate rejects (half-up, AC: clean release)", async () => {
+    // `serve` succeeds, then the auth gate rejects — the mapping is up but is not a
+    // usable tunnel. It must stay releasable, exactly like a half-up host-resolution failure.
+    const { runner, calls } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." }, "Stopped")));
+    const tunnel = new TailscaleTunnel(runner);
+
+    await expect(tunnel.establish(LOOPBACK)).rejects.toThrow(/mandatory tunnel-auth/);
+    // Not a usable `up` (auth was never in force) — reports down …
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: false });
+
+    await tunnel.teardown();
+    // … yet teardown still turns the dangling serve mapping off.
+    expect(calls.some((c) => c.args.join(" ") === "serve --bg http://127.0.0.1:4321 off")).toBe(true);
+  });
+
+  it("provisions no ACL policy — relies on the operator's, driving only `serve` + `status`", async () => {
+    // Which authenticated devices may reach the endpoint is the tailnet's own,
+    // operator-owned ACL policy; the adapter relies on it and never provisions or
+    // overwrites it. A completed establish drives exactly `serve` then `status` —
+    // never `set`, `funnel`, `up`, or any other tailnet-policy write.
+    const { runner, calls } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+
+    await new TailscaleTunnel(runner).establish(LOOPBACK);
+
+    expect(calls.map((c) => c.args[0])).toEqual(["serve", "status"]);
   });
 });
 
