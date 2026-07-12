@@ -8,7 +8,6 @@ import type { Socket } from "node:net";
 import {
   DEFAULT_REQUIRES_ACTION_DETAIL,
   encodeControlFrame,
-  SESSIONS_CREATE_PATH,
   SESSIONS_PATH,
   type ControlEvent,
   type ControlRequest,
@@ -38,13 +37,17 @@ afterEach(async () => {
   }
 });
 
-/** Register a session over the real (legacy) HTTP endpoint and return its id. */
+/** Create a session over the current §2 flow (`POST /v1/sessions`) and return its id. */
 async function registerSession(server: CcctlServer): Promise<string> {
   const { host, port } = server.address;
-  const res = await fetch(`http://${host}:${port}${SESSIONS_CREATE_PATH}`, {
+  const res = await fetch(`http://${host}:${port}${SESSIONS_PATH}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${ACCOUNT_BEARER}` },
-    body: JSON.stringify({ sessionIngressToken: "ingress-token-1" }),
+    body: JSON.stringify({
+      context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
+      source: "ui",
+      permission_mode: "default",
+    }),
   });
   const payload = (await res.json()) as { session_id: string };
   return payload.session_id;
@@ -220,20 +223,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void
 }
 
 describe("worker channel — WebSocket at ws_url", () => {
-  it("opens the channel and moves the session connecting → ready (AC#1)", async () => {
-    const server = await startTestServer();
-    const sessionId = await registerSession(server);
-    expect(server.sessions.get(sessionId)?.status).toBe("connecting");
-
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
-    expect(outcome.kind).toBe("upgrade");
-    await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
-  });
-
   it("opens the channel at the §2-minted /v1/sessions/{id}/ws and reaches ready with the account Bearer (AC#1, current flow)", async () => {
     const server = await startTestServer();
     const { sessionId, wsPath } = await createBridgeSession(server);
-    // The current flow mints the worker channel under /v1/sessions/{id}/ws, not the legacy base.
+    // The current flow mints the worker channel under /v1/sessions/{id}/ws.
     expect(wsPath).toBe(`${SESSIONS_PATH}/${sessionId}/ws`);
     expect(server.sessions.get(sessionId)?.status).toBe("connecting");
 
@@ -253,7 +246,7 @@ describe("worker channel — WebSocket at ws_url", () => {
   it("reads worker_status frames and surfaces the tri-state activity (AC#2)", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (outcome.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${outcome.kind}`);
     }
@@ -280,7 +273,7 @@ describe("worker channel — WebSocket at ws_url", () => {
   it("supplies the default detail for a requires_action frame that carries none", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (outcome.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${outcome.kind}`);
     }
@@ -295,7 +288,7 @@ describe("worker channel — WebSocket at ws_url", () => {
   it("skips a malformed line and keeps reading the channel", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (outcome.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${outcome.kind}`);
     }
@@ -319,7 +312,7 @@ describe("worker channel — WebSocket at ws_url", () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
 
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`, { authorization: null });
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`, { authorization: null });
     expect(outcome).toEqual({ kind: "response", status: 401 });
     // The channel never opened: the session stays in its pre-connect lifecycle.
     expect(server.sessions.get(sessionId)?.status).toBe("connecting");
@@ -328,13 +321,13 @@ describe("worker channel — WebSocket at ws_url", () => {
   it("fails closed on an unknown session id (404)", async () => {
     const server = await startTestServer();
     await registerSession(server);
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/does-not-exist/ws`);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/does-not-exist/ws`);
     expect(outcome).toEqual({ kind: "response", status: 404 });
   });
 
   it("fails closed on a non-worker-channel path (404)", async () => {
     const server = await startTestServer();
-    const outcome = await openWorkerChannel(server, "/v1/code/nope");
+    const outcome = await openWorkerChannel(server, "/v1/nope");
     expect(outcome).toEqual({ kind: "response", status: 404 });
   });
 
@@ -342,7 +335,7 @@ describe("worker channel — WebSocket at ws_url", () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
 
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`, {
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`, {
       upgradeHeader: "h2c",
     });
     expect(outcome).toEqual({ kind: "response", status: 400 });
@@ -353,7 +346,7 @@ describe("worker channel — WebSocket at ws_url", () => {
   it("moves the session to closed when the worker sends a WebSocket Close frame", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (outcome.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${outcome.kind}`);
     }
@@ -366,7 +359,7 @@ describe("worker channel — WebSocket at ws_url", () => {
   it("reaps the channel on an unclean disconnect (TCP FIN, no Close frame) and frees the slot", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const first = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const first = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (first.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${first.kind}`);
     }
@@ -378,7 +371,7 @@ describe("worker channel — WebSocket at ws_url", () => {
     await waitFor(() => server.sessions.get(sessionId)?.status === "closed");
 
     // The slot is freed: a reconnect for the same session is accepted, not 409'd.
-    const second = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const second = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     expect(second.kind).toBe("upgrade");
     await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
   });
@@ -386,7 +379,7 @@ describe("worker channel — WebSocket at ws_url", () => {
   it("refuses a second concurrent worker channel for the same session (409)", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const first = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const first = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (first.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${first.kind}`);
     }
@@ -394,7 +387,7 @@ describe("worker channel — WebSocket at ws_url", () => {
 
     // The first channel is still live: a second upgrade for the same session fails
     // closed rather than racing two channels over one session's state.
-    const second = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const second = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     expect(second).toEqual({ kind: "response", status: 409 });
     // The live channel is untouched.
     expect(server.sessions.get(sessionId)?.status).toBe("ready");
@@ -403,7 +396,7 @@ describe("worker channel — WebSocket at ws_url", () => {
   it("tears the channel down on a framing protocol error (an unmasked client frame)", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (outcome.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${outcome.kind}`);
     }
@@ -438,7 +431,7 @@ describe("worker channel — steer relay (UI → worker, §2)", () => {
   it.each(STEERS)("writes a $verb steer to the correct session's worker WebSocket (AC#1)", async ({ request }) => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (outcome.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${outcome.kind}`);
     }
@@ -457,7 +450,7 @@ describe("worker channel — steer relay (UI → worker, §2)", () => {
   it("delivers the steer over the live channel of a running session — the turn continues (AC#2)", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (outcome.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${outcome.kind}`);
     }
@@ -485,7 +478,7 @@ describe("worker channel — steer relay (UI → worker, §2)", () => {
   it("writes a large steer that needs an extended-length frame (>126 bytes)", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (outcome.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${outcome.kind}`);
     }
@@ -524,7 +517,7 @@ describe("worker channel — steer relay (UI → worker, §2)", () => {
   it("stops delivering steers once the channel is reaped (fail-closed after close)", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    const outcome = await openWorkerChannel(server, `${SESSIONS_CREATE_PATH}/${sessionId}/ws`);
+    const outcome = await openWorkerChannel(server, `${SESSIONS_PATH}/${sessionId}/ws`);
     if (outcome.kind !== "upgrade") {
       throw new Error(`expected an upgrade, got ${outcome.kind}`);
     }

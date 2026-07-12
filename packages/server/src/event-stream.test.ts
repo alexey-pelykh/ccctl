@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
-import { encodeControlFrame, SESSIONS_CREATE_PATH, type ControlEvent } from "@ccctl/core";
+import { encodeControlFrame, SESSIONS_PATH, type ControlEvent } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
 
 const ACCOUNT_BEARER = "oauth-account-secret-sse-abc123";
@@ -34,13 +34,17 @@ afterEach(async () => {
   }
 });
 
-/** Register a session over the real HTTP endpoint and return its id. */
+/** Create a session over the current §2 flow (`POST /v1/sessions`) and return its id. */
 async function registerSession(server: CcctlServer): Promise<string> {
   const { host, port } = server.address;
-  const res = await fetch(`http://${host}:${port}${SESSIONS_CREATE_PATH}`, {
+  const res = await fetch(`http://${host}:${port}${SESSIONS_PATH}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${ACCOUNT_BEARER}` },
-    body: JSON.stringify({ sessionIngressToken: "ingress-token-1" }),
+    body: JSON.stringify({
+      context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
+      source: "ui",
+      permission_mode: "default",
+    }),
   });
   const payload = (await res.json()) as { session_id: string };
   return payload.session_id;
@@ -155,7 +159,7 @@ function openWorkerChannel(server: CcctlServer, sessionId: string): Promise<Sock
     Authorization: `Bearer ${ACCOUNT_BEARER}`,
   };
   return new Promise<Socket>((resolve, reject) => {
-    const req = httpRequest({ host, port, path: `${SESSIONS_CREATE_PATH}/${sessionId}/ws`, method: "GET", headers });
+    const req = httpRequest({ host, port, path: `${SESSIONS_PATH}/${sessionId}/ws`, method: "GET", headers });
     req.on("upgrade", (_res, socket) => {
       sockets.push(socket);
       resolve(socket);

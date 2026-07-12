@@ -57,7 +57,7 @@ import {
   toEnvironmentRegisterResponseWire,
   toWorkPollResponseWire,
 } from "./bridge-wire.js";
-import { toRegisterResponseWire } from "./register-wire.js";
+import { toSessionCreateResponseWire } from "./session-create-wire.js";
 
 /** Hard ceiling on a bridge request body (1 MiB) — a control-plane body fits well within it. */
 const MAX_BRIDGE_BODY_BYTES = 1024 * 1024;
@@ -200,7 +200,7 @@ export function handleSessionCreate(req: IncomingMessage, res: ServerResponse, s
     state.sessions.set(sessionId, createSession(sessionId));
     // Serialize through the golden-pinned wire seam (ADR-001), never the core object
     // directly — the §2 response IS the `{ session_id, ws_url }` body the worker parses.
-    writeJson(res, 201, toRegisterResponseWire({ sessionId, wsUrl }));
+    writeJson(res, 201, toSessionCreateResponseWire({ sessionId, wsUrl }));
   });
 }
 

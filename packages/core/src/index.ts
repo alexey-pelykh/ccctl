@@ -374,18 +374,6 @@ export function workStopPath(environmentId: string, workId: string): string {
   return `${environmentWorkPath(environmentId)}/${workId}/stop`;
 }
 
-/**
- * The previous build's single-step register path (`POST /v1/code/sessions`, #6),
- * retained ONLY as transitional compat: the realigned `@ccctl/server` (#123) keeps
- * a legacy register route on it while its own environments-bridge flow is the
- * canonical path, and the not-yet-realigned `@ccctl/e2e` harness still drives it.
- * The current flow splits that step into environment-register
- * ({@link ENVIRONMENTS_BRIDGE_PATH}) and session-create ({@link SESSIONS_PATH});
- * this constant — and the server's legacy route — are removed once the e2e
- * realigns onto the current flow (#124). New code targets {@link SESSIONS_PATH}.
- */
-export const SESSIONS_CREATE_PATH = "/v1/code/sessions";
-
 // --- credentials ---
 //
 // Two credential CLASSES ride the bridge, on opposite legs and with opposite

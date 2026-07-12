@@ -5,7 +5,7 @@
  * The worker-channel WebSocket — bridge-protocol §2/§3 (the server side).
  *
  * `@ccctl/server` mints a `ws_url` pointing at its OWN bound address
- * (`ws://host:port/v1/code/sessions/{id}/ws`), so the ccctl server IS the
+ * (`ws://host:port/v1/sessions/{id}/ws`), so the ccctl server IS the
  * WebSocket server: the patched worker (or, in tests, a client stand-in) dials in
  * and streams `stream-json` frames server-ward. This module accepts that upgrade
  * and reads the channel; "the server opens the worker WebSocket at ws_url" (AC-1)
@@ -43,7 +43,6 @@ import {
   applyWorkerStatusFrame,
   ControlFrameDecoder,
   encodeControlFrame,
-  SESSIONS_CREATE_PATH,
   SESSIONS_PATH,
   type ControlRequest,
   type Session,
@@ -298,31 +297,21 @@ export function dispatchToWorkerChannel(state: WorkerChannelState, sessionId: st
 }
 
 /**
- * The worker-channel path bases a `ws_url` may be minted under: the current flow's
- * session-create ({@link SESSIONS_PATH} → `/v1/sessions/{id}/ws`) and the retained
- * legacy register ({@link SESSIONS_CREATE_PATH} → `/v1/code/sessions/{id}/ws`).
- * Neither is a prefix of the other, so match order is irrelevant.
- */
-const WORKER_CHANNEL_PATH_BASES: readonly string[] = [SESSIONS_PATH, SESSIONS_CREATE_PATH];
-
-/**
- * Extract the session id from a worker-channel path (`{base}/{sessionId}/ws`, for a
- * base in {@link WORKER_CHANNEL_PATH_BASES}), or `null` when the path is not a
- * worker-channel URL or carries an empty / nested session segment.
+ * Extract the session id from a worker-channel path — `{@link SESSIONS_PATH}/{sessionId}/ws`
+ * (`/v1/sessions/{id}/ws`), the base the §2 session-create mints its `ws_url` under — or
+ * `null` when the path is not a worker-channel URL or carries an empty / nested session segment.
  */
 function matchWorkerChannelPath(pathname: string): string | null {
   const suffix = "/ws";
   if (!pathname.endsWith(suffix)) {
     return null;
   }
-  for (const base of WORKER_CHANNEL_PATH_BASES) {
-    const prefix = `${base}/`;
-    if (pathname.startsWith(prefix)) {
-      const sessionId = pathname.slice(prefix.length, pathname.length - suffix.length);
-      return sessionId === "" || sessionId.includes("/") ? null : sessionId;
-    }
+  const prefix = `${SESSIONS_PATH}/`;
+  if (!pathname.startsWith(prefix)) {
+    return null;
   }
-  return null;
+  const sessionId = pathname.slice(prefix.length, pathname.length - suffix.length);
+  return sessionId === "" || sessionId.includes("/") ? null : sessionId;
 }
 
 /** Update a session's transport-lifecycle `status`, leaving its other dimensions untouched. */

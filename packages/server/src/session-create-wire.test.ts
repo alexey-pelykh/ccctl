@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { SessionCreateResponse } from "@ccctl/core";
-import { toRegisterResponseWire } from "./register-wire.js";
+import { toSessionCreateResponseWire } from "./session-create-wire.js";
 
 // A fixed, credential-free SessionCreateResponse (core's camelCase model) and the
 // EXACT snake_case bytes it must serialize to. Hardcoding the golden string —
@@ -11,20 +11,20 @@ import { toRegisterResponseWire } from "./register-wire.js";
 // a renamed key, a reordered field, an extra property, or a reverted casing all
 // change these bytes and fail closed (ADR-001; bridge-protocol §1/§2). This pins
 // the wire shape deterministically, complementing the live-endpoint contract
-// test in index.test.ts.
+// test in the §2 session-create suite (environments-bridge.test.ts).
 const CORE_RESPONSE: SessionCreateResponse = {
   sessionId: "sess-1",
-  wsUrl: "ws://127.0.0.1:8787/v1/code/sessions/sess-1/ws",
+  wsUrl: "ws://127.0.0.1:8787/v1/sessions/sess-1/ws",
 };
-const GOLDEN_WIRE_JSON = '{"session_id":"sess-1","ws_url":"ws://127.0.0.1:8787/v1/code/sessions/sess-1/ws"}';
+const GOLDEN_WIRE_JSON = '{"session_id":"sess-1","ws_url":"ws://127.0.0.1:8787/v1/sessions/sess-1/ws"}';
 
-describe("toRegisterResponseWire — register-response wire DTO (ADR-001)", () => {
-  it("serializes core's camelCase RegisterResponse to the exact snake_case wire bytes", () => {
-    expect(JSON.stringify(toRegisterResponseWire(CORE_RESPONSE))).toBe(GOLDEN_WIRE_JSON);
+describe("toSessionCreateResponseWire — session-create response wire DTO (ADR-001)", () => {
+  it("serializes core's camelCase SessionCreateResponse to the exact snake_case wire bytes", () => {
+    expect(JSON.stringify(toSessionCreateResponseWire(CORE_RESPONSE))).toBe(GOLDEN_WIRE_JSON);
   });
 
   it("emits exactly session_id + ws_url, in that order, and no camelCase key leaks", () => {
-    const wire = toRegisterResponseWire(CORE_RESPONSE);
+    const wire = toSessionCreateResponseWire(CORE_RESPONSE);
     // Key set AND order are pinned; a stray, missing, or renamed field fails closed.
     expect(Object.keys(wire)).toEqual(["session_id", "ws_url"]);
     // Core's internal casing must not reach the wire.
@@ -33,7 +33,7 @@ describe("toRegisterResponseWire — register-response wire DTO (ADR-001)", () =
   });
 
   it("maps each core field to its snake_case counterpart by value", () => {
-    const wire = toRegisterResponseWire(CORE_RESPONSE);
+    const wire = toSessionCreateResponseWire(CORE_RESPONSE);
     expect(wire.session_id).toBe(CORE_RESPONSE.sessionId);
     expect(wire.ws_url).toBe(CORE_RESPONSE.wsUrl);
   });
