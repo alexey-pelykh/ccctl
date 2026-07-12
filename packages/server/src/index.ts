@@ -93,6 +93,18 @@ export { toSessionCreateResponseWire, type SessionCreateResponseWire } from "./s
 // startup.ts; DEFAULT_HOST is also consumed internally below.
 export { DEFAULT_HOST, LOCAL_SERVER_AUTH_ENV, requireLocalServerAuth, resolveBindHost, WILDCARD_BIND_HOST };
 
+// Re-export the session-launcher port (#28) on the public surface — the backend-agnostic
+// contract for bringing up a headful, locally-attachable terminal session. The tmux (#29)
+// and owned-pty (#30) backends implement it; a caller (the daemon) depends only on the
+// port. Type-only: the interface ships no runtime, its backends do. Defined in
+// session-launcher.ts.
+export type {
+  ISessionLauncher,
+  SessionLaunchOptions,
+  LaunchedSession,
+  TerminalAttachment,
+} from "./session-launcher.js";
+
 /** Configuration for a ccctl server instance. */
 export interface ServerConfig {
   /** Loopback port the local HTTP server binds to. `0` selects an ephemeral port. */
