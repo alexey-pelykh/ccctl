@@ -21,7 +21,12 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   `Host: api.anthropic.com`, observed by a loopback stand-in for that host.
   `inference-guarantee.test.ts` (unit) and `inference-untouched.e2e.test.ts`
   (e2e) exercise it — hermetic, no patched worker or credentials, so it gates on
-  every run.
+  every run. The stand-in's negative-space assertions (`received` has
+  `length === 0` for control traffic) are **self-guarded** by a **liveness
+  canary** (`probeStandInLiveness`, #134): a probe fired straight at the same
+  stand-in instance proves it can receive, so a zero reads as "the traffic did
+  not arrive," not "the stand-in was never wired" — which a bare zero would pass
+  vacuously.
 
 - **Bridge wire-conformance oracle (#130/#131)** — `bridge-wire-conformance.ts` pins the
   current environments-bridge flow's snake_case contract face **independently** of

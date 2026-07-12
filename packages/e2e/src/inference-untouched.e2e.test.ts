@@ -8,6 +8,8 @@ import { assertInferenceUntouched, InferenceGuaranteeViolation } from "./inferen
 import {
   observeControlLeg,
   observeInferenceLeg,
+  probeStandInLiveness,
+  StandInLivenessError,
   startInferenceStandIn,
   type InferenceStandIn,
 } from "./traffic-harness.js";
@@ -73,6 +75,11 @@ describe("ccctl e2e: inference is untouched by control-channel redirection (skel
       expect(control.receivedBy).toBe("local-server");
       // ...and it is NOT observed reaching api.anthropic.com.
       expect(standIn.received).toHaveLength(0);
+      // Liveness canary (#134): the SAME stand-in instance DOES receive when a request
+      // is actually fired at it — so the length-0 above is "control did not arrive",
+      // not "this stand-in was never wired". Receiver-grounded in its own log.
+      const canary = await probeStandInLiveness(standIn);
+      expect(standIn.received).toEqual([canary]);
       expect(server.environments.size).toBe(1);
       expect(server.sessions.size).toBe(1);
     });
@@ -134,9 +141,31 @@ describe("ccctl e2e: inference is untouched by control-channel redirection (skel
       // from the sender claiming where it went.
       expect(misrouted.receivedBy).toBe("local-server");
       expect(standIn.received).toHaveLength(0);
+      // Liveness canary (#134): the length-0 is "the misrouted inference did not reach
+      // the stand-in", not "the stand-in was dead" — the SAME instance receives a probe
+      // fired straight at it. Guards this negative-space assertion the same way.
+      const canary = await probeStandInLiveness(standIn);
+      expect(standIn.received).toEqual([canary]);
 
       // ...and the guarantee catches the regression (AC-3).
       expect(() => assertInferenceUntouched([control, misrouted], EXPECTATION)).toThrow(InferenceGuaranteeViolation);
+    });
+  });
+
+  describe("Rule: the liveness canary is armed — a dead stand-in fails it", () => {
+    it("a deliberately-closed (unwired) stand-in FAILS the canary, so no length-0 passes vacuously", async () => {
+      // Build a real stand-in, then deliberately un-wire it by closing it: a closed
+      // stand-in can no longer receive — exactly the "dead stand-in" that makes a bare
+      // `received.length === 0` a vacuous pass. Managed locally (already closed), so the
+      // afterEach cleanup has nothing to double-close.
+      const deadStandIn = await startInferenceStandIn();
+      await deadStandIn.close();
+
+      // The canary catches it: the probe cannot land, so it throws rather than passing.
+      await expect(probeStandInLiveness(deadStandIn)).rejects.toThrow(StandInLivenessError);
+      // ...and the log stayed empty — a length-0 that now provably means "dead", which
+      // is precisely why the positive canaries above are load-bearing.
+      expect(deadStandIn.received).toHaveLength(0);
     });
   });
 });
