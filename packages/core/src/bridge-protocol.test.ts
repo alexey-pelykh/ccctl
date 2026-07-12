@@ -20,7 +20,6 @@ import {
   loggableWorkItemAction,
   loggableWorkPoll,
   PERMISSION_MODES,
-  SESSIONS_CREATE_PATH,
   SESSIONS_PATH,
   workAckPath,
   WORK_ITEM_KINDS,
@@ -56,10 +55,6 @@ describe("version pin & pinned paths (AC: version-pinned)", () => {
     expect(environmentWorkPollPath("env-1")).toBe("/v1/environments/env-1/work/poll");
     expect(workAckPath("env-1", "work-9")).toBe("/v1/environments/env-1/work/work-9/ack");
     expect(workStopPath("env-1", "work-9")).toBe("/v1/environments/env-1/work/work-9/stop");
-  });
-
-  it("retains the superseded single-step register path for not-yet-realigned consumers", () => {
-    expect(SESSIONS_CREATE_PATH).toBe("/v1/code/sessions");
   });
 });
 

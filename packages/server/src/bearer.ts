@@ -2,15 +2,17 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 /**
- * `Authorization: Bearer …` parsing, shared by the two ccctl-server ingress
- * points that receive the account credential (bridge-protocol §4): the register
- * handler (`POST /v1/code/sessions`) and the worker-channel WebSocket upgrade.
+ * `Authorization: Bearer …` parsing, shared by the ccctl-server ingress points
+ * that receive the account credential: the environments-bridge POSTs — §1
+ * environment register (`POST /v1/environments/bridge`) and §2 session create
+ * (`POST /v1/sessions`) — and the §4 worker-channel WebSocket upgrade. (The §3
+ * work-poll reuses the same extractor to read its SCOPED per-environment token.)
  *
  * The helper only reports whether a usable Bearer is PRESENT — it deliberately
- * has no persistence surface of its own. Both call sites compare-and-discard the
- * result, so the account Bearer is validated for receipt and then dropped: it
- * never reaches session state, the register response, or a log (the strict
- * NON-PERSISTING pass-through the contract mandates).
+ * has no persistence surface of its own. At the account-credential points the
+ * result is compared and discarded, so the account Bearer is validated for receipt
+ * and then dropped: it never reaches session state, a response body, or a log (the
+ * strict NON-PERSISTING pass-through the contract mandates).
  */
 
 /**

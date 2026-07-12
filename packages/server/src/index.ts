@@ -28,11 +28,6 @@
  * `api.anthropic.com` for the live session lands with the credentialed wave; this
  * slice validates receipt only.)
  *
- * **Retained legacy register.** The superseded single-step register
- * (`POST /v1/code/sessions`, {@link handleLegacyRegister}) is kept as transitional
- * compat so the not-yet-realigned `@ccctl/e2e` harness stays green; it is removed
- * with the e2e realign (#124). New code targets the §1/§2 flow above.
- *
  * **Browser-facing transport pair (#13).** The worker channel fans every inbound
  * `control_event` out to subscribed UI clients over Server-Sent Events
  * (`GET /api/events`, {@link CcctlServer.broadcast}); the browser steers back with a
@@ -42,23 +37,16 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
 import type { Duplex } from "node:stream";
 import {
-  createSession,
   ENVIRONMENTS_BRIDGE_PATH,
-  formatAuthority,
-  SESSIONS_CREATE_PATH,
   SESSIONS_PATH,
   type ControlEvent,
   type ControlRequest,
   type HostEndpoint,
   type Session,
-  type SessionCreateResponse,
   type WorkItem,
 } from "@ccctl/core";
-import { toRegisterResponseWire } from "./register-wire.js";
-import { parseBearer } from "./bearer.js";
 import { dispatchToWorkerChannel, handleWorkerChannelUpgrade } from "./worker-channel.js";
 import {
   broadcastEvent,
@@ -69,7 +57,7 @@ import {
   type EventStreamState,
 } from "./event-stream.js";
 import { COMMAND_PATH, handleUiCommand } from "./ui-command.js";
-import { writeError, writeJson } from "./http-response.js";
+import { writeError } from "./http-response.js";
 import {
   DEFAULT_WORK_POLL_TIMEOUT_MS,
   enqueueWork,
@@ -90,12 +78,12 @@ import {
   WILDCARD_BIND_HOST,
 } from "./startup.js";
 
-// Re-export the register/session-create response wire boundary (the snake_case DTO
-// + mapper, ADR-001 / #108) on the public surface, so a contract consumer — the e2e
-// harness's register round-trip (#109), a future worker client — asserts against the
-// PINNED wire type instead of re-transcribing its shape. The mapper and its exact
-// serialized bytes are golden-tested in register-wire.test.ts.
-export { toRegisterResponseWire, type RegisterResponseWire } from "./register-wire.js";
+// Re-export the §2 session-create response wire boundary (the snake_case DTO +
+// mapper, ADR-001 / #108) on the public surface, so a contract consumer — a future
+// worker client — asserts against the PINNED wire type instead of re-transcribing
+// its shape. The mapper and its exact serialized bytes are golden-tested in
+// session-create-wire.test.ts.
+export { toSessionCreateResponseWire, type SessionCreateResponseWire } from "./session-create-wire.js";
 
 // Re-export the baseline startup guarantees (#14) on the public surface. The daemon
 // (@ccctl/cli's `serve`) applies them before binding, and any embedder gets the same
@@ -168,51 +156,10 @@ interface ServerState {
 }
 
 /**
- * Handle the retained legacy single-step register (`POST /v1/code/sessions`) — kept
- * as transitional compat for the not-yet-realigned e2e harness (#124). Fails closed
- * on every branch that is not a well-formed POST carrying the account Bearer, and —
- * at this slice — accepts a single session only. New workers use the §1/§2 flow.
- */
-function handleLegacyRegister(req: IncomingMessage, res: ServerResponse, state: ServerState): void {
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
-    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on ${SESSIONS_CREATE_PATH}`);
-    return;
-  }
-  // The account Bearer must be present (bridge-protocol §5). Validate receipt and
-  // fail closed if absent/malformed; the caller never binds it — parseBearer's return
-  // is compared and discarded — so it cannot reach session state, the response, or a
-  // log (there is no logging in this module).
-  if (parseBearer(req.headers.authorization) === null) {
-    res.setHeader("WWW-Authenticate", "Bearer");
-    writeError(res, 401, "ccctl: missing or malformed `Authorization: Bearer` credential");
-    return;
-  }
-  // One session only at this slice; a second registration fails closed rather than
-  // silently replacing the live session.
-  if (state.sessions.size >= 1) {
-    writeError(res, 409, "ccctl: a session already exists (one session only at this slice)");
-    return;
-  }
-
-  const sessionId = randomUUID();
-  const response: SessionCreateResponse = {
-    sessionId,
-    wsUrl: `ws://${formatAuthority(state.address.host, state.address.port)}${SESSIONS_CREATE_PATH}/${sessionId}/ws`,
-  };
-  state.sessions.set(sessionId, createSession(sessionId));
-  // Serialize through the boundary DTO: the wire body is snake_case
-  // (`session_id` / `ws_url`) per ADR-001. `toRegisterResponseWire` is the single,
-  // golden-tested seam that owns the camel↔snake asymmetry — never write `response`
-  // to the wire directly, or a future reader "fixing" the mismatch reintroduces drift.
-  writeJson(res, 201, toRegisterResponseWire(response));
-}
-
-/**
  * Route one HTTP request. The browser-facing UI transport pair is matched first
  * (`GET /api/events`, `POST /api/command`), then the environments-bridge legs (§1
- * environment register, §2 session create, §3 work poll / ack / stop), and finally
- * the retained legacy register. Anything else falls through to a fail-closed 404.
+ * environment register, §2 session create, §3 work poll / ack / stop). Anything else
+ * falls through to a fail-closed 404.
  */
 function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerState): void {
   const { pathname } = new URL(req.url ?? "/", "http://localhost");
@@ -245,10 +192,6 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerS
         handleWorkStop(req, res, state, work.environmentId, work.workId);
         return;
     }
-  }
-  if (pathname === SESSIONS_CREATE_PATH) {
-    handleLegacyRegister(req, res, state);
-    return;
   }
   writeError(res, 404, `ccctl: no route for ${pathname}`);
 }

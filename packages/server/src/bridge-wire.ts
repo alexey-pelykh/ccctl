@@ -16,8 +16,8 @@
  *     the "fail closed on protocol drift" contract at the ingress edge, mirroring
  *     core's own `workItemFromValue` / `isPermissionMode` discriminant validation.
  *   - **Outgoing responses** (server → worker) are serialized core camelCase →
- *     snake_case by the `to…Wire` mappers. The §2 session-create response reuses
- *     `toRegisterResponseWire` (register-wire.ts) — the same `{ session_id, ws_url }`
+ *     snake_case by the `to…Wire` mappers. The §2 session-create response uses
+ *     `toSessionCreateResponseWire` (session-create-wire.ts) — the `{ session_id, ws_url }`
  *     body — so that one golden-pinned mapper stays the single owner of that shape.
  *
  * The scoped per-environment work-poll token rides the §1 register RESPONSE
