@@ -97,6 +97,62 @@ export function startInferenceStandIn(host: string = LOOPBACK_HOST): Promise<Inf
   });
 }
 
+/**
+ * The path a liveness canary rides — distinctive, so a recorded canary is never
+ * confused with a control (`/v1/...`) or inference (`/v1/messages`) request, nor they
+ * with it.
+ */
+const LIVENESS_CANARY_PATH = "/__ccctl-e2e/liveness-canary";
+
+/**
+ * Thrown by {@link probeStandInLiveness} when a stand-in does not receive-and-record
+ * the liveness canary — i.e. it is dead / never-wired. A typed error (not a bare
+ * `Error`) so a caller — a test, a future gate — can distinguish "this stand-in is not
+ * live" from any other failure and surface the specific `message`. Mirrors
+ * {@link InferenceGuaranteeViolation} / {@link BearerLeakViolation}.
+ */
+export class StandInLivenessError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "StandInLivenessError";
+  }
+}
+
+/**
+ * Fire a liveness canary AT the stand-in and prove — receiver-grounded, from the
+ * stand-in's OWN {@link InferenceStandIn.received} log — that it arrived. This is the
+ * self-guard for the negative-space `expect(standIn.received).toHaveLength(0)`
+ * assertions: a `length === 0` is evidence that "the traffic did not arrive" ONLY if
+ * the SAME stand-in instance can be shown to receive at all — otherwise a dead /
+ * never-wired stand-in reads identically to a clean pass (issue #134).
+ *
+ * Fire this AFTER the `toHaveLength(0)` assertion it guards: the canary is itself a
+ * received request, so it advances the log by one. Throws {@link StandInLivenessError}
+ * — it never returns — when the stand-in did not answer or did not record the canary;
+ * that throw IS the canary catching a dead stand-in. Returns the recorded canary on
+ * success so the caller can assert the log now holds exactly it.
+ */
+export async function probeStandInLiveness(standIn: InferenceStandIn): Promise<RecordedRequest> {
+  const before = standIn.received.length;
+  try {
+    // A real outbound request AT the stand-in (not merely carrying its Host) — the one
+    // thing a dead / unwired stand-in cannot answer.
+    await httpPostJson(standIn.address, LIVENESS_CANARY_PATH, {}, { canary: "liveness-probe" });
+  } catch (cause) {
+    throw new StandInLivenessError(
+      "the stand-in did not answer the liveness canary — it is not live, so `received.length === 0` for it proves nothing",
+      { cause },
+    );
+  }
+  const recorded = standIn.received.at(-1);
+  if (recorded === undefined || standIn.received.length !== before + 1 || recorded.path !== LIVENESS_CANARY_PATH) {
+    throw new StandInLivenessError(
+      "the stand-in answered but did not record the liveness canary — its request log is not wired, so `received.length === 0` for it proves nothing",
+    );
+  }
+  return recorded;
+}
+
 /** Inputs to observe the control leg (the environments-bridge register + session-create POSTs). */
 export interface ControlLegOptions {
   /** The real local ccctl server the worker's control channel points at. */
