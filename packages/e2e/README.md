@@ -54,8 +54,9 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   session-dispatch item whose `secret` decodes to the per-session ingress token, a
   stand-in worker opens the per-session channel over **HTTP + SSE** (`worker/register` →
   held-open `worker/events/stream` → `PUT worker` status, §4/§5), a stand-in phone
-  **views** the session over **SSE** (`GET /api/events`), and the phone **steers** it
-  (`POST /api/command`) — a `prompt` the server injects as a `{ type: "user" }`
+  **views** the session over **SSE** (`GET /api/sessions/{id}/events`, per session #20),
+  and the phone **steers** it (`POST /api/sessions/{id}/command`) — a `prompt` the
+  server injects as a `{ type: "user" }`
   `client_event` turn the worker **reads** off its downstream and acks
   (`worker/events/delivery`), after which the worker relays a transcript back up
   `worker/events` that the phone views. Every hop is grounded in the receiver's own

@@ -8,20 +8,27 @@ upstream steer-building logic). There is nothing to compile; `build` just copies
 the static assets into `dist/`, and the modules can be served as-is by the daemon
 (or locally, e.g. `npx serve .`).
 
-It talks to [`@ccctl/server`](../server) over two channels — the zero-build
-transport pair:
+It talks to [`@ccctl/server`](../server) over a **per-session** namespace (#20), so
+more than one session can be carried at once. `GET /api/sessions` lists the carried
+sessions and the UI picks one to view + steer; the selected session drives the
+zero-build transport pair:
 
-- **Downstream (implemented, #15):** an `EventSource` subscribes to the SSE
-  stream at `GET /api/events`. Each `control_event` frame is decoded and routed —
-  a `worker_status` frame updates the **current-turn** indicator in place
-  (`running` / `requires_action` + its detail / `idle`), every other event is
-  appended to the **transcript**, and an undecodable line is surfaced verbatim
-  rather than dropped. On reconnect, `EventSource` replays past its
-  `Last-Event-ID` and the server reconciles the gap.
-- **Upstream (implemented, #16):** `fetch` POSTs a `{ subtype, payload? }` command
-  to `POST /api/command`, which the server re-frames as a `control_request` (it
-  mints the id) and relays to the worker channel. Three steer verbs are wired:
-  **input** (`{ subtype: "prompt", payload: { text } }`), **redirect**
+- **List + select (#20):** a `fetch` GET of `/api/sessions` enumerates the sessions
+  the daemon is carrying (id + status + activity). Picking one (re)opens its stream
+  and clears the prior session's transcript — the view + steer below apply to the
+  selected session, and never bleed across sessions.
+- **Downstream (implemented, #15; per-session #20):** an `EventSource` subscribes to
+  the selected session's SSE stream at `GET /api/sessions/{id}/events`. Each
+  `control_event` frame is decoded and routed — a `worker_status` frame updates the
+  **current-turn** indicator in place (`running` / `requires_action` + its detail /
+  `idle`), every other event is appended to the **transcript**, and an undecodable
+  line is surfaced verbatim rather than dropped. On reconnect, `EventSource` replays
+  past its per-session `Last-Event-ID` and the server reconciles the gap.
+- **Upstream (implemented, #16; per-session #20):** `fetch` POSTs a
+  `{ subtype, payload? }` command to `POST /api/sessions/{id}/command`, which the
+  server re-frames as a `control_request` (it mints the id) and relays to THAT
+  session's worker channel. Three steer verbs are wired: **input**
+  (`{ subtype: "prompt", payload: { text } }`), **redirect**
   (`{ subtype: "interrupt", payload: { reason } }`) and **approve**
   (`{ subtype: "approve" }`). An accepted steer (server `202`) is echoed into the
   transcript — marked outbound — so it is reflected in the viewed session even

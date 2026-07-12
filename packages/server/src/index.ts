@@ -122,7 +122,7 @@ export interface CcctlServer {
   /**
    * Inject one user turn — push a `{ type: "user" }` `client_event` down the session's
    * held-open worker downstream (§4/§5). The programmatic form of the turn a
-   * `POST /api/command` `prompt` drives. Throws if the session has no live worker channel
+   * `POST /api/sessions/{id}/command` `prompt` drives. Throws if the session has no live worker channel
    * (guard the call with {@link CcctlServer.hasLiveWorker}).
    */
   injectTurn(sessionId: string, prompt: string): void;

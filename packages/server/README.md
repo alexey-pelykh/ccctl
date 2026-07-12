@@ -32,16 +32,20 @@ the session, never logged, never returned in a body. The §3 poll carries no
 credential; the §4/§5 channel is authorized by the locally-minted
 `session_ingress_token` (carried inside the work-secret), NOT the account Bearer.
 
-The browser-facing transport pair relays that one session to the UI. Downstream,
-every payload the worker POSTs up `worker/events` (§5) fans out to subscribed
-clients over **Server-Sent Events** at `GET /api/events`, each event carrying a
-`Last-Event-ID`-compatible id so a reconnecting client reconciles the gap it
-missed. Upstream, the browser steers back with a `fetch` **POST** to
-`/api/command`: a `prompt` becomes a `{ type: "user" }` turn injected on the
-session's worker downstream, any other verb a `control_request` — both pushed as a
-`client_event` frame. Browser-facing auth — the deferred local-server credential
-boundary — is a later item; the loopback UI ingress is unauthenticated at this
-slice (the account Bearer rides the worker's §1/§2 legs, never the browser).
+The browser-facing transport is a **per-session** namespace (#20), so the daemon
+carries more than one session at once without cross-wiring. `GET /api/sessions` lists
+the carried sessions (id + status + activity). Downstream, every payload a session's
+worker POSTs up `worker/events` (§5) fans out to the clients subscribed to THAT
+session's **Server-Sent Events** stream at `GET /api/sessions/{id}/events` — and only
+them — each event carrying a per-session `Last-Event-ID`-compatible id so a
+reconnecting client reconciles the gap it missed. Upstream, the browser steers a
+chosen session with a `fetch` **POST** to `/api/sessions/{id}/command`: a `prompt`
+becomes a `{ type: "user" }` turn injected on that session's worker downstream, any
+other verb a `control_request` — both pushed as a `client_event` frame. Naming the
+session in the URL makes cross-wiring between sessions structurally impossible.
+Browser-facing auth — the deferred local-server credential boundary — is a later item;
+the loopback UI ingress is unauthenticated at this slice (the account Bearer rides the
+worker's §1/§2 legs, never the browser).
 
 Two **baseline startup guarantees** ride along from the skeleton, exported for the
 daemon ([`@ccctl/cli`](../cli)'s `serve`) to apply before it binds: `requireLocalServerAuth`

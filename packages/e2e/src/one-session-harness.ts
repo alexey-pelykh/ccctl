@@ -229,7 +229,7 @@ export interface UiSteerAck {
 export interface UiClient {
   /** The event lines this phone has viewed over SSE, in arrival order. */
   viewed(): readonly ViewedSseEvent[];
-  /** POST one steer to `/api/command`; resolves with the server's ack. */
+  /** POST one steer to the session's command path (`/api/sessions/{id}/command`); resolves with the server's ack. */
   steer(command: UiSteerCommand): Promise<UiSteerAck>;
   /** Close the SSE stream. */
   close(): Promise<void>;
