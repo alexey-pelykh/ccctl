@@ -89,8 +89,13 @@ const SESSION_CREATE_WIRE_KEYS: readonly string[] = ["session_id"];
 /** The pinned §3 single-item key set AND order. */
 const WORK_ITEM_WIRE_KEYS: readonly string[] = ["id", "secret", "data"];
 
-/** The account-Bearer-authorized §1 request body the mock bridge sends (observed snake_case wire, #130). */
-const MOCK_ENVIRONMENT_REGISTER_BODY = {
+/**
+ * The account-Bearer-authorized §1 request body the mock bridge sends (observed
+ * snake_case wire, #130). Exported as the SINGLE source of the bridge's §1 request wire —
+ * the live-worker oracle (`live-worker-oracle.ts`, #133) reuses it so the hermetic golden
+ * and the credentialed oracle drive an identical §1 body, never two that can drift apart.
+ */
+export const BRIDGE_ENVIRONMENT_REGISTER_BODY = {
   machine_name: "e2e-machine",
   directory: "/e2e/proj",
   branch: "main",
@@ -99,8 +104,12 @@ const MOCK_ENVIRONMENT_REGISTER_BODY = {
   metadata: { worker_type: "claude_code" },
 } as const;
 
-/** The account-Bearer-authorized §2 request body the mock bridge sends (snake_case wire). */
-const MOCK_SESSION_CREATE_BODY = {
+/**
+ * The account-Bearer-authorized §2 request body the mock bridge sends (snake_case wire).
+ * Exported as the SINGLE source of the §2 request wire — shared with the live-worker
+ * oracle (#133) so the hermetic and credentialed drivers never diverge on the §2 body.
+ */
+export const BRIDGE_SESSION_CREATE_BODY = {
   context: { model: "claude-opus-4-8", cwd: "/e2e/proj" },
   source: "e2e",
   permission_mode: "default",
@@ -190,7 +199,7 @@ export interface DeliveredWork {
  * §3 poll path interpolates.
  */
 export async function registerEnvironment(server: CcctlServer, bearer: string): Promise<RegisteredEnvironment> {
-  const res = await postJson(bridgeUrl(server, ENVIRONMENTS_BRIDGE_PATH), bearer, MOCK_ENVIRONMENT_REGISTER_BODY);
+  const res = await postJson(bridgeUrl(server, ENVIRONMENTS_BRIDGE_PATH), bearer, BRIDGE_ENVIRONMENT_REGISTER_BODY);
   if (res.status !== 201) {
     throw new Error(`ccctl e2e: environment register expected 201 from the local server, got ${res.status}`);
   }
@@ -204,7 +213,7 @@ export async function registerEnvironment(server: CcctlServer, bearer: string): 
  * server AUTO-ENQUEUES this session's `session` work item, which §3 then delivers.
  */
 export async function createSession(server: CcctlServer, bearer: string): Promise<CreatedSession> {
-  const res = await postJson(bridgeUrl(server, SESSIONS_PATH), bearer, MOCK_SESSION_CREATE_BODY);
+  const res = await postJson(bridgeUrl(server, SESSIONS_PATH), bearer, BRIDGE_SESSION_CREATE_BODY);
   if (res.status !== 201) {
     throw new Error(`ccctl e2e: session create expected 201 from the local server, got ${res.status}`);
   }
@@ -250,14 +259,18 @@ export async function pollWork(server: CcctlServer, environmentId: string): Prom
 export async function assertServerSpeaksBridgeContract(server: CcctlServer, bearer: string): Promise<void> {
   // §1 — register the environment; and the account-Bearer boundary (missing → 401).
   const { environmentId } = await registerEnvironment(server, bearer);
-  const envNoBearer = await postJson(bridgeUrl(server, ENVIRONMENTS_BRIDGE_PATH), null, MOCK_ENVIRONMENT_REGISTER_BODY);
+  const envNoBearer = await postJson(
+    bridgeUrl(server, ENVIRONMENTS_BRIDGE_PATH),
+    null,
+    BRIDGE_ENVIRONMENT_REGISTER_BODY,
+  );
   if (envNoBearer.status !== 401) {
     throw new Error(`ccctl e2e: §1 register without the account Bearer expected 401, got ${envNoBearer.status}`);
   }
 
   // §2 — create a session; and its account-Bearer boundary (missing → 401).
   const { sessionId } = await createSession(server, bearer);
-  const sessionNoBearer = await postJson(bridgeUrl(server, SESSIONS_PATH), null, MOCK_SESSION_CREATE_BODY);
+  const sessionNoBearer = await postJson(bridgeUrl(server, SESSIONS_PATH), null, BRIDGE_SESSION_CREATE_BODY);
   if (sessionNoBearer.status !== 401) {
     throw new Error(
       `ccctl e2e: §2 session create without the account Bearer expected 401, got ${sessionNoBearer.status}`,

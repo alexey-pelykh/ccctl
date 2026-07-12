@@ -363,6 +363,19 @@ export function dispatchControlRequest(state: WorkerChannelState, sessionId: str
 }
 
 /**
+ * Whether the session has a LIVE worker channel — a worker that registered AND is
+ * holding its §4/§5 downstream open. This is exactly {@link injectUserTurn}'s
+ * precondition: `true` iff a `client_event` push would NOT fail closed (`record`
+ * present with a non-null `downstream`). The receiver-grounded read of "a real worker
+ * is connected", distinct from the session merely existing; `false` for an unknown
+ * session or one whose worker has not opened (or has closed) its downstream.
+ */
+export function hasLiveWorkerChannel(state: WorkerChannelState, sessionId: string): boolean {
+  const record = state.workerChannels.get(sessionId);
+  return record !== undefined && record.downstream !== null;
+}
+
+/**
  * End every held-open worker downstream and clear it — called from server shutdown.
  * A held-open SSE response keeps its connection open indefinitely, so
  * `httpServer.close()` would otherwise hang waiting on it (the UI-stream analog in
