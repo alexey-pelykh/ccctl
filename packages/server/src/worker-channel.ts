@@ -2,341 +2,435 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 /**
- * The worker-channel WebSocket — bridge-protocol §2/§3 (the server side).
+ * The per-session worker channel — bridge-protocol §4/§5, the server side, over
+ * **HTTP + Server-Sent Events** (issue #130).
  *
- * `@ccctl/server` mints a `ws_url` pointing at its OWN bound address
- * (`ws://host:port/v1/sessions/{id}/ws`), so the ccctl server IS the
- * WebSocket server: the patched worker (or, in tests, a client stand-in) dials in
- * and streams `stream-json` frames server-ward. This module accepts that upgrade
- * and reads the channel; "the server opens the worker WebSocket at ws_url" (AC-1)
- * is the server standing up that endpoint.
+ * The current Claude Code `--sdk-url` worker does NOT open a WebSocket: it opens a
+ * held-open SSE stream for the server→worker downstream and POSTs its own upstream
+ * legs. This module terminates that channel, rooted at
+ * `{@link workerChannelPath}` (`/v1/code/sessions/{id}/worker`):
  *
- * What this slice does — and only this (AC-3: "just reads and surfaces the raw
- * state"):
- *   1. Accept the WebSocket upgrade at `…/{sessionId}/ws` for a known session,
- *      requiring the account Bearer on the connect (bridge-protocol §4) and
- *      failing closed otherwise. The Bearer is a strict NON-PERSISTING
- *      pass-through — validated for receipt via {@link parseBearer}, then dropped;
- *      it never reaches session state or a log.
- *   2. Decode the inbound WebSocket text frames ({@link WsFrameReader}) into their
- *      NDJSON payload and feed that to `@ccctl/core`'s streaming
- *      {@link ControlFrameDecoder} — the framing and the control-frame codec are
- *      both reused, never re-implemented here.
- *   3. Apply each decoded frame with `@ccctl/core`'s pure
- *      {@link applyWorkerStatusFrame}: a `worker_status` frame advances the
- *      session's `activity` (running / requires_action / idle); anything else is a
- *      no-op. The surfaced state is the session in {@link WorkerChannelState.sessions}.
+ *   - `POST …/worker/register` `{}` → `{ worker_epoch }` ({@link handleWorkerRegister}).
+ *     The server stamps a monotonic per-session epoch; a later register supersedes it,
+ *     and an upstream POST carrying a superseded epoch fails closed `409` (the worker
+ *     then exits).
+ *   - `GET …/worker/events/stream` → a held-open `text/event-stream` downstream
+ *     ({@link handleWorkerEventsStream}); the server pushes `client_event` frames down
+ *     it (turn injection / steer relay).
+ *   - `POST …/worker/events` `{ worker_epoch, events: [{ payload }] }` → the upstream
+ *     transcript leg ({@link handleWorkerEvents}); each payload is relayed to the UI
+ *     SSE (#13, {@link broadcastEvent}) — this is where a turn's output returns.
+ *   - `PUT …/worker` `{ worker_status, worker_epoch, external_metadata }` → the status
+ *     gate ({@link handleWorkerStatus}); `idle` means "ready for a turn". It MUST `200`
+ *     or the worker exits. The server derives the session's `activity` from it
+ *     ({@link applyWorkerStatus}).
+ *   - `POST …/worker/heartbeat` → liveness ({@link handleWorkerHeartbeat},
+ *     {@link recordHeartbeat}); `POST …/worker/events/delivery`
+ *     `{ worker_epoch, updates: [{ event_id, status }] }` → the worker's per-event
+ *     downstream acks ({@link handleWorkerDelivery}).
  *
- * Transport lifecycle: opening the channel moves the session `status` from
- * `connecting` to `ready`; a WebSocket close, a socket error, or a bare TCP
- * half-close (a FIN without a Close frame) all move it to `closed` and reap the
- * channel. One channel per session — a second concurrent upgrade is refused with a
- * 409, mirroring the register's one-session rule — and reaping frees that slot so a
- * reconnect after a clean or abrupt disconnect is accepted. `activity` and `status`
- * are the independent dimensions the core model defines, updated separately here.
- * Classification beyond the raw tri-state and the idle timer are later items.
+ * **Turn injection** ({@link injectUserTurn}) pushes a `client_event` frame down the
+ * held-open downstream. The event name is `client_event`; the `data` is
+ * `{ sequence_num, event_id, event_type: "message", payload }`, and `payload.type`
+ * is what the worker demuxes on (`user` | `control_request` | `control_response`). A
+ * user turn carries a `{ type: "user", message, … }` payload; a UI steer
+ * ({@link dispatchControlRequest}) carries the `control_request`. Downstream frames
+ * carry no `worker_epoch`; a re-sent `uuid` is de-duplicated by the worker.
+ *
+ * **Two-credential boundary (HARD, #130).** No account Bearer rides this channel —
+ * it is authorized (in the credentialed wave) by the per-session
+ * {@link SessionIngressToken} the server minted into the work-secret, NEVER the
+ * account Bearer. This slice is loopback-hermetic and does not yet enforce the
+ * ingress token on the channel; the token boundary lives in the work-secret mint
+ * (`environments-bridge.ts`).
  */
 
-import type { IncomingMessage } from "node:http";
-import type { Duplex } from "node:stream";
+import { randomUUID } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import {
-  applyWorkerStatusFrame,
-  ControlFrameDecoder,
-  encodeControlFrame,
-  SESSIONS_PATH,
+  applyWorkerStatus,
+  BRIDGE_PROTOCOL_API_VERSION,
+  isWorkerStatus,
+  recordHeartbeat,
   type ControlRequest,
+  type JsonValue,
   type Session,
-  type SessionStatus,
 } from "@ccctl/core";
-import { parseBearer } from "./bearer.js";
 import { broadcastEvent, type EventStreamState } from "./event-stream.js";
-import {
-  closeFramePayload,
-  computeAcceptKey,
-  encodeWsFrame,
-  WsFrameReader,
-  WsOpcode,
-  type WsFrame,
-} from "./websocket.js";
+import { readJsonBody, writeError, writeJson } from "./http-response.js";
 
-/** RFC 6455 §7.4.1 close codes this slice sends. */
-const WS_CLOSE_NORMAL = 1000;
-const WS_CLOSE_PROTOCOL_ERROR = 1002;
+/** Hard ceiling on a worker-channel request body (1 MiB) — a control-plane batch fits within it. */
+const MAX_WORKER_BODY_BYTES = 1024 * 1024;
+
+/**
+ * The live per-session worker channel: its current epoch, its held-open downstream
+ * SSE (or `null` when the worker has not opened / has dropped the stream), and the
+ * next downstream `client_event` sequence number.
+ */
+export interface WorkerChannelRecord {
+  /** The current `worker_epoch`; a superseded (older) epoch on an upstream POST fails closed 409. */
+  epoch: number;
+  /** The held-open `worker/events/stream` response the server pushes `client_event` frames to. */
+  downstream: ServerResponse | null;
+  /** The next `sequence_num` / SSE `id` a pushed downstream frame carries (monotonic, starts at 1). */
+  nextSeq: number;
+}
 
 /** The per-server state the worker channel reads and updates. */
 export interface WorkerChannelState {
   /** Sessions tracked by the server, keyed by ccctl session id. */
   readonly sessions: Map<string, Session>;
+  /** The live per-session worker channel, keyed by session id (epoch + downstream + seq). */
+  readonly workerChannels: Map<string, WorkerChannelRecord>;
   /**
-   * The live worker-channel socket per session id, so the server can enforce one
-   * channel per session and tear the socket down on shutdown. An upgraded socket is
-   * detached from the HTTP server and is not reachable via its connection-management
-   * APIs, so ownership is explicit here.
-   */
-  readonly workerChannels: Map<string, Duplex>;
-  /**
-   * The UI Server-Sent Events relay state. Every inbound `control_event` read off
-   * this channel is fanned out to subscribed UI clients through it (#13), so the
-   * read path is also the source of the browser's event stream.
+   * The UI Server-Sent Events relay state. Every payload read off the worker's
+   * upstream `worker/events` leg (§5) is fanned out to subscribed UI clients through
+   * it (#13), so the upstream read path is also the source of the browser's stream.
    */
   readonly events: EventStreamState;
 }
 
+/** A matched §4/§5 worker-channel leg plus the session it addresses. */
+export type WorkerRoute =
+  | { readonly leg: "register"; readonly sessionId: string }
+  | { readonly leg: "events-stream"; readonly sessionId: string }
+  | { readonly leg: "events"; readonly sessionId: string }
+  | { readonly leg: "events-delivery"; readonly sessionId: string }
+  | { readonly leg: "heartbeat"; readonly sessionId: string }
+  | { readonly leg: "status"; readonly sessionId: string };
+
 /**
- * Handle one HTTP `upgrade` against the worker-channel contract. Fails closed —
- * writing a plain HTTP error and destroying the socket — on every branch that is
- * not a well-formed WebSocket upgrade for a KNOWN session carrying the account
- * Bearer. On success it completes the RFC 6455 handshake and reads the channel,
- * surfacing each `worker_status` frame into the session's `activity`.
+ * Match a path against the §4/§5 worker-channel legs — `…/worker` (PUT status),
+ * `…/worker/register`, `…/worker/events/stream`, `…/worker/events`,
+ * `…/worker/events/delivery`, `…/worker/heartbeat` — extracting the session id, or
+ * `null` when it is not a worker-channel path. Anchored on the pinned
+ * {@link BRIDGE_PROTOCOL_API_VERSION} (`/v1/code/sessions/{id}/worker/…`), so a
+ * version-drifted path fails to match and 404s rather than being served. The session
+ * id is a server-minted UUID (no embedded `/`), so segment splitting is exact.
  */
-export function handleWorkerChannelUpgrade(
+export function matchWorkerRoute(pathname: string): WorkerRoute | null {
+  const segments = pathname.split("/");
+  // Expect ["", "v1", "code", "sessions", {id}, "worker", …tail].
+  if (
+    segments.length < 6 ||
+    segments[0] !== "" ||
+    segments[1] !== BRIDGE_PROTOCOL_API_VERSION ||
+    segments[2] !== "code" ||
+    segments[3] !== "sessions" ||
+    segments[5] !== "worker"
+  ) {
+    return null;
+  }
+  const sessionId = segments[4];
+  if (sessionId === undefined || sessionId === "") {
+    return null;
+  }
+  const tail = segments.slice(6);
+  if (tail.length === 0) {
+    return { leg: "status", sessionId };
+  }
+  if (tail.length === 1 && tail[0] === "register") {
+    return { leg: "register", sessionId };
+  }
+  if (tail.length === 1 && tail[0] === "events") {
+    return { leg: "events", sessionId };
+  }
+  if (tail.length === 1 && tail[0] === "heartbeat") {
+    return { leg: "heartbeat", sessionId };
+  }
+  if (tail.length === 2 && tail[0] === "events" && tail[1] === "stream") {
+    return { leg: "events-stream", sessionId };
+  }
+  if (tail.length === 2 && tail[0] === "events" && tail[1] === "delivery") {
+    return { leg: "events-delivery", sessionId };
+  }
+  return null;
+}
+
+/**
+ * `POST …/worker/register` (§4). Mints and returns a fresh per-session
+ * `worker_epoch` — monotonic, so a re-register SUPERSEDES the prior epoch and any
+ * upstream POST still stamped with it fails closed 409. Ends a stale held-open
+ * downstream from the superseded epoch. The `{}` body is not load-bearing (drained,
+ * ignored). Fails closed 404 for an unknown session.
+ */
+export function handleWorkerRegister(
   req: IncomingMessage,
-  socket: Duplex,
-  head: Buffer,
+  res: ServerResponse,
   state: WorkerChannelState,
+  sessionId: string,
 ): void {
-  const { pathname } = new URL(req.url ?? "/", "http://localhost");
-  const sessionId = matchWorkerChannelPath(pathname);
-  if (sessionId === null) {
-    rejectUpgrade(socket, 404, "Not Found", `ccctl: no worker channel for ${pathname}`);
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on the worker-register path`);
     return;
   }
   if (!state.sessions.has(sessionId)) {
-    rejectUpgrade(socket, 404, "Not Found", `ccctl: no session ${sessionId}`);
+    writeError(res, 404, `ccctl: no session ${sessionId}`);
     return;
   }
-  // Bridge-protocol §4: the account Bearer is presented AGAIN on the worker-WS
-  // connect. Require it and fail closed if absent/malformed — the security posture
-  // forbids an unauthenticated channel, even on loopback. Non-persisting: the
-  // parsed token is compared to null and discarded, never stored or logged.
-  if (parseBearer(req.headers.authorization) === null) {
-    rejectUpgrade(socket, 401, "Unauthorized", "ccctl: missing or malformed `Authorization: Bearer` credential", {
-      "WWW-Authenticate": "Bearer",
-    });
+  req.resume(); // drain the ignorable `{}` body so the socket does not stall.
+  const prev = state.workerChannels.get(sessionId);
+  // A re-register supersedes the prior epoch: end the stale downstream so the old
+  // worker's held stream is not left dangling, and bump the epoch.
+  if (prev?.downstream !== null && prev?.downstream !== undefined) {
+    prev.downstream.end();
+  }
+  const epoch = (prev?.epoch ?? 0) + 1;
+  state.workerChannels.set(sessionId, { epoch, downstream: null, nextSeq: prev?.nextSeq ?? 1 });
+  writeJson(res, 200, { worker_epoch: epoch });
+}
+
+/**
+ * `GET …/worker/events/stream` (§4). Holds the response open as the server→worker
+ * downstream `text/event-stream`; the server pushes `client_event` frames down it
+ * (turn injection / steer). Requires the worker to have registered (the epoch the
+ * channel is bound to) — an unregistered session fails closed 409. Reaped when the
+ * worker disconnects. Fails closed 404/405 for an unknown session / wrong method.
+ */
+export function handleWorkerEventsStream(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: WorkerChannelState,
+  sessionId: string,
+): void {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on the worker-events-stream path`);
     return;
   }
-  // One worker channel per session at this slice: a session already streaming a
-  // live channel refuses a second concurrent upgrade rather than letting two
-  // channels race the same session's state. Mirrors the register "one session only"
-  // 409; a cleanly- or abruptly-closed channel is reaped (see `shutdown` /the `end`
-  // handler), freeing the slot for a reconnect.
-  if (state.workerChannels.has(sessionId)) {
-    rejectUpgrade(socket, 409, "Conflict", `ccctl: session ${sessionId} already has a worker channel`);
+  if (!state.sessions.has(sessionId)) {
+    writeError(res, 404, `ccctl: no session ${sessionId}`);
     return;
   }
-  const key = req.headers["sec-websocket-key"];
-  if (typeof key !== "string" || (req.headers.upgrade ?? "").toLowerCase() !== "websocket") {
-    rejectUpgrade(socket, 400, "Bad Request", "ccctl: malformed WebSocket upgrade");
+  const record = state.workerChannels.get(sessionId);
+  if (record === undefined) {
+    writeError(res, 409, `ccctl: session ${sessionId} worker must register before opening the events stream`);
     return;
   }
-
-  // Complete the RFC 6455 §4.2.2 handshake; from here the socket carries frames.
-  socket.write(
-    "HTTP/1.1 101 Switching Protocols\r\n" +
-      "Upgrade: websocket\r\n" +
-      "Connection: Upgrade\r\n" +
-      `Sec-WebSocket-Accept: ${computeAcceptKey(key)}\r\n\r\n`,
-  );
-  setStatus(state, sessionId, "ready");
-  // Own the socket, keyed by session, for the one-channel guard above and for
-  // shutdown teardown (it is now detached from the HTTP server).
-  state.workerChannels.set(sessionId, socket);
-
-  // One NDJSON decoder and one frame reader per connection: both buffer across
-  // chunk boundaries, so a control line or a WebSocket frame split over two socket
-  // reads is reassembled, never mis-parsed.
-  const decoder = new ControlFrameDecoder();
-  const reader = new WsFrameReader();
-  let messageOpcode: number | null = null;
-  let messageChunks: Buffer[] = [];
-  let closed = false;
-
-  // Deferred hardening: only the per-frame 16 MiB cap (WsFrameReader) bounds inbound
-  // bytes — the reassembly buffer here and core's ControlFrameDecoder buffer both
-  // accumulate across fragments/reads without an AGGREGATE cap, so a flood of
-  // sub-cap fragments (or an unterminated NDJSON line) could grow memory unbounded.
-  // The channel is loopback-only and speaks to a trusted patched worker, so this is
-  // defense-in-depth, not an exploit path; an aggregate cap (spanning core's decoder)
-  // lands with the liveness/idle-timer item.
-
-  const shutdown = (): void => {
-    if (!closed) {
-      closed = true;
-      // Only reap the mapping if it still points at THIS socket, so a late
-      // shutdown of a prior socket can never evict a reconnect's live channel.
-      if (state.workerChannels.get(sessionId) === socket) {
-        state.workerChannels.delete(sessionId);
-      }
-      setStatus(state, sessionId, "closed");
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  // Open with an SSE comment so headers flush immediately and the worker's stream
+  // settles before the first pushed frame (a comment is ignored by an SSE reader).
+  res.write(": ccctl worker stream\n\n");
+  record.downstream = res;
+  // Reap the downstream when the worker disconnects, so a closed stream is never a
+  // dangling write target — but only if it still points at THIS response, so a late
+  // close of a superseded stream cannot evict a reconnect's live downstream.
+  res.on("close", () => {
+    if (record.downstream === res) {
+      record.downstream = null;
     }
-  };
+  });
+}
 
-  const applyLines = (text: string): void => {
-    for (const result of decoder.push(text)) {
-      // Malformed NDJSON lines are skipped: a bad line must not tear the channel
-      // down (the fail-closed-per-line policy the core decoder is built for).
-      if (!result.ok) {
-        continue;
-      }
-      const frame = result.frame;
-      // A `worker_status` frame advances the session's derived activity; any other
-      // frame is a no-op inside applyWorkerStatusFrame.
-      const session = state.sessions.get(sessionId);
-      if (session !== undefined) {
-        state.sessions.set(sessionId, applyWorkerStatusFrame(session, frame));
-      }
-      // Relay every control_event to subscribed UI clients over SSE (#13) — the
-      // read-path counterpart of the worker-ward steer relay below. State events
-      // (`worker_status`) and transcript events alike fan out to the browser; a
-      // control_request / control_response is not an "event" and is not relayed
-      // (broadcast is ControlEvent-typed).
-      if (frame.type === "control_event") {
-        broadcastEvent(state.events, frame);
-      }
-    }
-  };
-
-  const finishMessage = (): void => {
-    const opcode = messageOpcode;
-    const message = Buffer.concat(messageChunks);
-    messageOpcode = null;
-    messageChunks = [];
-    // The worker channel speaks UTF-8 text NDJSON; a stray binary message is
-    // dropped rather than mis-decoded as text.
-    if (opcode === WsOpcode.Text) {
-      applyLines(message.toString("utf8"));
-    }
-  };
-
-  const onData = (chunk: Buffer): void => {
-    let frames: WsFrame[];
-    try {
-      frames = reader.push(chunk);
-    } catch {
-      // A framing protocol error: close with 1002 and tear down rather than act
-      // on a malformed frame.
-      socket.end(encodeWsFrame(WsOpcode.Close, closeFramePayload(WS_CLOSE_PROTOCOL_ERROR)));
-      shutdown();
+/**
+ * `POST …/worker/events` (§5). The upstream transcript leg: a batched
+ * `{ worker_epoch, events: [{ payload }] }`. Each payload is a raw `stream-json`
+ * message the server relays to the UI SSE (#13) — this is where a turn's output
+ * returns. Fails closed 404 (unknown session), 409 (superseded epoch), or 400
+ * (malformed body). MUST `200` on success.
+ */
+export function handleWorkerEvents(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: WorkerChannelState,
+  sessionId: string,
+): void {
+  readWorkerBody(req, res, state, sessionId, "POST", (_record, body) => {
+    const events = body.events;
+    if (!Array.isArray(events)) {
+      writeError(res, 400, "ccctl: worker-events body `events` must be an array");
       return;
     }
-    for (const frame of frames) {
-      switch (frame.opcode) {
-        case WsOpcode.Close:
-          socket.end(encodeWsFrame(WsOpcode.Close, closeFramePayload(WS_CLOSE_NORMAL)));
-          shutdown();
-          return;
-        case WsOpcode.Ping:
-          socket.write(encodeWsFrame(WsOpcode.Pong, frame.payload));
-          break;
-        case WsOpcode.Pong:
-          break; // an unsolicited pong: ignore.
-        case WsOpcode.Text:
-        case WsOpcode.Binary:
-          messageOpcode = frame.opcode;
-          messageChunks = [frame.payload];
-          if (frame.fin) {
-            finishMessage();
-          }
-          break;
-        case WsOpcode.Continuation:
-          messageChunks.push(frame.payload);
-          if (frame.fin) {
-            finishMessage();
-          }
-          break;
-        default:
-          break; // unreachable: the reader rejects unknown opcodes.
+    for (const entry of events) {
+      // Relay each event's payload verbatim to the UI stream. A malformed entry (no
+      // `payload`) is skipped rather than tearing down the batch — fail-soft per event,
+      // fail-closed only on the batch envelope above.
+      if (typeof entry === "object" && entry !== null && !Array.isArray(entry) && "payload" in entry) {
+        broadcastEvent(state.events, (entry as { payload: JsonValue }).payload);
       }
     }
-  };
-
-  socket.on("data", onData);
-  socket.on("close", shutdown);
-  socket.on("error", () => {
-    socket.destroy();
-    shutdown();
+    writeJson(res, 200, {});
   });
-  // A worker that half-closes (sends a TCP FIN) without a WebSocket Close frame
-  // would otherwise linger: 'close' never fires while the server's write side stays
-  // open, so the session would be stuck `ready` and its one-channel slot held until
-  // restart. Treat the peer's FIN as a disconnect — destroy the socket, which drives
-  // 'close' → shutdown → status `closed` and reaps the slot.
-  socket.on("end", () => {
-    socket.destroy();
-  });
-
-  // Any bytes the HTTP parser already read past the handshake headers arrive in
-  // `head`; feed them before yielding to the socket's own 'data' stream.
-  if (head.length > 0) {
-    onData(head);
-  }
 }
 
 /**
- * Relay one steer message worker-ward over an open worker channel — the write
- * counterpart to the read path above (bridge-protocol §2: "steer input flows
- * worker-ward over this one channel"). Looks up the session's live worker-channel
- * socket, serializes the {@link ControlRequest} to its NDJSON line with
- * `@ccctl/core`'s {@link encodeControlFrame} — the SAME codec the read path decodes,
- * so the framing stays symmetric and is never re-implemented — and writes it as a
- * single UNMASKED WebSocket text frame ({@link encodeWsFrame}, server→client per
- * RFC 6455 §5.1). The trailing newline `encodeControlFrame` appends is the NDJSON
- * delimiter that lets the worker's own decoder emit the line without buffering.
- *
- * Fails closed: a session with no live channel (never connected, or already reaped)
- * throws rather than silently dropping the steer — {@link WorkerChannelState.workerChannels}
- * is the source of truth for a live channel, so its absence IS "not connected". The
- * UI-facing caller (`CcctlServer.dispatch`) surfaces that to the UI.
+ * `PUT …/worker` (§4). The status gate: `{ worker_status, worker_epoch,
+ * external_metadata }`. Derives the session's `activity` from `worker_status`
+ * ({@link applyWorkerStatus}) — `idle` means "ready for a turn". Fails closed 404
+ * (unknown session), 409 (superseded epoch), or 400 (unknown `worker_status`,
+ * drift). MUST `200` on success or the worker exits.
  */
-export function dispatchToWorkerChannel(state: WorkerChannelState, sessionId: string, request: ControlRequest): void {
-  const socket = state.workerChannels.get(sessionId);
-  if (socket === undefined) {
+export function handleWorkerStatus(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: WorkerChannelState,
+  sessionId: string,
+): void {
+  readWorkerBody(req, res, state, sessionId, "PUT", (_record, body) => {
+    const workerStatus = body.worker_status;
+    if (!isWorkerStatus(workerStatus)) {
+      writeError(res, 400, "ccctl: worker-status body carries an unknown `worker_status` (drift)");
+      return;
+    }
+    const session = state.sessions.get(sessionId);
+    if (session !== undefined) {
+      state.sessions.set(sessionId, applyWorkerStatus(session, workerStatus));
+    }
+    writeJson(res, 200, {});
+  });
+}
+
+/**
+ * `POST …/worker/heartbeat` (§4). Liveness: refreshes the session's
+ * `lastActivityAt` ({@link recordHeartbeat}). The body is not load-bearing (drained,
+ * ignored) — liveness must stay robust, so it is not epoch-gated. Fails closed
+ * 404/405 for an unknown session / wrong method. MUST `200`.
+ */
+export function handleWorkerHeartbeat(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: WorkerChannelState,
+  sessionId: string,
+): void {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on the worker-heartbeat path`);
+    return;
+  }
+  const session = state.sessions.get(sessionId);
+  if (session === undefined) {
+    writeError(res, 404, `ccctl: no session ${sessionId}`);
+    return;
+  }
+  req.resume(); // drain the (ignorable) body.
+  state.sessions.set(sessionId, recordHeartbeat(session));
+  writeJson(res, 200, {});
+}
+
+/**
+ * `POST …/worker/events/delivery` (§5). The worker's per-event downstream acks:
+ * `{ worker_epoch, updates: [{ event_id, status }] }`. Accepted (this slice has no
+ * redelivery / visibility-timeout, so the acks are a no-op beyond validation). Fails
+ * closed 404 (unknown session), 409 (superseded epoch), or 400 (malformed body).
+ * MUST `200`.
+ */
+export function handleWorkerDelivery(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: WorkerChannelState,
+  sessionId: string,
+): void {
+  readWorkerBody(req, res, state, sessionId, "POST", (_record, body) => {
+    if (!Array.isArray(body.updates)) {
+      writeError(res, 400, "ccctl: worker-delivery body `updates` must be an array");
+      return;
+    }
+    writeJson(res, 200, {});
+  });
+}
+
+/**
+ * Inject one user turn — push a `{ type: "user" }` `client_event` down the session's
+ * held-open downstream (§4/§5 turn injection). The `--sdk-url` worker demuxes on
+ * `payload.type`, so a user prompt is a `user` message. Fails closed (throws) when
+ * the session has no live downstream — the UI-facing caller ({@link injectTurn})
+ * surfaces that.
+ */
+export function injectUserTurn(state: WorkerChannelState, sessionId: string, prompt: string): void {
+  const payload: JsonValue = {
+    type: "user",
+    message: { role: "user", content: [{ type: "text", text: prompt }] },
+    parent_tool_use_id: null,
+    session_id: sessionId,
+    uuid: randomUUID(),
+  };
+  pushClientEvent(state, sessionId, payload);
+}
+
+/**
+ * Relay one UI steer worker-ward — push the {@link ControlRequest} as the payload of
+ * a `client_event` down the session's held-open downstream. `request.type` is
+ * `"control_request"`, one of the demux types the worker reads. Fails closed
+ * (throws) when the session has no live downstream, the same as {@link injectUserTurn}.
+ */
+export function dispatchControlRequest(state: WorkerChannelState, sessionId: string, request: ControlRequest): void {
+  pushClientEvent(state, sessionId, request as unknown as JsonValue);
+}
+
+/**
+ * End every held-open worker downstream and clear it — called from server shutdown.
+ * A held-open SSE response keeps its connection open indefinitely, so
+ * `httpServer.close()` would otherwise hang waiting on it (the UI-stream analog in
+ * `event-stream.ts`).
+ */
+export function closeWorkerChannels(state: WorkerChannelState): void {
+  for (const record of state.workerChannels.values()) {
+    if (record.downstream !== null) {
+      record.downstream.end();
+      record.downstream = null;
+    }
+  }
+}
+
+// --- internals ---
+
+/** One downstream `client_event` frame per §4/§5: event name pinned, `data` the demux envelope. */
+function pushClientEvent(state: WorkerChannelState, sessionId: string, payload: JsonValue): void {
+  const record = state.workerChannels.get(sessionId);
+  if (record === undefined || record.downstream === null) {
     throw new Error(`ccctl: no live worker channel for session ${sessionId}`);
   }
-  socket.write(encodeWsFrame(WsOpcode.Text, Buffer.from(encodeControlFrame(request), "utf8")));
+  const seq = record.nextSeq++;
+  const data = JSON.stringify({ sequence_num: seq, event_id: randomUUID(), event_type: "message", payload });
+  record.downstream.write(`event: client_event\nid: ${seq}\ndata: ${data}\n\n`);
 }
 
 /**
- * Extract the session id from a worker-channel path — `{@link SESSIONS_PATH}/{sessionId}/ws`
- * (`/v1/sessions/{id}/ws`), the base the §2 session-create mints its `ws_url` under — or
- * `null` when the path is not a worker-channel URL or carries an empty / nested session segment.
+ * Read + epoch-validate an upstream worker POST body, then invoke `onBody` with the
+ * live {@link WorkerChannelRecord} and the parsed object. Centralizes the shared
+ * fail-closed tail of the `events` / `status` / `delivery` legs: wrong method → 405,
+ * unknown session → 404, unregistered / superseded epoch → 409, non-object or
+ * over-cap body → 400/413. Only a request that clears all of these reaches `onBody`.
  */
-function matchWorkerChannelPath(pathname: string): string | null {
-  const suffix = "/ws";
-  if (!pathname.endsWith(suffix)) {
-    return null;
-  }
-  const prefix = `${SESSIONS_PATH}/`;
-  if (!pathname.startsWith(prefix)) {
-    return null;
-  }
-  const sessionId = pathname.slice(prefix.length, pathname.length - suffix.length);
-  return sessionId === "" || sessionId.includes("/") ? null : sessionId;
-}
-
-/** Update a session's transport-lifecycle `status`, leaving its other dimensions untouched. */
-function setStatus(state: WorkerChannelState, sessionId: string, status: SessionStatus): void {
-  const session = state.sessions.get(sessionId);
-  if (session !== undefined) {
-    state.sessions.set(sessionId, { ...session, status });
-  }
-}
-
-/** Reject an upgrade with a minimal plain-HTTP error, then destroy the socket. */
-function rejectUpgrade(
-  socket: Duplex,
-  status: number,
-  statusText: string,
-  message: string,
-  headers: Record<string, string> = {},
+function readWorkerBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: WorkerChannelState,
+  sessionId: string,
+  method: "POST" | "PUT",
+  onBody: (record: WorkerChannelRecord, body: Record<string, unknown>) => void,
 ): void {
-  const lines = [
-    `HTTP/1.1 ${status} ${statusText}`,
-    "Connection: close",
-    "Content-Type: text/plain; charset=utf-8",
-    `Content-Length: ${Buffer.byteLength(message)}`,
-    ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
-  ];
-  socket.write(`${lines.join("\r\n")}\r\n\r\n${message}`);
-  socket.destroy();
+  if (req.method !== method) {
+    res.setHeader("Allow", method);
+    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on the worker channel`);
+    return;
+  }
+  if (!state.sessions.has(sessionId)) {
+    writeError(res, 404, `ccctl: no session ${sessionId}`);
+    return;
+  }
+  void readJsonBody(req, MAX_WORKER_BODY_BYTES).then((result) => {
+    if (!result.ok) {
+      writeError(res, result.status, result.message);
+      return;
+    }
+    if (typeof result.value !== "object" || result.value === null || Array.isArray(result.value)) {
+      writeError(res, 400, "ccctl: worker channel body must be a JSON object");
+      return;
+    }
+    const body = result.value as Record<string, unknown>;
+    const record = state.workerChannels.get(sessionId);
+    // The epoch gate: the worker must have registered, and the stamped epoch must be
+    // the current one. A superseded (or absent) epoch fails closed 409 — the worker exits.
+    if (record === undefined || body.worker_epoch !== record.epoch) {
+      writeError(res, 409, `ccctl: worker channel epoch superseded for session ${sessionId}`);
+      return;
+    }
+    onBody(record, body);
+  });
 }

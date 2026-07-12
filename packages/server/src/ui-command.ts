@@ -4,39 +4,43 @@
 /**
  * The UI command ingress — the browser's `fetch` POST that steers the worker (#13).
  *
- * This is the upstream half of the zero-build UI transport pair: the browser
- * POSTs a `{ subtype, payload? }` command to `POST /api/command`, and the server
- * re-frames it as a `@ccctl/core` {@link ControlRequest} and relays it worker-ward
- * over the session's live worker channel — reusing {@link dispatchToWorkerChannel}
- * (issue #12), never re-implementing the framing. The downstream half — the SSE
- * event stream the browser reads — is `event-stream.ts`.
+ * This is the upstream half of the zero-build UI transport pair: the browser POSTs a
+ * `{ subtype, payload? }` command to `POST /api/command`, and the server pushes it
+ * worker-ward as a `client_event` frame down the session's held-open worker
+ * downstream (§4/§5), reusing `worker-channel.ts`, never re-implementing the framing.
+ * The downstream half — the SSE event stream the browser reads — is `event-stream.ts`.
  *
- * The server MINTS the `control_request` id (a fresh UUID per command): the id is
- * the server's correlation handle, not the browser's to choose. The command is
- * relayed to THE session (one session at this slice); per-session addressing lands
- * with multiplexing, a later item.
+ * The command's `subtype` selects the frame's `payload.type` (the worker's demux key):
+ *
+ *   - `prompt` (send input) → a `{ type: "user" }` turn ({@link injectUserTurn}) — the
+ *     user's text becomes a user message, the load-bearing turn injection (#130).
+ *   - any other verb (`approve` / `interrupt`) → a `{ type: "control_request" }`
+ *     ({@link dispatchControlRequest}), the server MINTING the correlation id (the id is
+ *     the server's handle, not the browser's to choose).
  *
  * Fail-closed on every branch that is not a well-formed POST that can actually be
- * relayed: a wrong method, an over-long or malformed body, no session, or no live
- * worker channel each answer with a status, never a silent drop. Browser-facing
- * auth is deferred (see `event-stream.ts`) — the loopback ingress is unauthenticated
- * at this slice.
+ * relayed: a wrong method, an over-long or malformed body, a blank prompt, no session,
+ * or no live worker channel each answer with a status, never a silent drop.
+ * Browser-facing auth is deferred (see `event-stream.ts`) — the loopback ingress is
+ * unauthenticated at this slice.
  */
 
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ControlRequest } from "@ccctl/core";
 import { writeError, writeJson } from "./http-response.js";
-import { dispatchToWorkerChannel, type WorkerChannelState } from "./worker-channel.js";
+import { dispatchControlRequest, injectUserTurn, type WorkerChannelState } from "./worker-channel.js";
 
 /** The same-origin path the browser POSTs UI steer commands to. */
 export const COMMAND_PATH = "/api/command";
 
+/** The "send input" steer verb — mapped to a `{ type: "user" }` turn injection (mirrors `@ccctl/web-ui`). */
+const INPUT_SUBTYPE = "prompt";
+
 /**
  * Hard ceiling on a command body (1 MiB). Generous for a UI steer — even a large
- * pasted prompt fits — while bounding an unbuffered POST body against a malformed
- * or hostile `Content-Length`. The worker channel enforces its own 16 MiB
- * per-frame cap downstream; this is the ingress-side counterpart.
+ * pasted prompt fits — while bounding an unbuffered POST body against a malformed or
+ * hostile `Content-Length`.
  */
 const MAX_COMMAND_BODY_BYTES = 1024 * 1024;
 
@@ -84,10 +88,10 @@ function currentSessionId(state: WorkerChannelState): string | null {
 }
 
 /**
- * Handle `POST /api/command` — re-frame a UI steer command as a `control_request`
- * and relay it over the session's worker channel. Reads the body with a size cap,
- * validates it, then dispatches; answers `202` with the minted request id, or a
- * fail-closed status on any branch that cannot be relayed.
+ * Handle `POST /api/command` — push a UI steer worker-ward as a `client_event` on the
+ * session's worker downstream. Reads the body with a size cap, validates it, then
+ * relays; answers `202` with the minted correlation id, or a fail-closed status on any
+ * branch that cannot be relayed.
  */
 export function handleUiCommand(req: IncomingMessage, res: ServerResponse, state: WorkerChannelState): void {
   if (req.method !== "POST") {
@@ -130,18 +134,22 @@ export function handleUiCommand(req: IncomingMessage, res: ServerResponse, state
       writeError(res, 404, "ccctl: no session to steer");
       return;
     }
+    // A `prompt` steer needs a non-empty text before anything is relayed (400).
+    if (command.subtype === INPUT_SUBTYPE) {
+      const text = command.payload?.text;
+      if (typeof text !== "string" || text.trim() === "") {
+        writeError(res, 400, "ccctl: a `prompt` command requires a non-empty `payload.text`");
+        return;
+      }
+    }
     // The server owns the correlation id; the browser does not choose it.
     const id = randomUUID();
-    const request: ControlRequest =
-      command.payload === undefined
-        ? { type: "control_request", id, subtype: command.subtype }
-        : { type: "control_request", id, subtype: command.subtype, payload: command.payload };
     try {
-      dispatchToWorkerChannel(state, sessionId, request);
+      relayCommand(state, sessionId, id, command);
     } catch {
-      // dispatchToWorkerChannel fails closed when the session has no live worker
-      // channel (never connected, or already reaped). Surface that as a conflict
-      // rather than a silent drop, so the UI learns the steer did not land.
+      // injectUserTurn / dispatchControlRequest fail closed when the session has no
+      // live worker downstream (never connected, or already reaped). Surface that as a
+      // conflict rather than a silent drop, so the UI learns the steer did not land.
       writeError(res, 409, `ccctl: session ${sessionId} has no live worker channel`);
       return;
     }
@@ -149,8 +157,26 @@ export function handleUiCommand(req: IncomingMessage, res: ServerResponse, state
   });
 
   req.on("error", () => {
-    // A request-stream error (the client reset mid-body): the connection is gone,
-    // so there is nothing to relay and no one to answer — drop it.
+    // A request-stream error (the client reset mid-body): the connection is gone, so
+    // there is nothing to relay and no one to answer — drop it.
     handled = true;
   });
+}
+
+/**
+ * Relay a parsed command worker-ward: a `prompt` becomes a `{ type: "user" }` turn (the
+ * `payload.text`, already validated non-empty by the caller, is the prompt), anything
+ * else a `{ type: "control_request" }` carrying the server-minted `id`. Throws (via the
+ * channel helpers) when there is no live downstream, which the caller maps to a `409`.
+ */
+function relayCommand(state: WorkerChannelState, sessionId: string, id: string, command: UiCommand): void {
+  if (command.subtype === INPUT_SUBTYPE) {
+    injectUserTurn(state, sessionId, command.payload?.text as string);
+    return;
+  }
+  const request: ControlRequest =
+    command.payload === undefined
+      ? { type: "control_request", id, subtype: command.subtype }
+      : { type: "control_request", id, subtype: command.subtype, payload: command.payload };
+  dispatchControlRequest(state, sessionId, request);
 }

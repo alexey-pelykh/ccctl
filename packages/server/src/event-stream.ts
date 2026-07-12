@@ -5,10 +5,16 @@
  * The UI event stream — the Server-Sent Events (SSE) relay to the browser (#13).
  *
  * This is the downstream half of the zero-build UI transport pair: the worker
- * channel (`worker-channel.ts`) fans every inbound `control_event` out to
- * subscribed UI clients here, and the browser's `EventSource` reads them off
- * `GET /api/events`. The upstream half — the browser's `fetch` POST that steers
- * the worker — is `ui-command.ts`.
+ * channel (`worker-channel.ts`) fans every payload it reads off the worker's
+ * upstream `POST …/worker/events` leg (§5) out to subscribed UI clients here, and
+ * the browser's `EventSource` reads them off `GET /api/events`. The upstream half —
+ * the browser's `fetch` POST that steers the worker — is `ui-command.ts`.
+ *
+ * The relayed payload is a RAW worker event ({@link JsonValue}) — a `stream-json`
+ * message off the `--sdk-url` control transport, not necessarily a `control_event`.
+ * The browser's decoder classifies a `control_event` (transcript / current-turn) and
+ * surfaces anything else verbatim, so relaying the raw payload here is faithful (no
+ * shape is dropped) rather than filtered.
  *
  * What this slice guarantees:
  *   1. Every relayed event carries a monotonic **`Last-Event-ID`-compatible id**
@@ -27,13 +33,14 @@
  * later item; until then the one stream IS the one session's.
  *
  * Browser-facing auth is deferred: the loopback UI ingress is unauthenticated at
- * this slice (the account Bearer is the WORKER's credential, enforced on the
- * register + worker channel, never the browser's). The local-server credential
- * boundary — how the UI/tunnel authenticates — is the deferred security item.
+ * this slice (the account Bearer is the WORKER's credential, riding §1/§2 —
+ * register + session-create — ONLY; the per-session ingress token authorizes the
+ * §4/§5 worker channel, never the browser). The local-server credential boundary —
+ * how the UI/tunnel authenticates — is the deferred security item.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { ControlEvent } from "@ccctl/core";
+import type { JsonValue } from "@ccctl/core";
 import { writeError } from "./http-response.js";
 
 /** The same-origin path the browser's `EventSource` subscribes to. */
@@ -70,14 +77,14 @@ export function createEventStreamState(): EventStreamState {
 }
 
 /**
- * Encode one control event as an SSE message carrying its `Last-Event-ID` `id`.
- * `JSON.stringify` never emits a literal newline (a newline inside a string is
+ * Encode one worker event payload as an SSE message carrying its `Last-Event-ID`
+ * `id`. `JSON.stringify` never emits a literal newline (a newline inside a string is
  * escaped as `\n`), so the payload is a single physical line; the split still
  * defends the framing, since an SSE `data` field spanning newlines must repeat
  * the `data:` prefix per line.
  */
-function encodeSseEvent(id: number, event: ControlEvent): string {
-  const dataLines = JSON.stringify(event)
+function encodeSseEvent(id: number, payload: JsonValue): string {
+  const dataLines = JSON.stringify(payload)
     .split("\n")
     .map((line) => `data: ${line}`)
     .join("\n");
@@ -92,14 +99,14 @@ function writeChunk(res: ServerResponse, chunk: string): void {
 }
 
 /**
- * Relay one control event to every subscribed UI client over SSE. Assigns the
- * next monotonic `Last-Event-ID` and retains the event in the bounded replay
+ * Relay one worker event payload to every subscribed UI client over SSE. Assigns
+ * the next monotonic `Last-Event-ID` and retains the event in the bounded replay
  * buffer FIRST — regardless of whether anyone is currently subscribed — so a
  * client that reconnects afterwards can still reconcile the gap.
  */
-export function broadcastEvent(state: EventStreamState, event: ControlEvent): void {
+export function broadcastEvent(state: EventStreamState, payload: JsonValue): void {
   const id = state.nextEventId++;
-  const chunk = encodeSseEvent(id, event);
+  const chunk = encodeSseEvent(id, payload);
   state.buffer.push({ id, chunk });
   if (state.buffer.length > EVENT_REPLAY_BUFFER_SIZE) {
     state.buffer.shift();

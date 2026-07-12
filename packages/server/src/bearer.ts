@@ -5,8 +5,10 @@
  * `Authorization: Bearer …` parsing, shared by the ccctl-server ingress points
  * that receive the account credential: the environments-bridge POSTs — §1
  * environment register (`POST /v1/environments/bridge`) and §2 session create
- * (`POST /v1/sessions`) — and the §4 worker-channel WebSocket upgrade. (The §3
- * work-poll reuses the same extractor to read its SCOPED per-environment token.)
+ * (`POST /v1/sessions`) — and ONLY those. The §3 work-poll is uncredentialed (the
+ * worker presents none), and the §4/§5 per-session channel is authorized by the
+ * locally-minted session ingress token, NOT the account Bearer — so neither leg
+ * reaches this extractor.
  *
  * The helper only reports whether a usable Bearer is PRESENT — it deliberately
  * has no persistence surface of its own. At the account-credential points the
