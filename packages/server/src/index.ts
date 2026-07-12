@@ -46,6 +46,7 @@ import {
   handleWorkerHeartbeat,
   handleWorkerRegister,
   handleWorkerStatus,
+  hasLiveWorkerChannel,
   injectUserTurn,
   matchWorkerRoute,
   type WorkerChannelRecord,
@@ -118,9 +119,18 @@ export interface CcctlServer {
   /**
    * Inject one user turn — push a `{ type: "user" }` `client_event` down the session's
    * held-open worker downstream (§4/§5). The programmatic form of the turn a
-   * `POST /api/command` `prompt` drives. Throws if the session has no live worker channel.
+   * `POST /api/command` `prompt` drives. Throws if the session has no live worker channel
+   * (guard the call with {@link CcctlServer.hasLiveWorker}).
    */
   injectTurn(sessionId: string, prompt: string): void;
+  /**
+   * Whether the session has a LIVE worker channel — a real worker registered AND is
+   * holding its §4/§5 downstream open ({@link CcctlServer.injectTurn}'s precondition). The
+   * receiver-grounded read of "a real worker is connected", distinct from the session
+   * merely existing in {@link CcctlServer.sessions}; `false` for an unknown session or one
+   * whose worker has not opened (or has closed) its downstream.
+   */
+  hasLiveWorker(sessionId: string): boolean;
   /** Stop accepting connections and release the port. */
   close(): Promise<void>;
 }
@@ -203,6 +213,9 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
     environments: state.environments,
     injectTurn(sessionId: string, prompt: string): void {
       injectUserTurn(state, sessionId, prompt);
+    },
+    hasLiveWorker(sessionId: string): boolean {
+      return hasLiveWorkerChannel(state, sessionId);
     },
     close(): Promise<void> {
       return new Promise<void>((resolve, reject) => {

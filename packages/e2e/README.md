@@ -64,14 +64,38 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   credentials), so it gates on every run. Its pure SSE parsing helpers are
   unit-tested in `one-session-harness.test.ts`.
 
-## What is still a placeholder
+- **Live-worker oracle (credentialed wave, #133)** — `live-worker-oracle.ts` pairs the
+  hermetic wire-conformance golden with an independent **live** check. A hermetic golden
+  can only verify "the server emits the wire the golden encodes," never "the golden
+  encodes the wire the **real** worker actually speaks"; the oracle closes that gap by
+  driving a **real** patched worker against the built `@ccctl/server` and
+  **self-classifying** the observed wire against the golden's pinned shapes —
+  `verified` (the live wire matches every pinned shape **and** a real worker reached
+  `idle` and completed one turn), `drift` (a leg's live wire diverged — the golden is
+  stale vs the current worker; the diverging leg(s) are **named** and the run **fails**),
+  or `inconclusive` (a required leg was never captured — worker never reached `idle`, no
+  turn, or a bridge response was never seen — **runtime-skip**, never a fabricated green).
+  It reuses the golden's **own** pure shape assertions, so "drift" is literally "the live
+  wire fails the same gate the golden pins," and every "reached X" is receiver-read from
+  the server's own state (the `one-session-harness` posture). **Fenced / opt-in**: the
+  whole suite is gated on `CCCTL_E2E` + `CCCTL_SDK_URL` + `ANTHROPIC_API_KEY`
+  (`resolveOracleEnv`) and `describe.skipIf`-skips when they are absent, so it lives
+  **outside** the credential-free CI `e2e` lane and never runs — nor fails — there.
+  `control-plane.e2e.test.ts` drives it; the pure fence + tri-state classifier are
+  unit-tested credential-free in `live-worker-oracle.test.ts`.
 
-- The **full happy path with a real worker** — the same one-session flow, but
-  driven by a real patched, headless Claude Code worker and with a **real egress
-  to `api.anthropic.com`** — lands in a later, credentialed wave (gated on
-  `CCCTL_E2E` / `CCCTL_SDK_URL` / `ANTHROPIC_API_KEY`). `control-plane.e2e.test.ts`
-  holds that `describe.todo` placeholder; the hermetic `one-session-harness` above
-  is the skeleton it graduates from.
+## What is fenced to the credentialed wave
+
+- The **live-worker oracle** above is wired but **fenced** — it runs only when
+  `CCCTL_E2E` / `CCCTL_SDK_URL` / `ANTHROPIC_API_KEY` are set (turbo passes them through
+  to `test:e2e`). The remaining forward-looking piece is the concrete **patched-worker
+  launch contract** (`PatchedWorkerLauncher` / `spawnPatchedWorker`): the repo ships no
+  packaged patched worker yet (the `ccctl serve` daemon is still a skeleton, #71), so the
+  default launcher spawns the operator-supplied `CCCTL_SDK_URL` with a documented env
+  contract, and any mismatch surfaces **safely** as `inconclusive` rather than a fake
+  green. The launcher is injectable, so that contract can firm up when the patched-worker
+  packaging lands with no churn to the oracle. The hermetic `one-session-harness` is the
+  skeleton the live oracle graduates from.
 
 ## Running
 

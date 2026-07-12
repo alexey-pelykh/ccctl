@@ -338,3 +338,30 @@ describe("turn injection — server.injectTurn pushes a client_event down the do
     expect(() => server.injectTurn("no-such-session", "hi")).toThrow(/no live worker channel/);
   });
 });
+
+describe("worker liveness — server.hasLiveWorker reflects a held-open downstream (not mere session existence)", () => {
+  it("is false for an unknown session and for a session whose worker has not opened its downstream", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+
+    // Unknown session — no channel at all.
+    expect(server.hasLiveWorker("no-such-session")).toBe(false);
+    // Session EXISTS but no worker registered/opened a downstream — the exact case that must
+    // NOT read as live (the injectTurn precondition is unmet, so a turn would fail closed).
+    expect(server.hasLiveWorker(sessionId)).toBe(false);
+    await registerWorker(server, sessionId);
+    // Registered an epoch but still no held-open downstream → still not live.
+    expect(server.hasLiveWorker(sessionId)).toBe(false);
+  });
+
+  it("is true once the worker holds its downstream open — exactly when injectTurn would NOT throw", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId);
+
+    expect(server.hasLiveWorker(sessionId)).toBe(true);
+    // Corroboration: the injectTurn precondition hasLiveWorker gates is now met.
+    expect(() => server.injectTurn(sessionId, "go")).not.toThrow();
+  });
+});

@@ -33,10 +33,19 @@
  *   - the account-Bearer non-persisting pass-through canary (#60) —
  *     {@link assertBearerNeverObserved}, the runtime complement to core's
  *     compile-time credential-omission proof, asserted observationally over the
- *     one-session flow (see `bearer-canary.e2e.test.ts`).
+ *     one-session flow (see `bearer-canary.e2e.test.ts`); and
+ *   - the fenced, self-classifying LIVE-WORKER oracle (#133) —
+ *     {@link driveLiveWorkerOracle} + {@link classifyObservedWire}, the credentialed
+ *     complement to the hermetic golden: it drives a REAL patched worker against the
+ *     built server and self-classifies the observed wire (`verified | drift |
+ *     inconclusive`) against the golden's pinned shapes, so a green hermetic run plus a
+ *     green live run means the golden encodes the wire a real worker actually speaks.
+ *     Fenced on CCCTL_E2E + CCCTL_SDK_URL + ANTHROPIC_API_KEY; skips-never-fakes (see
+ *     `control-plane.e2e.test.ts`).
  *
- * The full happy path with a REAL patched worker and a real egress to
- * api.anthropic.com lands in a later, credentialed wave.
+ * The live-worker oracle drives the full happy path with a REAL patched worker and a
+ * real egress to api.anthropic.com — fenced to the credentialed wave; the hermetic
+ * skeletons above stay loopback-only.
  */
 
 /** The host that inference MUST continue to reach, unproxied. */
@@ -69,3 +78,4 @@ export * from "./bridge-wire-conformance.js";
 export * from "./traffic-harness.js";
 export * from "./one-session-harness.js";
 export * from "./bearer-canary.js";
+export * from "./live-worker-oracle.js";
