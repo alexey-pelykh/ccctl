@@ -54,8 +54,9 @@
  *
  * Forward-looking seam: the concrete way a patched worker is brought up
  * ({@link PatchedWorkerLauncher}) is the credentialed-wave integration point. The repo
- * ships no real-worker launcher today (the `ccctl serve` daemon is still a skeleton,
- * #71), so the DEFAULT launcher ({@link spawnPatchedWorker}) spawns the operator-supplied
+ * ships no real-worker launcher today (#71 wired the `ccctl serve` / `patch` / `tunnel`
+ * verbs, but packaging a patched worker is a later, credentialed wave), so the DEFAULT
+ * launcher ({@link spawnPatchedWorker}) spawns the operator-supplied
  * `CCCTL_SDK_URL` command with a documented env contract, and any mismatch surfaces
  * SAFELY as `inconclusive` (the worker never reaches `idle`) — never a fake green. The
  * launcher is injectable so the pure fence + classification logic is fully unit-testable
@@ -333,8 +334,9 @@ export type PatchedWorkerLauncher = (options: WorkerLaunchOptions) => Promise<Pa
  *   - `ANTHROPIC_API_KEY` — carried through for the worker's real inference on the one turn.
  *
  * This is the credentialed-wave contract, not a claim about today's Claude Code build:
- * the repo ships no packaged patched worker yet (the `ccctl serve` daemon is a skeleton,
- * #71), so a `CCCTL_SDK_URL` that does not honor this contract simply never drives the
+ * the repo ships no packaged patched worker yet (#71 wired the `ccctl serve` daemon, but
+ * the patched-worker packaging is a later wave), so a `CCCTL_SDK_URL` that does not honor
+ * this contract simply never drives the
  * channel to `idle`, and the run self-classifies `inconclusive`. Kills the child on
  * `close()` so a serial e2e run leaks no process.
  */

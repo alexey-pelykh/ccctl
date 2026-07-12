@@ -95,7 +95,8 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   `CCCTL_E2E` / `CCCTL_SDK_URL` / `ANTHROPIC_API_KEY` are set (turbo passes them through
   to `test:e2e`). The remaining forward-looking piece is the concrete **patched-worker
   launch contract** (`PatchedWorkerLauncher` / `spawnPatchedWorker`): the repo ships no
-  packaged patched worker yet (the `ccctl serve` daemon is still a skeleton, #71), so the
+  packaged patched worker yet (#71 wired the `ccctl serve` daemon + `patch`/`tunnel` verbs,
+  but packaging a patched worker is a later wave), so the
   default launcher spawns the operator-supplied `CCCTL_SDK_URL` with a documented env
   contract, and any mismatch surfaces **safely** as `inconclusive` rather than a fake
   green. The launcher is injectable, so that contract can firm up when the patched-worker
