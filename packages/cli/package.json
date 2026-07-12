@@ -1,7 +1,7 @@
 {
   "name": "@ccctl/cli",
   "version": "0.0.0",
-  "description": "ccctl CLI: start the local server and pick a tunnel",
+  "description": "ccctl CLI: patch the worker, serve the local server, and pick a tunnel",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
