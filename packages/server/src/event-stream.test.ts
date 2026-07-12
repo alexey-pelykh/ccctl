@@ -109,11 +109,7 @@ function parseSseBlock(block: string): SseEvent | null {
 }
 
 /** Open an EventSource-style GET against a session's `…/events` and collect parsed SSE events. */
-function openSse(
-  server: CcctlServer,
-  sessionId: string,
-  options: { lastEventId?: string } = {},
-): Promise<SseClient> {
+function openSse(server: CcctlServer, sessionId: string, options: { lastEventId?: string } = {}): Promise<SseClient> {
   const { host, port } = server.address;
   const headers: Record<string, string> = { Accept: "text/event-stream" };
   if (options.lastEventId !== undefined) {
