@@ -11,10 +11,13 @@
  * local {@link HostEndpoint} reachable and report back the public host the
  * worker's `--sdk-url` allowlist must then be told to permit.
  *
- * This slice implements Tailscale {@link TailscaleTunnel.establish | establish}
- * — bringing the tunnel up over the tailnet, reachable with no public IP and no
- * open inbound port. The rest of the {@link Tunnel} lifecycle (`status`,
- * `teardown`) and the Cloudflare / Headscale backends are still typed stubs.
+ * This item completes the Tailscale {@link Tunnel} lifecycle:
+ * {@link TailscaleTunnel.establish | establish} brings the tunnel up over the
+ * tailnet (reachable with no public IP and no open inbound port),
+ * {@link TailscaleTunnel.status | status} reports whether it is up and the host
+ * it is reachable at, and {@link TailscaleTunnel.teardown | teardown} releases
+ * it cleanly. Tailscale ACL provisioning and mandatory tunnel-auth, and the
+ * Cloudflare / Headscale backends, are still to come.
  */
 
 import { execFile } from "node:child_process";
@@ -41,9 +44,30 @@ export interface EstablishedTunnel {
 }
 
 /**
+ * The current lifecycle state of a {@link Tunnel}, as reported by
+ * {@link Tunnel.status}: whether it is `up` and, when it is, the same
+ * `publicHost` {@link Tunnel.establish} resolved — the AC's "reachable base",
+ * the host the SDK allowlist is permitting right now. A discriminated union, so
+ * an `up` status always carries a reachable host and a `down` one never claims a
+ * base it lacks (illegal states unrepresentable, as elsewhere in this codebase).
+ */
+export type TunnelStatus =
+  | { readonly kind: TunnelKind; readonly up: true; readonly publicHost: string }
+  | { readonly kind: TunnelKind; readonly up: false };
+
+/**
+ * The `down` {@link TunnelStatus} for a backend — the one shape shared by a
+ * torn-down (or never-established) Tailscale tunnel and the not-yet-implemented
+ * stub backends.
+ */
+function downStatus(kind: TunnelKind): TunnelStatus {
+  return { kind, up: false };
+}
+
+/**
  * Pluggable tunnel backend — one lifecycle contract, interchangeable
- * implementations. This slice defines `establish`; the rest of the lifecycle
- * (`status`, `teardown`) lands in a later item.
+ * implementations: bring a loopback endpoint up ({@link establish}), report
+ * whether it is up ({@link status}), and release it ({@link teardown}).
  */
 export interface Tunnel {
   /** Which backend this tunnel drives. */
@@ -54,6 +78,21 @@ export interface Tunnel {
    * binds loopback and the tunnel is its only path from off-box.
    */
   establish(local: HostEndpoint): Promise<EstablishedTunnel>;
+  /**
+   * Report the tunnel's current state — `up` (with the reachable public host)
+   * once {@link establish} has succeeded, `down` before it has or after
+   * {@link teardown}. Async at the interface level because a backend may have to
+   * query a remote control plane to answer; a CLI-driven backend such as
+   * Tailscale answers from the lifecycle state it tracks in-process.
+   */
+  status(): Promise<TunnelStatus>;
+  /**
+   * Release the tunnel {@link establish} brought up, leaving no mapping behind,
+   * and return it to `down`. A clean no-op when nothing is established, so it is
+   * always safe to call — e.g. from a shutdown path that does not know whether
+   * {@link establish} ran.
+   */
+  teardown(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,16 +164,37 @@ interface TailscaleSelf {
  * the tailnet with `tailscale serve` — reachable only inside the tailnet, so no
  * public IP and no open inbound port (in deliberate contrast to `tailscale
  * funnel`, which is public and is NOT used) — then resolves the node's tailnet
- * host from `tailscale status`.
+ * host from `tailscale status`. `status` reports the tracked lifecycle state (up
+ * with the reachable host, or down) and `teardown` turns that same serve mapping
+ * back off.
  *
- * This is the thin `establish` slice: ACL provisioning and mandatory
- * tunnel-auth land with the complete adapter, and `status` / `teardown` with
- * the rest of the lifecycle.
+ * The instance tracks what it served, so `status` / `teardown` act on exactly
+ * the mapping this `establish` brought up — a fresh instance per `establish`
+ * (see {@link ADAPTERS}). ACL provisioning and mandatory tunnel-auth still land
+ * with the complete adapter.
  */
 export class TailscaleTunnel implements Tunnel {
   readonly kind = "tailscale" as const;
 
   readonly #runner: CommandRunner;
+
+  /**
+   * The loopback endpoint currently served, recorded the moment `tailscale
+   * serve` succeeds — before the tailnet host is resolved — so `teardown` can
+   * turn the mapping back off even if `establish` later rejected while resolving
+   * the host (a half-up serve is still cleanly releasable). `null` when nothing
+   * is served: before `establish`, or after `teardown`.
+   */
+  #servedLocal: HostEndpoint | null = null;
+
+  /**
+   * The fully-resolved tunnel — set only once `establish` has both served the
+   * endpoint and resolved its reachable host. `status` reports `up` exactly when
+   * this is non-`null`; a serve that came up but never resolved a host is not a
+   * usable `up` (no reachable base to report), though `#servedLocal` still lets
+   * `teardown` release it.
+   */
+  #established: EstablishedTunnel | null = null;
 
   constructor(runner: CommandRunner = defaultCommandRunner) {
     this.#runner = runner;
@@ -152,9 +212,46 @@ export class TailscaleTunnel implements Tunnel {
     // internet. `--bg` detaches, so `establish` resolves once it is serving.
     // `formatAuthority` brackets an IPv6 loopback (`[::1]:port`), so `::1` — a
     // host `isLoopbackHost` accepts — yields a valid URL, not `http://::1:port`.
-    await this.#runner.run(TAILSCALE_BIN, ["serve", "--bg", `http://${formatAuthority(local.host, local.port)}`]);
+    await this.#runner.run(TAILSCALE_BIN, ["serve", "--bg", this.#serveTarget(local)]);
+    // The mapping is up now; record it before resolving the host so `teardown`
+    // can release it even if host resolution below throws.
+    this.#servedLocal = local;
 
-    return { kind: this.kind, publicHost: await this.#resolveTailnetHost() };
+    const established: EstablishedTunnel = { kind: this.kind, publicHost: await this.#resolveTailnetHost() };
+    this.#established = established;
+    return established;
+  }
+
+  status(): Promise<TunnelStatus> {
+    // Answered from tracked lifecycle state — no `tailscale` call. The instance
+    // owns its serve mapping (a fresh one per `establish`, see ADAPTERS), so its
+    // own record IS the current state; `status` is async only to satisfy the
+    // backend-agnostic interface (a remote-API backend may need to query).
+    const established = this.#established;
+    return Promise.resolve(
+      established === null ? downStatus(this.kind) : { kind: this.kind, up: true, publicHost: established.publicHost },
+    );
+  }
+
+  async teardown(): Promise<void> {
+    const served = this.#servedLocal;
+    if (served === null) {
+      return; // Nothing established (or already torn down) — a clean no-op.
+    }
+    // Turn off exactly the mapping `establish` turned on: the same serve target
+    // plus a trailing `off` (`tailscale serve --bg <target> off`). Targeted, so
+    // only THIS tunnel is released — never other `tailscale serve` config the
+    // user may run, which the blunter `tailscale serve reset` would clobber.
+    await this.#runner.run(TAILSCALE_BIN, ["serve", "--bg", this.#serveTarget(served), "off"]);
+    // Clear state only after the off command succeeds; if it rejected, the
+    // tunnel stays established so the caller can retry `teardown`.
+    this.#servedLocal = null;
+    this.#established = null;
+  }
+
+  /** The `tailscale serve` HTTP target for a loopback endpoint (IPv6 bracketed). */
+  #serveTarget(local: HostEndpoint): string {
+    return `http://${formatAuthority(local.host, local.port)}`;
   }
 
   /** Resolve this node's tailnet host from `tailscale status --json`. */
@@ -224,6 +321,11 @@ function tailnetHostFromSelf(self: TailscaleSelf): string | null {
  * `establish`, never a synchronous throw — so every {@link Tunnel} reports
  * failure the one way (a rejection a caller's `.catch` sees), matching the real
  * Tailscale path.
+ *
+ * Only `establish` is the unimplemented capability, so only it rejects. A
+ * backend that never establishes is honestly `down` and has nothing to release,
+ * so its `status` / `teardown` answer normally ({@link downStatus} / a no-op)
+ * rather than reject — keeping the whole lifecycle total across every backend.
  */
 function notImplemented(kind: TunnelKind): Promise<never> {
   return Promise.reject(new Error(`ccctl: ${kind} tunnel adapter is not implemented yet (skeleton)`));
@@ -236,6 +338,14 @@ export class CloudflareTunnel implements Tunnel {
   establish(_local: HostEndpoint): Promise<EstablishedTunnel> {
     return notImplemented(this.kind);
   }
+
+  status(): Promise<TunnelStatus> {
+    return Promise.resolve(downStatus(this.kind));
+  }
+
+  teardown(): Promise<void> {
+    return Promise.resolve();
+  }
 }
 
 /** Stub {@link Tunnel} for Headscale (self-hosted Tailscale control plane). */
@@ -244,6 +354,14 @@ export class HeadscaleTunnel implements Tunnel {
 
   establish(_local: HostEndpoint): Promise<EstablishedTunnel> {
     return notImplemented(this.kind);
+  }
+
+  status(): Promise<TunnelStatus> {
+    return Promise.resolve(downStatus(this.kind));
+  }
+
+  teardown(): Promise<void> {
+    return Promise.resolve();
   }
 }
 

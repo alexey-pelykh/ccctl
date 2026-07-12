@@ -157,6 +157,77 @@ describe("TailscaleTunnel.establish (AC: brings a Tailscale tunnel up)", () => {
   });
 });
 
+describe("TailscaleTunnel status + teardown (AC: status up/down/reachable base, clean teardown)", () => {
+  it("is down before establish, up with the reachable host after, down again after teardown", async () => {
+    const { runner, calls } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "phone-host.tail-scale.ts.net." })));
+    const tunnel = new TailscaleTunnel(runner);
+
+    // Fresh instance: nothing established yet.
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: false });
+
+    await tunnel.establish(LOOPBACK);
+    // Up, reporting the reachable base — the same host `establish` resolved.
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: true, publicHost: "phone-host.tail-scale.ts.net" });
+
+    await tunnel.teardown();
+    // Turned off exactly what was served (establish args + `off`), back to down.
+    expect(calls[calls.length - 1].args).toEqual(["serve", "--bg", "http://127.0.0.1:4321", "off"]);
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: false });
+  });
+
+  it("teardown brackets an IPv6 loopback in the off-target too (`::1` → `http://[::1]:port`)", async () => {
+    const { runner, calls } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const tunnel = new TailscaleTunnel(runner);
+
+    await tunnel.establish({ host: "::1", port: 4321 });
+    await tunnel.teardown();
+
+    expect(calls[calls.length - 1].args).toEqual(["serve", "--bg", "http://[::1]:4321", "off"]);
+  });
+
+  it("teardown is a clean no-op before establish (nothing to release, runs no command)", async () => {
+    const { runner, calls } = fakeRunner(() => ({ stdout: "", stderr: "" }));
+    const tunnel = new TailscaleTunnel(runner);
+
+    await tunnel.teardown();
+
+    expect(calls).toHaveLength(0);
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: false });
+  });
+
+  it("teardown still releases a serve that came up but whose host never resolved (AC: clean release)", async () => {
+    // `serve` succeeds; `status` reports no tailnet host, so `establish` rejects
+    // AFTER the mapping is up. The mapping must remain releasable.
+    const { runner, calls } = fakeRunner(tailscaleHandler(statusJson({ TailscaleIPs: [] })));
+    const tunnel = new TailscaleTunnel(runner);
+
+    await expect(tunnel.establish(LOOPBACK)).rejects.toThrow(/no tailnet host/);
+    // Not a usable `up` (no reachable base was resolved) — reports down …
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: false });
+
+    await tunnel.teardown();
+    // … yet teardown still turns the dangling serve mapping off.
+    expect(calls.some((c) => c.args.join(" ") === "serve --bg http://127.0.0.1:4321 off")).toBe(true);
+  });
+
+  it("stays up when the teardown off-command fails, so it can be retried", async () => {
+    const boom = new Error("tailscale serve off failed");
+    const runner: CommandRunner = {
+      run(_command, args) {
+        if (args.includes("off")) return Promise.reject(boom);
+        if (args[0] === "status") return Promise.resolve(statusJson({ DNSName: "host.ts.net." }));
+        return Promise.resolve({ stdout: "", stderr: "" });
+      },
+    };
+    const tunnel = new TailscaleTunnel(runner);
+    await tunnel.establish(LOOPBACK);
+
+    await expect(tunnel.teardown()).rejects.toBe(boom);
+    // Off failed → state not cleared → still up, so a caller can retry teardown.
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: true, publicHost: "host.ts.net" });
+  });
+});
+
 describe("stub backends (AC: only Tailscale establish is in scope for this slice)", () => {
   it("CloudflareTunnel.establish rejects as not implemented", async () => {
     expect(new CloudflareTunnel().kind).toBe("cloudflare");
@@ -166,6 +237,13 @@ describe("stub backends (AC: only Tailscale establish is in scope for this slice
   it("HeadscaleTunnel.establish rejects as not implemented", async () => {
     expect(new HeadscaleTunnel().kind).toBe("headscale");
     await expect(new HeadscaleTunnel().establish(LOOPBACK)).rejects.toThrow(/not implemented yet/);
+  });
+
+  it("a never-established stub reports down and its teardown is a no-op", async () => {
+    for (const tunnel of [new CloudflareTunnel(), new HeadscaleTunnel()]) {
+      expect(await tunnel.status()).toEqual({ kind: tunnel.kind, up: false });
+      await expect(tunnel.teardown()).resolves.toBeUndefined();
+    }
   });
 });
 
