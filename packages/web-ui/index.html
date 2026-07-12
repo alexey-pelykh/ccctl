@@ -26,6 +26,24 @@
       #activity[data-status="requires_action"] {
         color: #b45309;
       }
+      #session-list {
+        list-style: none;
+        padding: 0;
+      }
+      #session-list li {
+        padding: 0.25rem 0;
+      }
+      #session-list button {
+        width: 100%;
+        text-align: left;
+        cursor: pointer;
+        padding: 0.4rem 0.6rem;
+      }
+      /* The session currently viewed + steered. */
+      #session-list li[data-selected="true"] button {
+        font-weight: 700;
+        border-color: #1d4ed8;
+      }
       #events {
         list-style: none;
         padding: 0;
@@ -59,8 +77,14 @@
     <main>
       <h1>ccctl</h1>
       <p>Steer Claude Code from anywhere. Control channel only — inference stays on Anthropic.</p>
-      <!-- Transport lifecycle of the SSE connection. -->
-      <section id="status" aria-live="polite">connecting…</section>
+      <!-- The sessions the daemon is carrying (#20). Pick one to view + steer it; each is
+           independent — the transcript, activity, and steer below apply to the SELECTED session. -->
+      <section id="sessions">
+        <h2>Sessions <button id="refresh-sessions" type="button">Refresh</button></h2>
+        <ul id="session-list" aria-live="polite"></ul>
+      </section>
+      <!-- Transport lifecycle of the SSE connection to the selected session. -->
+      <section id="status" aria-live="polite">no session selected</section>
       <!-- The session's current turn (worker_status); revealed on the first frame. -->
       <section id="activity" aria-live="polite" hidden></section>
       <h2>Transcript</h2>

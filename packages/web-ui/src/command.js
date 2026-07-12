@@ -7,10 +7,11 @@
  * The upstream half of the zero-build UI transport pair. Where `transcript.js`
  * DECODES the `control_event` frames the server relays down the SSE stream, this
  * module ENCODES the UI's steer verbs into the `{ subtype, payload? }` command
- * bodies the browser `fetch`-POSTs to `POST /api/command` (#13). The server mints
- * the `control_request` id and re-frames the command as a `@ccctl/core`
- * `ControlRequest` onto the session's worker channel (#12) — the browser chooses
- * only the verb and its payload, never the correlation id.
+ * bodies the browser `fetch`-POSTs to `POST /api/sessions/{id}/command` (#13,
+ * session-addressed #20). The server mints the `control_request` id and re-frames
+ * the command as a `@ccctl/core` `ControlRequest` onto THAT session's worker channel
+ * (#12) — the browser chooses only the verb and its payload, never the correlation id
+ * and never which OTHER session it lands on (the id is in the URL).
  *
  * Keeping the verb→frame mapping here (DOM-free) makes the steer contract
  * unit-testable without a browser, exactly as the decode/classify logic is; `app.js`
@@ -25,8 +26,30 @@
  *   redirect → { subtype: "interrupt", payload: { reason } }      — redirect the current turn
  */
 
-/** Same-origin path the browser POSTs steer commands to (mirrors the server's `COMMAND_PATH`). */
-export const COMMAND_PATH = "/api/command";
+/** Same-origin path the browser GETs the session list from (mirrors the server's `UI_SESSIONS_PATH`). */
+export const SESSIONS_PATH = "/api/sessions";
+
+/**
+ * Same-origin path the browser subscribes a session's SSE stream on (`EventSource`).
+ * Per session (#20), so a viewer sees only the addressed session's events.
+ *
+ * @param {string} sessionId
+ * @returns {string}
+ */
+export function sessionEventsPath(sessionId) {
+  return `${SESSIONS_PATH}/${sessionId}/events`;
+}
+
+/**
+ * Same-origin path the browser POSTs a steer to, per session (#20), so a steer
+ * addresses exactly one session and can never land on another.
+ *
+ * @param {string} sessionId
+ * @returns {string}
+ */
+export function sessionCommandPath(sessionId) {
+  return `${SESSIONS_PATH}/${sessionId}/command`;
+}
 
 /** Wire subtype of the "send input" steer (mirrors `@ccctl/core`). */
 export const INPUT_SUBTYPE = "prompt";

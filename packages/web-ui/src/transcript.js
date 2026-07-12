@@ -5,7 +5,7 @@
  * @ccctl/web-ui — transcript rendering logic (pure, DOM-free).
  *
  * The downstream half of the zero-build UI transport pair reads `control_event`
- * frames off the server's SSE stream (`GET /api/events`, #13). Each SSE `data:`
+ * frames off a session's SSE stream (`GET /api/sessions/{id}/events`, #13/#20). Each SSE `data:`
  * line is one `JSON.stringify(ControlEvent)` from `@ccctl/core`; this module
  * turns that raw string into a small, DOM-agnostic render instruction so the
  * classification (current-turn vs transcript vs undecodable) is unit-testable

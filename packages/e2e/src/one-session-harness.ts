@@ -29,10 +29,10 @@
  *      reports `idle` ("ready for a turn"). The account Bearer does NOT ride this
  *      channel — the two-credential boundary (#130).
  *   5. **Phone view (SSE)** — a stand-in phone subscribes over Server-Sent Events
- *      (`GET /api/events`); the worker POSTs a transcript event UPSTREAM (`POST
- *      …/worker/events`) and the server relays its payload to the phone, which VIEWS
- *      it — grounded in the phone's OWN received record.
- *   6. **Phone steer** — the phone POSTs one steer (`POST /api/command`); a `prompt`
+ *      (`GET /api/sessions/{id}/events`); the worker POSTs a transcript event UPSTREAM
+ *      (`POST …/worker/events`) and the server relays its payload to the phone, which
+ *      VIEWS it — grounded in the phone's OWN received record.
+ *   6. **Phone steer** — the phone POSTs one steer (`POST /api/sessions/{id}/command`); a `prompt`
  *      steer is INJECTED as a `{ type: "user" }` turn pushed down the worker's
  *      held-open downstream as a `client_event`, where the worker READS it — grounded
  *      in the worker's OWN received frames — and acks it (`POST …/worker/events/delivery`).
@@ -70,11 +70,15 @@ import {
 import type { ObservedConnection } from "./inference-guarantee.js";
 import type { InferenceStandIn } from "./traffic-harness.js";
 
-/** The same-origin SSE subscription path the phone reads (mirrors the server's `EVENTS_PATH`, #13). */
-const EVENTS_PATH = "/api/events";
+/** The same-origin per-session SSE subscription path the phone reads (#13, session-addressed #20). */
+function sessionEventsPath(sessionId: string): string {
+  return `/api/sessions/${sessionId}/events`;
+}
 
-/** The same-origin steer-ingress path the phone POSTs to (mirrors the server's `COMMAND_PATH`, #13). */
-const COMMAND_PATH = "/api/command";
+/** The same-origin per-session steer-ingress path the phone POSTs to (#13, session-addressed #20). */
+function sessionCommandPath(sessionId: string): string {
+  return `/api/sessions/${sessionId}/command`;
+}
 
 /** The downstream SSE event name every server→worker turn-injection frame carries (§4/§5). */
 const CLIENT_EVENT_NAME = "client_event";
@@ -225,7 +229,7 @@ export interface UiSteerAck {
 export interface UiClient {
   /** The event lines this phone has viewed over SSE, in arrival order. */
   viewed(): readonly ViewedSseEvent[];
-  /** POST one steer to `/api/command`; resolves with the server's ack. */
+  /** POST one steer to the session's command path (`/api/sessions/{id}/command`); resolves with the server's ack. */
   steer(command: UiSteerCommand): Promise<UiSteerAck>;
   /** Close the SSE stream. */
   close(): Promise<void>;
@@ -235,23 +239,27 @@ export interface UiClient {
 export interface UiClientOptions {
   /** The local server whose SSE relay + steer ingress the phone talks to. */
   readonly server: CcctlServer;
+  /** The session the phone views + steers (the UI transport is per session, #20). */
+  readonly sessionId: string;
 }
 
 /**
- * Subscribe the stand-in phone to the SSE stream and resolve a {@link UiClient}.
- * Resolves once the response headers arrive — at which point the server has
- * synchronously registered the subscriber — so a subsequent worker emit is delivered
- * live rather than missed (a fresh SSE connection is not replayed the backlog).
+ * Subscribe the stand-in phone to the SESSION's SSE stream and resolve a
+ * {@link UiClient}. Resolves once the response headers arrive — at which point the
+ * server has synchronously registered the subscriber — so a subsequent worker emit is
+ * delivered live rather than missed (a fresh SSE connection is not replayed the
+ * backlog). The phone views + steers exactly the one session it is bound to (#20).
  */
 export async function connectUiClient(options: UiClientOptions): Promise<UiClient> {
-  const { server } = options;
+  const { server, sessionId } = options;
   const events: ViewedSseEvent[] = [];
-  const stream = await openSseStream(server.address, EVENTS_PATH, (event) => {
+  const stream = await openSseStream(server.address, sessionEventsPath(sessionId), (event) => {
     events.push({ id: event.id, data: event.data });
   });
   return {
     viewed: (): readonly ViewedSseEvent[] => events,
-    steer: (command: UiSteerCommand): Promise<UiSteerAck> => postSteer(server.address, command),
+    steer: (command: UiSteerCommand): Promise<UiSteerAck> =>
+      postSteer(server.address, sessionCommandPath(sessionId), command),
     close: (): Promise<void> => stream.close(),
   };
 }
@@ -361,14 +369,16 @@ export async function driveOneSessionFlow(options: OneSessionFlowOptions): Promi
 
     // 5. Phone subscribes over SSE — BEFORE the worker emits, so the relayed event is
     //    delivered live (a fresh SSE connection is not replayed the backlog).
-    const activeUi = await connectUiClient({ server });
+    const activeUi = await connectUiClient({ server, sessionId });
     ui = activeUi;
 
     // 6. Phone steer — POST a `prompt`; the server injects it as a `{ type: "user" }`
     //    turn down the worker's downstream, where the worker READS it (its own record).
     const ack = await activeUi.steer(steer);
     if (ack.status !== 202) {
-      throw new Error(`ccctl e2e: the phone's steer expected 202 from ${COMMAND_PATH}, got ${ack.status}`);
+      throw new Error(
+        `ccctl e2e: the phone's steer expected 202 from ${sessionCommandPath(sessionId)}, got ${ack.status}`,
+      );
     }
     await waitFor(() => activeWorker.received().length >= 1);
     const injected = activeWorker.received()[0];
@@ -603,9 +613,9 @@ async function postJsonExpect(
   }
 }
 
-/** POST one steer to `/api/command` and read the server's `{ id }` ack (best-effort on a refusal). */
-async function postSteer(address: HostEndpoint, command: UiSteerCommand): Promise<UiSteerAck> {
-  const res = await fetch(serverUrl(address, COMMAND_PATH), {
+/** POST one steer to a session's `…/command` and read the server's `{ id }` ack (best-effort on a refusal). */
+async function postSteer(address: HostEndpoint, path: string, command: UiSteerCommand): Promise<UiSteerAck> {
+  const res = await fetch(serverUrl(address, path), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(command),

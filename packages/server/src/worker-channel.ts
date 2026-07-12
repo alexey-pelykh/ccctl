@@ -56,7 +56,7 @@ import {
   type JsonValue,
   type Session,
 } from "@ccctl/core";
-import { broadcastEvent, type EventStreamState } from "./event-stream.js";
+import { broadcastEvent, type SessionEventRelays } from "./event-stream.js";
 import { readJsonBody, writeError, writeJson } from "./http-response.js";
 
 /** Hard ceiling on a worker-channel request body (1 MiB) — a control-plane batch fits within it. */
@@ -83,11 +83,13 @@ export interface WorkerChannelState {
   /** The live per-session worker channel, keyed by session id (epoch + downstream + seq). */
   readonly workerChannels: Map<string, WorkerChannelRecord>;
   /**
-   * The UI Server-Sent Events relay state. Every payload read off the worker's
-   * upstream `worker/events` leg (§5) is fanned out to subscribed UI clients through
-   * it (#13), so the upstream read path is also the source of the browser's stream.
+   * The per-session UI Server-Sent Events relays. Every payload read off a session's
+   * upstream `worker/events` leg (§5) is fanned out to the UI clients subscribed to THAT
+   * SESSION's stream (#13/#20), so the upstream read path is also the source of the
+   * browser's per-session stream — and a session's output never reaches another
+   * session's subscribers.
    */
-  readonly events: EventStreamState;
+  readonly eventRelays: SessionEventRelays;
 }
 
 /** A matched §4/§5 worker-channel leg plus the session it addresses. */
@@ -247,11 +249,12 @@ export function handleWorkerEvents(
       return;
     }
     for (const entry of events) {
-      // Relay each event's payload verbatim to the UI stream. A malformed entry (no
-      // `payload`) is skipped rather than tearing down the batch — fail-soft per event,
-      // fail-closed only on the batch envelope above.
+      // Relay each event's payload verbatim to THIS SESSION's UI stream (#20: never to
+      // another session's subscribers). A malformed entry (no `payload`) is skipped rather
+      // than tearing down the batch — fail-soft per event, fail-closed only on the batch
+      // envelope above.
       if (typeof entry === "object" && entry !== null && !Array.isArray(entry) && "payload" in entry) {
-        broadcastEvent(state.events, (entry as { payload: JsonValue }).payload);
+        broadcastEvent(state.eventRelays, sessionId, (entry as { payload: JsonValue }).payload);
       }
     }
     writeJson(res, 200, {});
