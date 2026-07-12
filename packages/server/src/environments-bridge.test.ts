@@ -5,15 +5,15 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   ENVIRONMENTS_BRIDGE_PATH,
   environmentWorkPollPath,
+  parseWorkSecret,
   SESSIONS_PATH,
-  workAckPath,
-  workStopPath,
-  type WorkItem,
+  workItemFromValue,
+  type WorkSecret,
 } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
 
-// The account OAuth Bearer, presented on §1/§2 (and §4). It must NEVER authorize the
-// §3 work-poll leg and must never be persisted or echoed — the two-token boundary.
+// The account OAuth Bearer, presented on §1/§2 ONLY. The §3 work-poll leg carries NO
+// credential (issue #130), and the account Bearer must never be persisted or echoed.
 const ACCOUNT_BEARER = "oauth-account-secret-bridge";
 
 // A short long-poll window so the empty-queue timeout test resolves quickly while the
@@ -40,11 +40,12 @@ function base(server: CcctlServer): string {
 }
 
 const REGISTER_BODY = {
-  machine_id: "machine-1",
+  machine_name: "dev-laptop",
   directory: "/home/dev/proj",
   branch: "main",
-  repository: "owner/repo",
+  git_repo_url: "https://github.com/owner/repo.git",
   max_sessions: 4,
+  metadata: { worker_type: "claude_code" },
 };
 
 const SESSION_BODY = {
@@ -76,44 +77,55 @@ function createSession(server: CcctlServer, options: AuthBody = {}): Promise<Res
   return post(`${base(server)}${SESSIONS_PATH}`, { authorization, body });
 }
 
-/** Register an environment and return its id + scoped work-poll token (the happy path). */
-async function registeredEnvironment(server: CcctlServer): Promise<{ environmentId: string; token: string }> {
+/** Register an environment and return its id (the happy path — no work-poll token, #130). */
+async function registeredEnvironment(server: CcctlServer): Promise<string> {
   const res = await registerEnvironment(server);
   expect(res.status).toBe(201);
-  const wire = (await res.json()) as { environment_id: string; work_poll_token: string };
-  return { environmentId: wire.environment_id, token: wire.work_poll_token };
+  return ((await res.json()) as { environment_id: string }).environment_id;
 }
 
-function poll(server: CcctlServer, environmentId: string, token: string | null): Promise<Response> {
+/** Create a session and return its id (the §2 response is `{ session_id }`, no ws_url). */
+async function createdSession(server: CcctlServer): Promise<string> {
+  const res = await createSession(server);
+  expect(res.status).toBe(201);
+  return ((await res.json()) as { session_id: string }).session_id;
+}
+
+/** GET the §3 work-poll — carrying an OPTIONAL authorization header (ignored by the leg). */
+function poll(server: CcctlServer, environmentId: string, authorization: string | null = null): Promise<Response> {
   const headers: Record<string, string> = {};
-  if (token !== null) {
-    headers.Authorization = `Bearer ${token}`;
+  if (authorization !== null) {
+    headers.Authorization = authorization;
   }
   return fetch(`${base(server)}${environmentWorkPollPath(environmentId)}`, { method: "GET", headers });
 }
 
-async function pollWork(server: CcctlServer, environmentId: string, token: string): Promise<WorkItem[]> {
-  const res = await poll(server, environmentId, token);
-  expect(res.status).toBe(200);
-  return ((await res.json()) as { work: WorkItem[] }).work;
+/** Decode a work item's `secret` (base64url(JSON(WorkSecret))) into a validated WorkSecret, or null. */
+function decodeSecret(secret: string): WorkSecret | null {
+  try {
+    return parseWorkSecret(JSON.parse(Buffer.from(secret, "base64url").toString("utf8")));
+  } catch {
+    return null;
+  }
 }
 
 const tick = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("§1 environment register — POST /v1/environments/bridge", () => {
-  it("mints an environment id + a scoped work-poll token and records the environment (AC#1)", async () => {
+  it("mints an environment id and records the environment — no work-poll token (#130)", async () => {
     const server = await startTestServer();
     const res = await registerEnvironment(server);
     expect(res.status).toBe(201);
-    const wire = (await res.json()) as { environment_id: string; work_poll_token: string };
-    expect(wire.environment_id.length).toBeGreaterThan(0);
-    expect(wire.work_poll_token.length).toBeGreaterThan(0);
-    expect(server.environments.has(wire.environment_id)).toBe(true);
-    // The scoped token is NOT the account Bearer (distinct credential classes).
-    expect(wire.work_poll_token).not.toBe(ACCOUNT_BEARER);
+    const wire = (await res.json()) as Record<string, unknown>;
+    expect(Object.keys(wire)).toEqual(["environment_id"]);
+    expect(typeof wire.environment_id).toBe("string");
+    expect((wire.environment_id as string).length).toBeGreaterThan(0);
+    expect(server.environments.has(wire.environment_id as string)).toBe(true);
+    // There is no scoped work-poll token on the response any more.
+    expect(wire).not.toHaveProperty("work_poll_token");
   });
 
-  it("receives the account Bearer but never persists or echoes it (AC#3)", async () => {
+  it("receives the account Bearer but never persists or echoes it", async () => {
     const server = await startTestServer();
     const res = await registerEnvironment(server);
     expect(JSON.stringify(await res.json())).not.toContain(ACCOUNT_BEARER);
@@ -121,10 +133,11 @@ describe("§1 environment register — POST /v1/environments/bridge", () => {
     expect(snapshot).not.toContain(ACCOUNT_BEARER);
   });
 
-  it("fails closed without the account Bearer, on a malformed body, and on the wrong method (AC#3, AC#4)", async () => {
+  it("fails closed without the account Bearer, on a malformed body, and on the wrong method", async () => {
     const server = await startTestServer();
     expect((await registerEnvironment(server, { authorization: null })).status).toBe(401);
     expect((await registerEnvironment(server, { authorization: "Basic x" })).status).toBe(401);
+    // A body still using the superseded machine_id / required-repository shape fails closed.
     expect((await registerEnvironment(server, { body: { machine_id: "m" } })).status).toBe(400);
     expect((await registerEnvironment(server, { body: { ...REGISTER_BODY, max_sessions: 0 } })).status).toBe(400);
     const wrongMethod = await fetch(`${base(server)}${ENVIRONMENTS_BRIDGE_PATH}`, {
@@ -137,15 +150,15 @@ describe("§1 environment register — POST /v1/environments/bridge", () => {
 });
 
 describe("§2 session create — POST /v1/sessions", () => {
-  it("creates a connecting session and returns { session_id, ws_url } pointing at this server (AC#1)", async () => {
+  it("creates a connecting session and returns { session_id } with NO ws_url (#130)", async () => {
     const server = await startTestServer();
     const res = await createSession(server);
     expect(res.status).toBe(201);
-    const wire = (await res.json()) as { session_id: string; ws_url: string };
-    expect(wire.session_id.length).toBeGreaterThan(0);
-    const { host, port } = server.address;
-    expect(wire.ws_url).toBe(`ws://${host}:${port}${SESSIONS_PATH}/${wire.session_id}/ws`);
-    const session = server.sessions.get(wire.session_id);
+    const wire = (await res.json()) as Record<string, unknown>;
+    expect(Object.keys(wire)).toEqual(["session_id"]);
+    expect((wire.session_id as string).length).toBeGreaterThan(0);
+    expect(wire).not.toHaveProperty("ws_url");
+    const session = server.sessions.get(wire.session_id as string);
     expect(session?.status).toBe("connecting");
     expect(session?.activity).toEqual({ kind: "idle" });
   });
@@ -154,19 +167,24 @@ describe("§2 session create — POST /v1/sessions", () => {
     const server = await startTestServer();
     const raw = await (await createSession(server)).text();
     const parsed = JSON.parse(raw) as Record<string, unknown>;
-    expect(Object.keys(parsed)).toEqual(["session_id", "ws_url"]);
+    expect(Object.keys(parsed)).toEqual(["session_id"]);
     expect(parsed).not.toHaveProperty("sessionId");
-    expect(parsed).not.toHaveProperty("wsUrl");
   });
 
-  it("receives the account Bearer but never persists or echoes it (AC#3)", async () => {
+  it("receives the account Bearer but never persists or echoes it (and the minted secret is not it)", async () => {
     const server = await startTestServer();
+    const environmentId = await registeredEnvironment(server);
     const res = await createSession(server);
     expect(JSON.stringify(await res.json())).not.toContain(ACCOUNT_BEARER);
     expect(JSON.stringify([...server.sessions.values()])).not.toContain(ACCOUNT_BEARER);
+    // The auto-enqueued work item's minted secret must not be the account Bearer either.
+    const item = workItemFromValue(await (await poll(server, environmentId)).json());
+    expect(item).not.toBeNull();
+    expect(item?.secret).not.toContain(ACCOUNT_BEARER);
+    expect(decodeSecret(item?.secret ?? "")?.session_ingress_token).not.toBe(ACCOUNT_BEARER);
   });
 
-  it("fails closed without the Bearer, on an unknown permission_mode (drift), and on a malformed body (AC#3, AC#4)", async () => {
+  it("fails closed without the Bearer, on an unknown permission_mode (drift), and on a malformed body", async () => {
     const server = await startTestServer();
     expect((await createSession(server, { authorization: null })).status).toBe(401);
     expect((await createSession(server, { body: { ...SESSION_BODY, permission_mode: "yolo" } })).status).toBe(400);
@@ -175,68 +193,70 @@ describe("§2 session create — POST /v1/sessions", () => {
   });
 });
 
-describe("§3 work poll — GET /v1/environments/{env}/work/poll (scoped-token auth)", () => {
-  it("delivers queued work immediately and moves it to in-flight; ack clears it (AC#2)", async () => {
+describe("§3 work poll — GET /v1/environments/{env}/work/poll (uncredentialed, single item)", () => {
+  it("delivers the session-create-enqueued work item as a SINGLE object with a decodable secret (#130)", async () => {
     const server = await startTestServer();
-    const { environmentId, token } = await registeredEnvironment(server);
+    const environmentId = await registeredEnvironment(server);
+    const sessionId = await createdSession(server); // §2→§3 auto-enqueue
 
-    const userTurn: WorkItem = { kind: "user_turn", id: "w-1", payload: { text: "run the prompt" } };
-    expect(server.enqueueWork(environmentId, userTurn)).toBe(true);
+    const res = await poll(server, environmentId);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as unknown;
+    // A single item object, NOT a { work: [...] } envelope.
+    expect(body).not.toHaveProperty("work");
+    const item = workItemFromValue(body);
+    expect(item).not.toBeNull();
+    expect(item?.data).toEqual({ type: "session", id: sessionId });
+    expect((item?.id ?? "").length).toBeGreaterThan(0);
 
-    const work = await pollWork(server, environmentId, token);
-    expect(work).toEqual([userTurn]);
-    // Delivered → in-flight, awaiting ack/stop.
-    expect(server.environments.get(environmentId)?.inFlight.has("w-1")).toBe(true);
-
-    const acked = await post(`${base(server)}${workAckPath(environmentId, "w-1")}`, {
-      authorization: `Bearer ${token}`,
-    });
-    expect(acked.status).toBe(204);
-    expect(server.environments.get(environmentId)?.inFlight.has("w-1")).toBe(false);
+    // secret = base64url(JSON(WorkSecret)) with BOTH inner fields load-bearing.
+    const secret = decodeSecret(item?.secret ?? "");
+    expect(secret).not.toBeNull();
+    expect(secret?.version).toBe(1);
+    expect((secret?.session_ingress_token ?? "").length).toBeGreaterThan(0);
+    expect(secret?.api_base_url).toBe(base(server));
   });
 
-  it("delivers each of the create_session / user_turn / steer kinds", async () => {
+  it("carries NO credential — an uncredentialed poll is served (the two-credential boundary, #130)", async () => {
     const server = await startTestServer();
-    const { environmentId, token } = await registeredEnvironment(server);
-    const items: WorkItem[] = [
-      { kind: "create_session", id: "c-1", payload: { source: "ui" } },
-      { kind: "user_turn", id: "u-1", payload: { text: "hi" } },
-      { kind: "steer", id: "s-1" },
-    ];
-    for (const item of items) {
-      server.enqueueWork(environmentId, item);
-    }
-    expect(await pollWork(server, environmentId, token)).toEqual(items);
+    const environmentId = await registeredEnvironment(server);
+    await createdSession(server);
+    // No Authorization header at all → 200 (the real worker presents none).
+    expect((await poll(server, environmentId)).status).toBe(200);
+    // Presenting the account Bearer on §3 is neither required nor rejected — it is ignored.
+    await createdSession(server);
+    expect((await poll(server, environmentId, `Bearer ${ACCOUNT_BEARER}`)).status).toBe(200);
   });
 
-  it("long-polls: a poll on an empty queue wakes up when work is enqueued (AC#2)", async () => {
+  it("long-polls: a poll on an empty queue wakes up when a session-create enqueues work", async () => {
     const server = await startTestServer();
-    const { environmentId, token } = await registeredEnvironment(server);
+    const environmentId = await registeredEnvironment(server);
 
-    const inflight = poll(server, environmentId, token);
+    const inflight = poll(server, environmentId);
     await tick(20); // let the poll register its waiter before we enqueue.
-    const steer: WorkItem = { kind: "steer", id: "s-9", payload: { text: "stop" } };
-    server.enqueueWork(environmentId, steer);
+    const sessionId = await createdSession(server);
 
     const res = await inflight;
     expect(res.status).toBe(200);
-    expect(((await res.json()) as { work: WorkItem[] }).work).toEqual([steer]);
+    const item = workItemFromValue(await res.json());
+    expect(item?.data).toEqual({ type: "session", id: sessionId });
   });
 
-  it("long-polls: an empty queue answers an empty batch after the timeout window", async () => {
+  it("long-polls: an empty queue answers a 200 with an empty body after the timeout window", async () => {
     const server = await startTestServer();
-    const { environmentId, token } = await registeredEnvironment(server);
+    const environmentId = await registeredEnvironment(server);
     const start = Date.now();
-    const work = await pollWork(server, environmentId, token);
-    expect(work).toEqual([]);
+    const res = await poll(server, environmentId);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(""); // empty body = "no work" (no envelope).
     expect(Date.now() - start).toBeGreaterThanOrEqual(POLL_TIMEOUT_MS - 50);
   });
 
   it("settles a held long-poll on shutdown so close() does not hang (operability)", async () => {
     const server = await startTestServer();
-    const { environmentId, token } = await registeredEnvironment(server);
+    const environmentId = await registeredEnvironment(server);
     // Hold a poll open on an empty queue — it would otherwise stay held for the full window.
-    const held = poll(server, environmentId, token);
+    const held = poll(server, environmentId);
     await tick(20); // let the poll register its waiter.
 
     // close() must resolve promptly (well under the poll window), not wait out the timeout.
@@ -246,66 +266,25 @@ describe("§3 work poll — GET /v1/environments/{env}/work/poll (scoped-token a
     // Already closed — drop it from the afterEach teardown to avoid a double close.
     started.splice(started.indexOf(server), 1);
 
-    // The held poll completed with an empty batch rather than erroring or hanging.
+    // The held poll completed with an empty body rather than erroring or hanging.
     const res = await held;
     expect(res.status).toBe(200);
-    expect(((await res.json()) as { work: WorkItem[] }).work).toEqual([]);
-  });
-
-  it("is authorized ONLY by the scoped token — the account Bearer does not open it (AC#3, two-token boundary)", async () => {
-    const server = await startTestServer();
-    const { environmentId, token } = await registeredEnvironment(server);
-    server.enqueueWork(environmentId, { kind: "steer", id: "s-1" });
-
-    // The account Bearer is the WRONG credential for §3.
-    expect((await poll(server, environmentId, ACCOUNT_BEARER)).status).toBe(401);
-    // No credential at all.
-    expect((await poll(server, environmentId, null)).status).toBe(401);
-    // A wrong scoped token.
-    expect((await poll(server, environmentId, "not-the-token")).status).toBe(401);
-    // The correct scoped token works.
-    expect((await poll(server, environmentId, token)).status).toBe(200);
+    expect(await res.text()).toBe("");
   });
 
   it("fails closed on an unknown environment (404) and a version-drifted path (404)", async () => {
     const server = await startTestServer();
-    const { token } = await registeredEnvironment(server);
-    expect((await poll(server, "no-such-env", token)).status).toBe(404);
+    await registeredEnvironment(server);
+    expect((await poll(server, "no-such-env")).status).toBe(404);
     // A drifted API version is not a work path → no route → 404 (fail closed on drift).
-    const drifted = await fetch(`${base(server)}/v2/environments/env-1/work/poll`, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const drifted = await fetch(`${base(server)}/v2/environments/env-1/work/poll`, { method: "GET" });
     expect(drifted.status).toBe(404);
   });
 
-  it("stop clears in-flight work; ack/stop of unknown work is 404 and a wrong token is 401", async () => {
+  it("rejects the wrong method on the work-poll path (405)", async () => {
     const server = await startTestServer();
-    const { environmentId, token } = await registeredEnvironment(server);
-    server.enqueueWork(environmentId, { kind: "user_turn", id: "w-1" });
-    await pollWork(server, environmentId, token); // → in-flight
-
-    // Wrong token cannot stop it.
-    expect(
-      (
-        await post(`${base(server)}${workStopPath(environmentId, "w-1")}`, {
-          authorization: `Bearer ${ACCOUNT_BEARER}`,
-        })
-      ).status,
-    ).toBe(401);
-    // The scoped token stops it.
-    expect(
-      (await post(`${base(server)}${workStopPath(environmentId, "w-1")}`, { authorization: `Bearer ${token}` })).status,
-    ).toBe(204);
-    expect(server.environments.get(environmentId)?.inFlight.has("w-1")).toBe(false);
-    // A second stop (nothing in flight) is 404.
-    expect(
-      (await post(`${base(server)}${workStopPath(environmentId, "w-1")}`, { authorization: `Bearer ${token}` })).status,
-    ).toBe(404);
-  });
-
-  it("enqueueWork returns false for an unknown environment", async () => {
-    const server = await startTestServer();
-    expect(server.enqueueWork("no-such-env", { kind: "steer", id: "s-1" })).toBe(false);
+    const environmentId = await registeredEnvironment(server);
+    const res = await fetch(`${base(server)}${environmentWorkPollPath(environmentId)}`, { method: "POST" });
+    expect(res.status).toBe(405);
   });
 });

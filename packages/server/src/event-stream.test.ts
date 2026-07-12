@@ -2,18 +2,15 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { afterEach, describe, expect, it } from "vitest";
-import { randomBytes } from "node:crypto";
 import { request as httpRequest, type IncomingMessage } from "node:http";
-import type { Socket } from "node:net";
-import { encodeControlFrame, SESSIONS_PATH, type ControlEvent } from "@ccctl/core";
+import { SESSIONS_PATH, workerEventsPath, workerRegisterPath, type ControlEvent } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
 
 const ACCOUNT_BEARER = "oauth-account-secret-sse-abc123";
 
-// Every started server, client socket, and SSE stream is tracked and torn down in
-// afterEach so no listener or connection leaks across tests.
+// Every started server and SSE stream is tracked and torn down in afterEach so no
+// listener or connection leaks across tests.
 const started: CcctlServer[] = [];
-const sockets: Socket[] = [];
 const streams: IncomingMessage[] = [];
 
 async function startTestServer(): Promise<CcctlServer> {
@@ -26,18 +23,25 @@ afterEach(async () => {
   while (streams.length > 0) {
     streams.pop()?.destroy();
   }
-  while (sockets.length > 0) {
-    sockets.pop()?.destroy();
-  }
   while (started.length > 0) {
     await started.pop()?.close();
   }
 });
 
-/** Create a session over the current §2 flow (`POST /v1/sessions`) and return its id. */
-async function registerSession(server: CcctlServer): Promise<string> {
+function base(server: CcctlServer): string {
   const { host, port } = server.address;
-  const res = await fetch(`http://${host}:${port}${SESSIONS_PATH}`, {
+  return `http://${host}:${port}`;
+}
+
+/** A session with a registered worker channel: the id + the worker's current epoch. */
+interface ReadySession {
+  readonly sessionId: string;
+  readonly epoch: number;
+}
+
+/** Create a §2 session and register its §4 worker so its §5 upstream `worker/events` is drivable. */
+async function readySession(server: CcctlServer): Promise<ReadySession> {
+  const created = await fetch(`${base(server)}${SESSIONS_PATH}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${ACCOUNT_BEARER}` },
     body: JSON.stringify({
@@ -46,8 +50,28 @@ async function registerSession(server: CcctlServer): Promise<string> {
       permission_mode: "default",
     }),
   });
-  const payload = (await res.json()) as { session_id: string };
-  return payload.session_id;
+  const sessionId = ((await created.json()) as { session_id: string }).session_id;
+  const registered = await fetch(`${base(server)}${workerRegisterPath(sessionId)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  const epoch = ((await registered.json()) as { worker_epoch: number }).worker_epoch;
+  return { sessionId, epoch };
+}
+
+/** Drive the §5 upstream leg: POST a batch of raw worker-event `entries` (each `{ payload }` or malformed). */
+function emit(server: CcctlServer, ready: ReadySession, entries: unknown[]): Promise<Response> {
+  return fetch(`${base(server)}${workerEventsPath(ready.sessionId)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ worker_epoch: ready.epoch, events: entries }),
+  });
+}
+
+/** Wrap payloads as well-formed `{ payload }` upstream entries. */
+function payloads(...values: unknown[]): { payload: unknown }[] {
+  return values.map((payload) => ({ payload }));
 }
 
 interface SseEvent {
@@ -121,57 +145,6 @@ function openSse(server: CcctlServer, options: { lastEventId?: string } = {}): P
   });
 }
 
-/** Encode `text` as a single masked (client → server, RFC 6455 §5.1) text frame. */
-function maskedTextFrame(text: string): Buffer {
-  const payload = Buffer.from(text, "utf8");
-  const mask = randomBytes(4);
-  const b0 = 0x81; // FIN + text opcode.
-  const header =
-    payload.length < 126
-      ? Buffer.from([b0, 0x80 | payload.length])
-      : (() => {
-          const h = Buffer.alloc(4);
-          h.writeUInt8(b0, 0);
-          h.writeUInt8(0x80 | 126, 1);
-          h.writeUInt16BE(payload.length, 2);
-          return h;
-        })();
-  const masked = Buffer.alloc(payload.length);
-  for (let i = 0; i < payload.length; i++) {
-    masked[i] = payload[i] ^ mask[i % 4];
-  }
-  return Buffer.concat([header, mask, masked]);
-}
-
-/** Send a control frame over the worker channel as a masked NDJSON text frame. */
-function sendFrame(socket: Socket, frame: Parameters<typeof encodeControlFrame>[0]): void {
-  socket.write(maskedTextFrame(encodeControlFrame(frame)));
-}
-
-/** Open the worker channel over a raw upgrade and return the connected socket. */
-function openWorkerChannel(server: CcctlServer, sessionId: string): Promise<Socket> {
-  const { host, port } = server.address;
-  const headers: Record<string, string> = {
-    Connection: "Upgrade",
-    Upgrade: "websocket",
-    "Sec-WebSocket-Key": randomBytes(16).toString("base64"),
-    "Sec-WebSocket-Version": "13",
-    Authorization: `Bearer ${ACCOUNT_BEARER}`,
-  };
-  return new Promise<Socket>((resolve, reject) => {
-    const req = httpRequest({ host, port, path: `${SESSIONS_PATH}/${sessionId}/ws`, method: "GET", headers });
-    req.on("upgrade", (_res, socket) => {
-      sockets.push(socket);
-      resolve(socket);
-    });
-    req.on("response", (res) => {
-      reject(new Error(`expected an upgrade, got HTTP ${res.statusCode ?? 0}`));
-    });
-    req.on("error", reject);
-    req.end();
-  });
-}
-
 async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
   const start = Date.now();
   while (!predicate()) {
@@ -196,101 +169,73 @@ describe("UI event stream — SSE relay (GET /api/events, #13)", () => {
     expect(sse.contentType).toBe("text/event-stream");
   });
 
-  it("relays broadcast events to a subscriber with a monotonic Last-Event-ID (AC#2)", async () => {
+  it("relays worker upstream payloads to a subscriber with a monotonic Last-Event-ID", async () => {
     const server = await startTestServer();
-    const sessionId = await registerSession(server);
+    const ready = await readySession(server);
     const sse = await openSse(server);
 
     const first = transcriptEvent("one");
     const second = transcriptEvent("two");
-    server.broadcast(sessionId, first);
-    server.broadcast(sessionId, second);
+    await emit(server, ready, payloads(first, second));
 
     await waitFor(() => sse.received().length === 2);
     const events = sse.received();
     expect(events[0].id).toBe("1");
     expect(events[1].id).toBe("2");
+    // The payload is relayed VERBATIM, so it round-trips through the SSE `data:` line.
     expect(JSON.parse(events[0].data)).toEqual(first);
     expect(JSON.parse(events[1].data)).toEqual(second);
   });
 
   it("fans one event out to every connected subscriber", async () => {
     const server = await startTestServer();
-    const sessionId = await registerSession(server);
+    const ready = await readySession(server);
     const a = await openSse(server);
     const b = await openSse(server);
 
-    server.broadcast(sessionId, transcriptEvent("hello"));
+    await emit(server, ready, payloads(transcriptEvent("hello")));
 
     await waitFor(() => a.received().length === 1 && b.received().length === 1);
     expect(JSON.parse(a.received()[0].data)).toEqual(transcriptEvent("hello"));
     expect(JSON.parse(b.received()[0].data)).toEqual(transcriptEvent("hello"));
   });
 
-  it("relays a worker control_event end-to-end (worker channel → SSE, AC#1)", async () => {
+  it("relays a worker upstream event end-to-end (worker/events → SSE)", async () => {
     const server = await startTestServer();
-    const sessionId = await registerSession(server);
-    const socket = await openWorkerChannel(server, sessionId);
-    await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
+    const ready = await readySession(server);
     const sse = await openSse(server);
 
     const event = transcriptEvent("hi from the worker");
-    sendFrame(socket, event);
+    await emit(server, ready, payloads(event));
 
     await waitFor(() => sse.received().length === 1);
     expect(JSON.parse(sse.received()[0].data)).toEqual(event);
     expect(sse.received()[0].id).toBe("1");
   });
 
-  it("relays worker_status while still driving session activity (coexists with the #11 read path)", async () => {
+  it("skips a malformed batch entry (no payload) rather than relaying it", async () => {
     const server = await startTestServer();
-    const sessionId = await registerSession(server);
-    const socket = await openWorkerChannel(server, sessionId);
-    await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
+    const ready = await readySession(server);
     const sse = await openSse(server);
 
-    const statusEvent: ControlEvent = {
-      type: "control_event",
-      subtype: "worker_status",
-      payload: { status: "running" },
-    };
-    sendFrame(socket, statusEvent);
-
-    // The frame both surfaces on the UI stream AND advances the derived activity.
-    await waitFor(() => sse.received().length === 1);
-    expect(JSON.parse(sse.received()[0].data)).toEqual(statusEvent);
-    expect(server.sessions.get(sessionId)?.activity.kind).toBe("running");
-  });
-
-  it("does not emit an SSE event for a malformed worker line", async () => {
-    const server = await startTestServer();
-    const sessionId = await registerSession(server);
-    const socket = await openWorkerChannel(server, sessionId);
-    await waitFor(() => server.sessions.get(sessionId)?.status === "ready");
-    const sse = await openSse(server);
-
-    // A garbage line between two valid events must be skipped, not relayed: two
-    // events reach the stream for three lines written.
+    // A garbage entry between two valid payloads must be skipped, not relayed: two
+    // events reach the stream for three entries posted.
     const before = transcriptEvent("before");
     const after = transcriptEvent("after");
-    sendFrame(socket, before);
-    socket.write(maskedTextFrame("this is not json\n"));
-    sendFrame(socket, after);
+    await emit(server, ready, [{ payload: before }, { notPayload: "x" }, { payload: after }]);
 
     await waitFor(() => sse.received().length === 2);
     expect(JSON.parse(sse.received()[0].data)).toEqual(before);
     expect(JSON.parse(sse.received()[1].data)).toEqual(after);
   });
 
-  it("replays only the events after Last-Event-ID on reconnect (AC#2)", async () => {
+  it("replays only the events after Last-Event-ID on reconnect", async () => {
     const server = await startTestServer();
-    const sessionId = await registerSession(server);
+    const ready = await readySession(server);
 
-    // Three events are relayed (and retained) before the reconnecting client asks
-    // to resume from id 1 — it must receive exactly ids 2 and 3.
-    server.broadcast(sessionId, transcriptEvent("e1"));
-    server.broadcast(sessionId, transcriptEvent("e2"));
-    server.broadcast(sessionId, transcriptEvent("e3"));
+    // Three events are relayed (and retained) before the reconnecting client asks to
+    // resume from id 1 — it must receive exactly ids 2 and 3.
+    await emit(server, ready, payloads(transcriptEvent("e1"), transcriptEvent("e2"), transcriptEvent("e3")));
 
     const sse = await openSse(server, { lastEventId: "1" });
     await waitFor(() => sse.received().length === 2);
@@ -301,10 +246,9 @@ describe("UI event stream — SSE relay (GET /api/events, #13)", () => {
 
   it("does not replay the backlog to a fresh connection (no Last-Event-ID)", async () => {
     const server = await startTestServer();
-    const sessionId = await registerSession(server);
+    const ready = await readySession(server);
 
-    server.broadcast(sessionId, transcriptEvent("old-1"));
-    server.broadcast(sessionId, transcriptEvent("old-2"));
+    await emit(server, ready, payloads(transcriptEvent("old-1"), transcriptEvent("old-2")));
 
     const sse = await openSse(server);
     // A fresh connection starts live: give any (erroneous) replay a chance to land,
@@ -313,7 +257,7 @@ describe("UI event stream — SSE relay (GET /api/events, #13)", () => {
     expect(sse.received()).toHaveLength(0);
 
     // A subsequent live event is delivered, and carries the next id after the backlog.
-    server.broadcast(sessionId, transcriptEvent("live"));
+    await emit(server, ready, payloads(transcriptEvent("live")));
     await waitFor(() => sse.received().length === 1);
     expect(sse.received()[0].id).toBe("3");
     expect(JSON.parse(sse.received()[0].data)).toEqual(transcriptEvent("live"));
@@ -336,8 +280,7 @@ describe("UI event stream — SSE relay (GET /api/events, #13)", () => {
 
   it("rejects a non-GET method on /api/events (405)", async () => {
     const server = await startTestServer();
-    const { host, port } = server.address;
-    const res = await fetch(`http://${host}:${port}/api/events`, { method: "POST" });
+    const res = await fetch(`${base(server)}/api/events`, { method: "POST" });
     expect(res.status).toBe(405);
     expect(res.headers.get("allow")).toBe("GET");
   });

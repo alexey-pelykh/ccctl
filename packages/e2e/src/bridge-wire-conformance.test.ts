@@ -5,50 +5,61 @@ import { describe, expect, it } from "vitest";
 import {
   assertEnvironmentRegisterResponseWire,
   assertSessionCreateResponseWire,
-  assertWorkPollResponseWire,
+  assertWorkItemWire,
+  decodeWorkSecret,
 } from "./bridge-wire-conformance.js";
 
-// Unit coverage of the wire-conformance oracle's PURE per-leg shape assertions (#124).
-// Each pins the current environments-bridge flow's snake_case response face INDEPENDENTLY
-// of the server's serializer, so these specs pin BOTH directions — the assertion ACCEPTS
-// the pinned shape and, crucially, REJECTS a camelCase / reordered / drifted shape — so a
-// conformance run cannot silently agree with a wrong contract (the Self-Confirming Mock
-// gap). Exercised live against the real server in `wire-conformance.e2e.test.ts`; driven
-// directly here so the shape gate is verified on every `test` run without a live server.
+// Unit coverage of the wire-conformance oracle's PURE per-leg shape assertions,
+// conformed to the worker's observed wire (#130/#131). Each pins the current
+// environments-bridge flow's snake_case response face INDEPENDENTLY of the server's
+// serializer, so these specs pin BOTH directions — the assertion ACCEPTS the pinned
+// shape and, crucially, REJECTS a camelCase / reordered / drifted / resurrected-legacy
+// shape — so a conformance run cannot silently agree with a wrong contract (the
+// Self-Confirming Mock gap). Exercised live against the real server in
+// `wire-conformance.e2e.test.ts`; driven directly here so the shape gate is verified on
+// every `test` run without a live server.
 
-describe("assertEnvironmentRegisterResponseWire — §1 { environment_id, work_poll_token }", () => {
-  const PINNED = JSON.stringify({ environment_id: "env-1", work_poll_token: "tok-1" });
+/** Encode a work-secret the way the server mints it: `base64url(JSON(WorkSecret))`. */
+function encodeSecret(secret: unknown): string {
+  return Buffer.from(JSON.stringify(secret), "utf8").toString("base64url");
+}
+
+const VALID_SECRET = { version: 1, session_ingress_token: "ingress-token-1", api_base_url: "http://127.0.0.1:8787" };
+
+describe("assertEnvironmentRegisterResponseWire — §1 { environment_id } (no work-poll token, #130)", () => {
+  const PINNED = JSON.stringify({ environment_id: "env-1" });
 
   it("accepts the pinned snake_case wire body and returns it typed", () => {
-    const wire = assertEnvironmentRegisterResponseWire(PINNED);
-    expect(wire.environment_id).toBe("env-1");
-    expect(wire.work_poll_token).toBe("tok-1");
+    expect(assertEnvironmentRegisterResponseWire(PINNED)).toEqual({ environment_id: "env-1" });
   });
 
   it("rejects the camelCase shape — the Self-Confirming Mock a wrong casing would be", () => {
-    const camel = JSON.stringify({ environmentId: "env-1", workPollToken: "tok-1" });
-    expect(() => assertEnvironmentRegisterResponseWire(camel)).toThrow(/does not match the pinned contract/);
+    expect(() => assertEnvironmentRegisterResponseWire(JSON.stringify({ environmentId: "env-1" }))).toThrow(
+      /does not match the pinned contract/,
+    );
   });
 
-  it("rejects a reordered key set (key ORDER is pinned)", () => {
-    const reordered = `{"work_poll_token":"tok-1","environment_id":"env-1"}`;
-    expect(() => assertEnvironmentRegisterResponseWire(reordered)).toThrow(/does not match the pinned contract/);
+  it("rejects a RESURRECTED work_poll_token (the retired legacy field, #130)", () => {
+    const resurrected = JSON.stringify({ environment_id: "env-1", work_poll_token: "tok-1" });
+    expect(() => assertEnvironmentRegisterResponseWire(resurrected)).toThrow(/does not match the pinned contract/);
   });
 
   it("rejects a stray extra key and a missing key", () => {
-    const extra = JSON.stringify({ environment_id: "env-1", work_poll_token: "tok-1", extra: "nope" });
-    expect(() => assertEnvironmentRegisterResponseWire(extra)).toThrow(/does not match the pinned contract/);
-    const missing = JSON.stringify({ environment_id: "env-1" });
-    expect(() => assertEnvironmentRegisterResponseWire(missing)).toThrow(/does not match the pinned contract/);
+    expect(() => assertEnvironmentRegisterResponseWire(JSON.stringify({ environment_id: "e", extra: 1 }))).toThrow(
+      /does not match the pinned contract/,
+    );
+    expect(() => assertEnvironmentRegisterResponseWire(JSON.stringify({}))).toThrow(
+      /does not match the pinned contract/,
+    );
   });
 
   it("rejects a non-string or empty field value", () => {
-    expect(() =>
-      assertEnvironmentRegisterResponseWire(JSON.stringify({ environment_id: "", work_poll_token: "t" })),
-    ).toThrow(/must be a non-empty string/);
-    expect(() =>
-      assertEnvironmentRegisterResponseWire(JSON.stringify({ environment_id: "e", work_poll_token: 1 })),
-    ).toThrow(/must be a non-empty string/);
+    expect(() => assertEnvironmentRegisterResponseWire(JSON.stringify({ environment_id: "" }))).toThrow(
+      /must be a non-empty string/,
+    );
+    expect(() => assertEnvironmentRegisterResponseWire(JSON.stringify({ environment_id: 1 }))).toThrow(
+      /must be a non-empty string/,
+    );
   });
 
   it("rejects a body that is not a JSON object", () => {
@@ -58,84 +69,136 @@ describe("assertEnvironmentRegisterResponseWire — §1 { environment_id, work_p
   });
 });
 
-describe("assertSessionCreateResponseWire — §2 { session_id, ws_url } (ADR-001)", () => {
-  const SESSION_ID = "sess-1";
-  const WS_URL = "ws://127.0.0.1:8787/v1/sessions/sess-1/ws";
-  const PINNED = JSON.stringify({ session_id: SESSION_ID, ws_url: WS_URL });
+describe("assertSessionCreateResponseWire — §2 { session_id } (no ws_url, #130)", () => {
+  const PINNED = JSON.stringify({ session_id: "sess-1" });
 
   it("accepts the pinned snake_case wire body and returns it typed", () => {
-    const wire = assertSessionCreateResponseWire(PINNED);
-    expect(wire.session_id).toBe(SESSION_ID);
-    expect(wire.ws_url).toBe(WS_URL);
+    expect(assertSessionCreateResponseWire(PINNED)).toEqual({ session_id: "sess-1" });
   });
 
   it("rejects the camelCase shape", () => {
-    const camel = JSON.stringify({ sessionId: SESSION_ID, wsUrl: WS_URL });
-    expect(() => assertSessionCreateResponseWire(camel)).toThrow(/does not match the pinned contract/);
+    expect(() => assertSessionCreateResponseWire(JSON.stringify({ sessionId: "sess-1" }))).toThrow(
+      /does not match the pinned contract/,
+    );
   });
 
-  it("rejects a reordered, extra, or missing key", () => {
-    expect(() => assertSessionCreateResponseWire(`{"ws_url":"${WS_URL}","session_id":"${SESSION_ID}"}`)).toThrow(
+  it("rejects a RESURRECTED ws_url — the SSE control path never reads one (#130)", () => {
+    const resurrected = JSON.stringify({ session_id: "sess-1", ws_url: "ws://127.0.0.1:8787/v1/sessions/sess-1/ws" });
+    expect(() => assertSessionCreateResponseWire(resurrected)).toThrow(/does not match the pinned contract/);
+  });
+
+  it("rejects an extra or missing key", () => {
+    expect(() => assertSessionCreateResponseWire(JSON.stringify({ session_id: "s", extra: "nope" }))).toThrow(
       /does not match the pinned contract/,
     );
-    expect(() =>
-      assertSessionCreateResponseWire(JSON.stringify({ session_id: SESSION_ID, ws_url: WS_URL, extra: "nope" })),
-    ).toThrow(/does not match the pinned contract/);
-    expect(() => assertSessionCreateResponseWire(JSON.stringify({ session_id: SESSION_ID }))).toThrow(
-      /does not match the pinned contract/,
-    );
+    expect(() => assertSessionCreateResponseWire(JSON.stringify({}))).toThrow(/does not match the pinned contract/);
   });
 
   it("rejects a non-string or empty field value", () => {
-    expect(() => assertSessionCreateResponseWire(JSON.stringify({ session_id: "", ws_url: WS_URL }))).toThrow(
+    expect(() => assertSessionCreateResponseWire(JSON.stringify({ session_id: "" }))).toThrow(
       /must be a non-empty string/,
     );
-    expect(() => assertSessionCreateResponseWire(JSON.stringify({ session_id: 1, ws_url: WS_URL }))).toThrow(
+    expect(() => assertSessionCreateResponseWire(JSON.stringify({ session_id: 1 }))).toThrow(
       /must be a non-empty string/,
     );
   });
 });
 
-describe("assertWorkPollResponseWire — §3 { work: WorkItem[] }", () => {
-  it("accepts an empty batch", () => {
-    expect(assertWorkPollResponseWire(JSON.stringify({ work: [] }))).toEqual([]);
+describe("assertWorkItemWire — §3 a SINGLE { id, secret, data } item (not a { work: [...] } envelope, #130)", () => {
+  it("accepts a well-formed session item and returns it typed alongside its decoded secret", () => {
+    const body = JSON.stringify({
+      id: "work-1",
+      secret: encodeSecret(VALID_SECRET),
+      data: { type: "session", id: "sess-1" },
+    });
+    const { item, secret } = assertWorkItemWire(body);
+    expect(item).toEqual({ id: "work-1", secret: encodeSecret(VALID_SECRET), data: { type: "session", id: "sess-1" } });
+    expect(secret).toEqual({
+      version: 1,
+      session_ingress_token: "ingress-token-1",
+      api_base_url: "http://127.0.0.1:8787",
+    });
   });
 
-  it("accepts a batch of well-formed work items (with and without payload)", () => {
-    const items = [
-      { kind: "create_session", id: "w1", payload: { session_id: "s1" } },
-      { kind: "user_turn", id: "w2" },
-    ];
-    expect(assertWorkPollResponseWire(JSON.stringify({ work: items }))).toEqual(items);
+  it("accepts a healthcheck item (no data.id)", () => {
+    const body = JSON.stringify({ id: "work-2", secret: encodeSecret(VALID_SECRET), data: { type: "healthcheck" } });
+    expect(assertWorkItemWire(body).item.data).toEqual({ type: "healthcheck" });
   });
 
-  it("rejects a wrong envelope key or an extra key (envelope shape is pinned)", () => {
-    expect(() => assertWorkPollResponseWire(JSON.stringify({ items: [] }))).toThrow(
+  it("rejects a { work: [...] } envelope — the defining §3 regression (#130)", () => {
+    const envelope = JSON.stringify({
+      work: [{ id: "w1", secret: encodeSecret(VALID_SECRET), data: { type: "session", id: "s1" } }],
+    });
+    expect(() => assertWorkItemWire(envelope)).toThrow(/expected a single item/);
+  });
+
+  it("rejects a reordered, extra, or missing top-level key", () => {
+    expect(() =>
+      assertWorkItemWire(`{"secret":"${encodeSecret(VALID_SECRET)}","id":"w1","data":{"type":"healthcheck"}}`),
+    ).toThrow(/does not match the pinned contract/);
+    expect(() =>
+      assertWorkItemWire(
+        JSON.stringify({ id: "w1", secret: encodeSecret(VALID_SECRET), data: { type: "healthcheck" }, extra: 1 }),
+      ),
+    ).toThrow(/does not match the pinned contract/);
+    expect(() => assertWorkItemWire(JSON.stringify({ id: "w1", secret: encodeSecret(VALID_SECRET) }))).toThrow(
       /does not match the pinned contract/,
     );
-    expect(() => assertWorkPollResponseWire(JSON.stringify({ work: [], extra: 1 }))).toThrow(
-      /does not match the pinned contract/,
-    );
   });
 
-  it("rejects a `work` field that is not an array", () => {
-    expect(() => assertWorkPollResponseWire(JSON.stringify({ work: { id: "w1" } }))).toThrow(/is not an array/);
+  it("rejects an unknown data.type and a session item missing its data.id — fail closed", () => {
+    expect(() =>
+      assertWorkItemWire(JSON.stringify({ id: "w1", secret: encodeSecret(VALID_SECRET), data: { type: "bogus" } })),
+    ).toThrow(/is not one of session\|healthcheck/);
+    expect(() =>
+      assertWorkItemWire(JSON.stringify({ id: "w1", secret: encodeSecret(VALID_SECRET), data: { type: "session" } })),
+    ).toThrow(/must be a non-empty string/);
   });
 
-  it("rejects a drifted work item (unknown kind, missing id, malformed payload) — fail closed", () => {
-    expect(() => assertWorkPollResponseWire(JSON.stringify({ work: [{ kind: "bogus", id: "w1" }] }))).toThrow(
-      /not a well-formed WorkItem/,
-    );
-    expect(() => assertWorkPollResponseWire(JSON.stringify({ work: [{ kind: "steer" }] }))).toThrow(
-      /not a well-formed WorkItem/,
+  it("rejects a missing/blank secret or a non-object data", () => {
+    expect(() => assertWorkItemWire(JSON.stringify({ id: "w1", secret: "", data: { type: "healthcheck" } }))).toThrow(
+      /must be a non-empty string/,
     );
     expect(() =>
-      assertWorkPollResponseWire(JSON.stringify({ work: [{ kind: "user_turn", id: "w1", payload: [] }] })),
-    ).toThrow(/not a well-formed WorkItem/);
+      assertWorkItemWire(JSON.stringify({ id: "w1", secret: encodeSecret(VALID_SECRET), data: [] })),
+    ).toThrow(/is not an object/);
   });
 
   it("rejects a body that is not a JSON object", () => {
-    expect(() => assertWorkPollResponseWire("not json")).toThrow(/not valid JSON/);
-    expect(() => assertWorkPollResponseWire("[]")).toThrow(/not a JSON object/);
+    expect(() => assertWorkItemWire("not json")).toThrow(/not valid JSON/);
+    expect(() => assertWorkItemWire("[]")).toThrow(/not a JSON object/);
+  });
+});
+
+describe("decodeWorkSecret — base64url(JSON(WorkSecret)) with both inner fields (#130)", () => {
+  it("decodes a well-formed secret", () => {
+    expect(decodeWorkSecret(encodeSecret(VALID_SECRET))).toEqual({
+      version: 1,
+      session_ingress_token: "ingress-token-1",
+      api_base_url: "http://127.0.0.1:8787",
+    });
+  });
+
+  it("rejects a secret that is not base64url(JSON)", () => {
+    expect(() => decodeWorkSecret(Buffer.from("not json", "utf8").toString("base64url"))).toThrow(
+      /not base64url\(JSON\)/,
+    );
+  });
+
+  it("rejects a decoded value that is not a JSON object", () => {
+    expect(() => decodeWorkSecret(encodeSecret([1, 2, 3]))).toThrow(/not a JSON object/);
+  });
+
+  it("rejects a non-number version", () => {
+    expect(() => decodeWorkSecret(encodeSecret({ ...VALID_SECRET, version: "1" }))).toThrow(/must be a number/);
+  });
+
+  it("rejects a missing or blank inner field (both are load-bearing)", () => {
+    expect(() => decodeWorkSecret(encodeSecret({ version: 1, api_base_url: "http://127.0.0.1:1" }))).toThrow(
+      /must be a non-empty string/,
+    );
+    expect(() => decodeWorkSecret(encodeSecret({ version: 1, session_ingress_token: "t", api_base_url: "" }))).toThrow(
+      /must be a non-empty string/,
+    );
   });
 });

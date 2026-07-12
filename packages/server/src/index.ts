@@ -4,52 +4,53 @@
 /**
  * `@ccctl/server` — the local server.
  *
- * Terminates the current Claude Code build's native `stream-json` control
- * transport: the **environments-bridge** flow (bridge-protocol §1–§4).
+ * Terminates the current Claude Code build's native `stream-json` control transport:
+ * the **environments-bridge** flow (bridge-protocol §1–§5), conformed to the worker's
+ * observed wire (issue #130).
  *
  *   - §1 **Environment register** — `POST /v1/environments/bridge` (account Bearer)
- *     mints an environment id + a scoped work-poll token.
+ *     mints an environment id (`{ environment_id }`, no work-poll token).
  *   - §2 **Session create** — `POST /v1/sessions` (account Bearer) creates a
- *     {@link Session} and returns `{ session_id, ws_url }`.
+ *     {@link Session}, AUTO-ENQUEUES its `session` work item (with a locally-minted
+ *     work-secret) for the worker to poll, and returns `{ session_id }` (no `ws_url`).
  *   - §3 **Work delivery** — `GET /v1/environments/{env}/work/poll`, long-polled and
- *     authorized by the SCOPED per-environment token (never the account Bearer),
- *     delivering `create_session` / `resume_session` / `user_turn` / `steer` work
- *     items, each acked or stopped. §1–§3 live in `environments-bridge.ts`.
- *   - §4 **Per-session worker channel** — the worker opens a WebSocket to the minted
- *     `ws_url` and streams `stream-json` frames; the server derives the session's
- *     `activity` and relays a turn/steer worker-ward. Handled in `worker-channel.ts`
- *     ({@link handleWorkerChannelUpgrade} / {@link CcctlServer.dispatch}).
+ *     carrying NO credential, delivering a SINGLE work item (or an empty body).
+ *     §1–§3 live in `environments-bridge.ts`.
+ *   - §4/§5 **Per-session worker channel** — HTTP + Server-Sent Events, rooted at
+ *     `/v1/code/sessions/{id}/worker` ({@link matchWorkerRoute}): `register` mints a
+ *     `worker_epoch`, a held-open `events/stream` is the server→worker downstream,
+ *     `events` is the batched upstream (where turn output returns), `PUT worker` is the
+ *     status gate, plus `heartbeat` + `events/delivery`. Handled in `worker-channel.ts`.
  *
- * **Two-token credential boundary (HARD, #60).** The account OAuth Bearer rides
- * §1/§2/§4 and is a strict NON-PERSISTING pass-through — validated for receipt and
- * dropped, never captured into state, a response, or a log. The work-poll leg (§3)
- * is authorized INSTEAD by the scoped per-environment token, so presenting the
- * account Bearer there fails closed. (Forwarding the account Bearer to
- * `api.anthropic.com` for the live session lands with the credentialed wave; this
- * slice validates receipt only.)
+ * **Two-credential boundary (HARD, #130).** The account OAuth Bearer rides §1/§2 ONLY
+ * and is a strict NON-PERSISTING pass-through — validated for receipt and dropped,
+ * never captured into state, a response, or a log. The §3 poll carries no credential;
+ * the §4/§5 channel is authorized (in the credentialed wave) by the per-session
+ * ingress token the server minted into the work-secret, NEVER the account Bearer.
  *
- * **Browser-facing transport pair (#13).** The worker channel fans every inbound
- * `control_event` out to subscribed UI clients over Server-Sent Events
- * (`GET /api/events`, {@link CcctlServer.broadcast}); the browser steers back with a
- * `fetch` POST (`POST /api/command`) re-framed as a `control_request` and relayed
- * via {@link CcctlServer.dispatch}. Loopback UI ingress is unauthenticated at this
- * slice (browser-facing auth is a later item).
+ * **Browser-facing transport pair (#13).** The worker channel fans every payload off
+ * its upstream `worker/events` leg (§5) out to subscribed UI clients over Server-Sent
+ * Events (`GET /api/events`); the browser steers back with a `fetch` POST
+ * (`POST /api/command`) the server pushes worker-ward as a `client_event` on the
+ * session's downstream ({@link CcctlServer.injectTurn} is the programmatic form of the
+ * turn-injection leg). Loopback UI ingress is unauthenticated at this slice.
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { Duplex } from "node:stream";
+import { ENVIRONMENTS_BRIDGE_PATH, SESSIONS_PATH, type HostEndpoint, type Session } from "@ccctl/core";
 import {
-  ENVIRONMENTS_BRIDGE_PATH,
-  SESSIONS_PATH,
-  type ControlEvent,
-  type ControlRequest,
-  type HostEndpoint,
-  type Session,
-  type WorkItem,
-} from "@ccctl/core";
-import { dispatchToWorkerChannel, handleWorkerChannelUpgrade } from "./worker-channel.js";
+  closeWorkerChannels,
+  handleWorkerDelivery,
+  handleWorkerEvents,
+  handleWorkerEventsStream,
+  handleWorkerHeartbeat,
+  handleWorkerRegister,
+  handleWorkerStatus,
+  injectUserTurn,
+  matchWorkerRoute,
+  type WorkerChannelRecord,
+} from "./worker-channel.js";
 import {
-  broadcastEvent,
   closeEventStreams,
   createEventStreamState,
   EVENTS_PATH,
@@ -60,13 +61,10 @@ import { COMMAND_PATH, handleUiCommand } from "./ui-command.js";
 import { writeError } from "./http-response.js";
 import {
   DEFAULT_WORK_POLL_TIMEOUT_MS,
-  enqueueWork,
   handleEnvironmentRegister,
   handleSessionCreate,
-  handleWorkAck,
   handleWorkPoll,
-  handleWorkStop,
-  matchWorkPath,
+  matchWorkPollPath,
   settlePendingPolls,
   type EnvironmentRecord,
 } from "./environments-bridge.js";
@@ -98,7 +96,7 @@ export interface ServerConfig {
   /** Host to bind. Defaults to loopback so nothing is exposed off-box. */
   host?: string;
   /**
-   * Long-poll hold (ms) before an empty `…/work/poll` answers with an empty batch.
+   * Long-poll hold (ms) before an empty `…/work/poll` answers with an empty body.
    * Defaults to {@link DEFAULT_WORK_POLL_TIMEOUT_MS}; a test passes a short value for
    * a deterministic timeout.
    */
@@ -110,7 +108,7 @@ export interface CcctlServer {
   /**
    * The address the server actually bound. When {@link ServerConfig.port} is `0`
    * this carries the resolved ephemeral port — so callers can always learn where to
-   * reach the server, and where the `ws_url`s it mints point.
+   * reach the server, and the base the work-secret's `api_base_url` points at.
    */
   readonly address: HostEndpoint;
   /** Sessions currently tracked by this server, keyed by ccctl session id. */
@@ -118,19 +116,11 @@ export interface CcctlServer {
   /** Environments registered on this server (§1), keyed by environment id. */
   readonly environments: ReadonlyMap<string, EnvironmentRecord>;
   /**
-   * Enqueue one work item for an environment (§3 ingress) — the server-side hook a
-   * UI action or launch feeds; the worker's next poll delivers it (or a held poll
-   * receives it immediately). Returns `false` when the environment is unknown.
+   * Inject one user turn — push a `{ type: "user" }` `client_event` down the session's
+   * held-open worker downstream (§4/§5). The programmatic form of the turn a
+   * `POST /api/command` `prompt` drives. Throws if the session has no live worker channel.
    */
-  enqueueWork(environmentId: string, item: WorkItem): boolean;
-  /** Forward a worker control event to all subscribed UI clients (SSE). */
-  broadcast(sessionId: string, event: ControlEvent): void;
-  /**
-   * Relay one UI-issued steer to the worker as a control request written over the
-   * session's worker-channel WebSocket (§4). Throws if the session has no live
-   * worker channel.
-   */
-  dispatch(sessionId: string, request: ControlRequest): void;
+  injectTurn(sessionId: string, prompt: string): void;
   /** Stop accepting connections and release the port. */
   close(): Promise<void>;
 }
@@ -138,15 +128,10 @@ export interface CcctlServer {
 /** Mutable per-server state shared with the request handler and the bridge legs. */
 interface ServerState {
   readonly sessions: Map<string, Session>;
-  /** Environments registered via §1, keyed by environment id (owns the §3 work queue + scoped token). */
+  /** Environments registered via §1, keyed by environment id (owns the §3 work queue). */
   readonly environments: Map<string, EnvironmentRecord>;
-  /**
-   * The live worker-channel socket per session id. An upgraded socket is DETACHED
-   * from the HTTP server, so neither `closeIdleConnections()` nor
-   * `closeAllConnections()` manages it — the server tracks them here to enforce one
-   * channel per session and to tear them down on {@link CcctlServer.close}.
-   */
-  readonly workerChannels: Map<string, Duplex>;
+  /** The live per-session worker channel (§4/§5): epoch + held-open downstream + seq. */
+  readonly workerChannels: Map<string, WorkerChannelRecord>;
   /** The UI Server-Sent Events relay state — subscribers + Last-Event-ID replay buffer. */
   readonly events: EventStreamState;
   /** Long-poll hold (ms) for an empty `…/work/poll`. */
@@ -158,8 +143,8 @@ interface ServerState {
 /**
  * Route one HTTP request. The browser-facing UI transport pair is matched first
  * (`GET /api/events`, `POST /api/command`), then the environments-bridge legs (§1
- * environment register, §2 session create, §3 work poll / ack / stop). Anything else
- * falls through to a fail-closed 404.
+ * environment register, §2 session create, §3 work poll) and the §4/§5 per-session
+ * worker channel. Anything else falls through to a fail-closed 404.
  */
 function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerState): void {
   const { pathname } = new URL(req.url ?? "/", "http://localhost");
@@ -179,17 +164,31 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerS
     handleSessionCreate(req, res, state);
     return;
   }
-  const work = matchWorkPath(pathname);
-  if (work !== null) {
-    switch (work.kind) {
-      case "poll":
-        handleWorkPoll(req, res, state, work.environmentId);
+  const workEnvironmentId = matchWorkPollPath(pathname);
+  if (workEnvironmentId !== null) {
+    handleWorkPoll(req, res, state, workEnvironmentId);
+    return;
+  }
+  const worker = matchWorkerRoute(pathname);
+  if (worker !== null) {
+    switch (worker.leg) {
+      case "register":
+        handleWorkerRegister(req, res, state, worker.sessionId);
         return;
-      case "ack":
-        handleWorkAck(req, res, state, work.environmentId, work.workId);
+      case "events-stream":
+        handleWorkerEventsStream(req, res, state, worker.sessionId);
         return;
-      case "stop":
-        handleWorkStop(req, res, state, work.environmentId, work.workId);
+      case "events":
+        handleWorkerEvents(req, res, state, worker.sessionId);
+        return;
+      case "events-delivery":
+        handleWorkerDelivery(req, res, state, worker.sessionId);
+        return;
+      case "heartbeat":
+        handleWorkerHeartbeat(req, res, state, worker.sessionId);
+        return;
+      case "status":
+        handleWorkerStatus(req, res, state, worker.sessionId);
         return;
     }
   }
@@ -202,17 +201,8 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
     address: state.address,
     sessions: state.sessions,
     environments: state.environments,
-    enqueueWork(environmentId: string, item: WorkItem): boolean {
-      return enqueueWork(state, environmentId, item);
-    },
-    // At this single-session slice there is one event stream, so the sessionId is
-    // accepted for the forthcoming per-session partition (multiplexing) but is not
-    // yet used to route — the one stream IS the one session's.
-    broadcast(_sessionId: string, event: ControlEvent): void {
-      broadcastEvent(state.events, event);
-    },
-    dispatch(sessionId: string, request: ControlRequest): void {
-      dispatchToWorkerChannel(state, sessionId, request);
+    injectTurn(sessionId: string, prompt: string): void {
+      injectUserTurn(state, sessionId, prompt);
     },
     close(): Promise<void> {
       return new Promise<void>((resolve, reject) => {
@@ -226,23 +216,15 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
         // Settle any held work-polls (§3 long-poll). A poll held open on an empty
         // queue is an in-flight request `close()` waits on and an armed timer that
         // keeps the loop alive — without this, shutting down while a worker is
-        // mid-poll hangs for up to workPollTimeoutMs. Same rationale as the SSE /
-        // worker-channel teardown below.
+        // mid-poll hangs for up to workPollTimeoutMs. Same rationale as the SSE
+        // teardown below.
         settlePendingPolls(state);
-        // End open SSE streams. An SSE response holds its connection open
-        // indefinitely and is never "idle", so `closeIdleConnections()` below would
-        // leave it — and `close()` would hang waiting on it. Ending them lets a
-        // quiescent server shut down promptly.
+        // End open SSE streams — both the UI relay (`/api/events`) and every held-open
+        // worker downstream (`worker/events/stream`). An SSE response holds its
+        // connection open indefinitely and is never "idle", so `closeIdleConnections()`
+        // below would leave it and `close()` would hang waiting on it.
         closeEventStreams(state.events);
-        // Tear down live worker-channel sockets explicitly. A worker channel is
-        // long-lived and, once upgraded, is DETACHED from the HTTP server — so
-        // `closeIdleConnections()` (and even `closeAllConnections()`) never touch it,
-        // yet `close()` still waits on it at the socket layer. Without this, a
-        // shutdown with a live channel hangs forever. This slice drops the channel
-        // abruptly; a graceful WS close handshake is a later concern.
-        for (const socket of state.workerChannels.values()) {
-          socket.destroy();
-        }
+        closeWorkerChannels(state);
         // Release idle keep-alive HTTP sockets so a quiescent server closes promptly
         // instead of waiting on pooled client connections.
         httpServer.closeIdleConnections();
@@ -261,7 +243,7 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
   const state: ServerState = {
     sessions: new Map<string, Session>(),
     environments: new Map<string, EnvironmentRecord>(),
-    workerChannels: new Map<string, Duplex>(),
+    workerChannels: new Map<string, WorkerChannelRecord>(),
     events: createEventStreamState(),
     workPollTimeoutMs: config.workPollTimeoutMs ?? DEFAULT_WORK_POLL_TIMEOUT_MS,
     address: { host, port: config.port },
@@ -274,18 +256,6 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
       if (!res.headersSent) {
         writeError(res, 500, "ccctl: internal server error");
       }
-    }
-  });
-
-  // The worker opens its worker-channel WebSocket to the minted `ws_url`, which
-  // points back at this server (§4). Node surfaces that as an `upgrade` event;
-  // `handleWorkerChannelUpgrade` fails closed on anything that is not a well-formed
-  // upgrade for a known session carrying the account Bearer.
-  httpServer.on("upgrade", (req, socket, head) => {
-    try {
-      handleWorkerChannelUpgrade(req, socket, head, state);
-    } catch {
-      socket.destroy();
     }
   });
 

@@ -5,7 +5,8 @@
  * Wire DTOs for the environments-bridge flow — the server HTTP boundary's
  * snake_case seam between `@ccctl/core`'s camelCase model and the bytes on the
  * Claude Code `--sdk-url` control transport (ADR-001's convention, extended from
- * the register response to the whole flow).
+ * the register response to the whole flow), conformed to the worker's
+ * *actually-observed* wire (issue #130).
  *
  * Two directions cross here, both fail-closed:
  *
@@ -16,22 +17,20 @@
  *     the "fail closed on protocol drift" contract at the ingress edge, mirroring
  *     core's own `workItemFromValue` / `isPermissionMode` discriminant validation.
  *   - **Outgoing responses** (server → worker) are serialized core camelCase →
- *     snake_case by the `to…Wire` mappers. The §2 session-create response uses
- *     `toSessionCreateResponseWire` (session-create-wire.ts) — the `{ session_id, ws_url }`
- *     body — so that one golden-pinned mapper stays the single owner of that shape.
+ *     snake_case by the `to…Wire` mappers: the §1 register response
+ *     ({@link toEnvironmentRegisterResponseWire}, a bare `{ environment_id }`), the
+ *     §2 session-create response (`toSessionCreateResponseWire`, session-create-wire.ts),
+ *     and the §3 single work item ({@link toWorkItemWire}).
  *
- * The scoped per-environment work-poll token rides the §1 register RESPONSE
- * ({@link EnvironmentRegisterResponseWire.work_poll_token}) even though core's
- * {@link EnvironmentRegisterResponse} models only the environment id: token
- * PROVISIONING is "the transport's concern, out of the core face's scope", so the
- * server mints it and hands it back here. It is a scoped credential (its leak
- * compromises one environment's work queue, not the account), so — unlike the
- * account Bearer — it legitimately travels on the wire.
+ * The §3 work-poll answers with a SINGLE {@link WorkItem} object (or an empty body —
+ * "no work"), NOT a `{ work: [...] }` envelope: the observed worker polls one item at
+ * a time under a reclaim model (`reclaim_older_than_ms`), never acking a batch.
  */
 
 import {
   isPermissionMode,
   type EnvironmentRegisterRequestBody,
+  type JsonObject,
   type SessionCreateRequestBody,
   type WorkItem,
 } from "@ccctl/core";
@@ -39,58 +38,65 @@ import {
 // --- §1 environment register ---
 
 /**
- * The snake_case `POST /v1/environments/bridge` request body — the machine /
- * directory / branch / repository the environment bridges, plus its concurrent
- * session cap. Maps to core's camelCase {@link EnvironmentRegisterRequestBody}.
+ * The snake_case `POST /v1/environments/bridge` request body — the machine name,
+ * working directory, branch, git remote URL (nullable), a concurrent-session cap,
+ * and an opaque metadata bag. Maps to core's camelCase
+ * {@link EnvironmentRegisterRequestBody}.
  */
 export interface EnvironmentRegisterRequestWire {
-  readonly machine_id: string;
+  readonly machine_name: string;
   readonly directory: string;
   readonly branch: string;
-  readonly repository: string;
+  readonly git_repo_url: string | null;
   readonly max_sessions: number;
+  readonly metadata: JsonObject;
 }
 
 /**
  * The snake_case `POST /v1/environments/bridge` response body: the server-assigned
- * environment id plus the scoped per-environment token the worker presents on the
- * work-poll leg (§3). `work_poll_token` has no core counterpart by design (token
- * provisioning is the transport's concern) — it is minted server-side.
+ * environment id the worker interpolates into the §3 work-poll path. There is no
+ * work-poll token — the §3 leg carries no credential (issue #130).
  */
 export interface EnvironmentRegisterResponseWire {
   readonly environment_id: string;
-  readonly work_poll_token: string;
 }
 
 /**
  * Parse a decoded `POST /v1/environments/bridge` body (snake_case) into core's
  * {@link EnvironmentRegisterRequestBody}, or `null` when it is not a well-formed
  * one. Fail-closed over arbitrary bytes: a non-object, a missing/mistyped string
- * field, or a `max_sessions` that is not a positive integer all yield `null`.
+ * field, a `git_repo_url` that is neither a string nor `null`, a non-object
+ * `metadata`, or a `max_sessions` that is not a positive integer all yield `null`.
  */
 export function parseEnvironmentRegisterBody(value: unknown): EnvironmentRegisterRequestBody | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
   }
-  const { machine_id, directory, branch, repository, max_sessions } = value as Record<string, unknown>;
+  const { machine_name, directory, branch, git_repo_url, max_sessions, metadata } = value as Record<string, unknown>;
   if (
-    typeof machine_id !== "string" ||
+    typeof machine_name !== "string" ||
+    machine_name === "" ||
     typeof directory !== "string" ||
     typeof branch !== "string" ||
-    typeof repository !== "string" ||
-    !isPositiveInteger(max_sessions)
+    !isNullableString(git_repo_url) ||
+    !isPositiveInteger(max_sessions) ||
+    !isJsonObject(metadata)
   ) {
     return null;
   }
-  return { machineId: machine_id, directory, branch, repository, maxSessions: max_sessions };
+  return {
+    machineName: machine_name,
+    directory,
+    branch,
+    gitRepoUrl: git_repo_url,
+    maxSessions: max_sessions,
+    metadata,
+  };
 }
 
-/** Serialize a minted environment id + scoped token into the §1 snake_case response body. */
-export function toEnvironmentRegisterResponseWire(
-  environmentId: string,
-  workPollToken: string,
-): EnvironmentRegisterResponseWire {
-  return { environment_id: environmentId, work_poll_token: workPollToken };
+/** Serialize a minted environment id into the §1 snake_case response body. */
+export function toEnvironmentRegisterResponseWire(environmentId: string): EnvironmentRegisterResponseWire {
+  return { environment_id: environmentId };
 }
 
 // --- §2 session create ---
@@ -99,6 +105,8 @@ export function toEnvironmentRegisterResponseWire(
  * The snake_case `POST /v1/sessions` request body — the session context (model +
  * cwd), the source that initiated it, and the permission mode. Maps to core's
  * camelCase {@link SessionCreateRequestBody} (`permission_mode` → `permissionMode`).
+ * The observed worker may carry extra fields (session metadata / tags); they are
+ * accepted and ignored (extra JSON keys are simply not read).
  */
 export interface SessionCreateRequestWire {
   readonly context: { readonly model: string; readonly cwd: string };
@@ -111,7 +119,8 @@ export interface SessionCreateRequestWire {
  * {@link SessionCreateRequestBody}, or `null` when it is not a well-formed one.
  * Fail-closed: a non-object, a missing/mistyped `context.model` / `context.cwd` /
  * `source`, or a `permission_mode` that is not one of the pinned
- * {@link isPermissionMode} values (drift) all yield `null`.
+ * {@link isPermissionMode} values (drift) all yield `null`. Extra fields (session
+ * metadata / tags the worker may send) are ignored, not rejected.
  */
 export function parseSessionCreateBody(value: unknown): SessionCreateRequestBody | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -134,21 +143,41 @@ export function parseSessionCreateBody(value: unknown): SessionCreateRequestBody
 // --- §3 work poll delivery ---
 
 /**
- * The snake_case `GET …/work/poll` response body — the batch of {@link WorkItem}s
- * delivered to the worker (empty when a long-poll times out with nothing queued).
- * A {@link WorkItem}'s fields (`kind` / `id` / `payload`) are already lowercase and
- * JSON-safe, so no per-field case mapping is needed — the batch is the wire shape.
+ * The snake_case `GET …/work/poll` response body — a SINGLE {@link WorkItem}
+ * (`{ id, secret, data: { type, id? } }`). A {@link WorkItem}'s fields are already
+ * lowercase/JSON-safe, so no per-field case mapping is needed; the item IS the wire
+ * shape. A `healthcheck` item omits `data.id`; a `session` item carries it.
  */
-export interface WorkPollResponseWire {
-  readonly work: readonly WorkItem[];
+export interface WorkItemWire {
+  readonly id: string;
+  readonly secret: string;
+  readonly data: { readonly type: string; readonly id?: string };
 }
 
-/** Serialize a batch of work items into the §3 work-poll response body. */
-export function toWorkPollResponseWire(work: readonly WorkItem[]): WorkPollResponseWire {
-  return { work };
+/**
+ * Serialize a single work item into the §3 work-poll response body. A `session`
+ * item carries `data.id` (its session id); a `healthcheck` item omits it. When there
+ * is NO work the handler answers an empty body instead of calling this — the wire
+ * has no envelope to represent "empty".
+ */
+export function toWorkItemWire(item: WorkItem): WorkItemWire {
+  const data = item.data.id === undefined ? { type: item.data.type } : { type: item.data.type, id: item.data.id };
+  return { id: item.id, secret: item.secret, data };
 }
+
+// --- shared guards ---
 
 /** A positive integer (a valid concurrent-session cap) — anything else fails closed. */
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+/** A string or `null` — the shape of a nullable wire field (`git_repo_url`). */
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+/** A plain JSON object (the `metadata` bag) — a non-object / array / null fails closed. */
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
