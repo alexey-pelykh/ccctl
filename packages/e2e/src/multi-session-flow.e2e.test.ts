@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { afterEach, describe, expect, it } from "vitest";
+import { DEFAULT_REQUIRES_ACTION_DETAIL } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "@ccctl/server";
 import { driveMultiSessionFlow, type MultiSessionFlow } from "./multi-session-harness.js";
 import { waitFor } from "./one-session-harness.js";
@@ -108,23 +109,41 @@ describe("ccctl e2e: multi-session flow — N concurrent sessions, never cross-w
       });
     });
 
-    it("derives each session's activity independently — a status on one never moves the other (#20/#21)", async () => {
+    it("derives each session's activity independently — full tri-state, interleaved, never cross-confused (#20/#21)", async () => {
       const server = await startLocalServer();
       const flow = await driveMultiSessionFlow({ server, bearer: ACCOUNT_BEARER, sessionCount: 2 });
       flows.push(flow);
       const [a, b] = flow.sessions;
+      const activityKind = (sessionId: string): string | undefined => server.sessions.get(sessionId)?.activity.kind;
 
-      // Drive ONLY session A to `running`; session B is untouched.
+      // Both start idle (every stand-in worker reported idle at setup).
+      expect(activityKind(a.sessionId)).toBe("idle");
+      expect(activityKind(b.sessionId)).toBe("idle");
+
+      // Drive ONLY session A to `running`; session B is untouched and keeps its own idle.
       await a.worker.putStatus("running");
-      await waitFor(() => server.sessions.get(a.sessionId)?.activity.kind === "running");
+      await waitFor(() => activityKind(a.sessionId) === "running");
+      expect(activityKind(b.sessionId)).toBe("idle");
 
+      // Drive session B to `requires_action`; session A keeps its own running.
+      await b.worker.putStatus("requires_action");
+      await waitFor(() => activityKind(b.sessionId) === "requires_action");
+      expect(activityKind(a.sessionId)).toBe("running");
+      // The bare §4 status gate defaults the detail (the rich detail rides the transcript stream).
+      expect(server.sessions.get(b.sessionId)?.activity).toEqual({
+        kind: "requires_action",
+        detail: DEFAULT_REQUIRES_ACTION_DETAIL,
+      });
+
+      // Swap their states — A → idle, B → running — so any shared-status bug would surface.
+      await a.worker.putStatus("idle");
+      await b.worker.putStatus("running");
+      await waitFor(() => activityKind(a.sessionId) === "idle" && activityKind(b.sessionId) === "running");
+
+      // The `GET /api/sessions` list surface (#20) reports each session's OWN status at all times.
       const listed = await flow.listSessions();
-      const listedA = listed.find((s) => s.id === a.sessionId);
-      const listedB = listed.find((s) => s.id === b.sessionId);
-      expect(listedA?.activity).toEqual({ kind: "running" });
-      // B keeps its own idle activity — status is never confused across sessions.
-      expect(listedB?.activity).toEqual({ kind: "idle" });
-      expect(server.sessions.get(b.sessionId)?.activity.kind).toBe("idle");
+      expect(listed.find((s) => s.id === a.sessionId)?.activity).toEqual({ kind: "idle" });
+      expect(listed.find((s) => s.id === b.sessionId)?.activity).toEqual({ kind: "running" });
     });
   });
 });

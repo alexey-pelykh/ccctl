@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import {
+  DEFAULT_REQUIRES_ACTION_DETAIL,
   SESSIONS_PATH,
   workerChannelPath,
   workerEventsDeliveryPath,
@@ -230,6 +231,21 @@ describe("§4 worker status gate — PUT /v1/code/sessions/{id}/worker", () => {
     expect(server.sessions.get(sessionId)?.activity.kind).toBe("running");
   });
 
+  it("derives `requires_action` (with the default detail) from the status gate — the third tri-state (#21)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // The PUT gate carries a BARE status (`external_metadata: {}`), so the derived activity
+    // takes the core default detail; the rich human `requires_action` detail rides the
+    // transcript stream and is decoded UI-side (web-ui), not folded into the session model.
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity).toEqual({
+      kind: "requires_action",
+      detail: DEFAULT_REQUIRES_ACTION_DETAIL,
+    });
+  });
+
   it("fails closed on a superseded epoch (409), an unknown status (400), and an unknown session (404)", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
@@ -242,6 +258,71 @@ describe("§4 worker status gate — PUT /v1/code/sessions/{id}/worker", () => {
     expect((await putStatus(server, sessionId, fresh, "on-fire")).status).toBe(400);
     // Unknown session.
     expect((await putStatus(server, "no-such-session", fresh, "idle")).status).toBe(404);
+  });
+});
+
+describe("§4 per-session status isolation — N sessions never confuse status (#21)", () => {
+  it("tracks each of two sessions independently across interleaved tri-state transitions", async () => {
+    const server = await startTestServer();
+    const s1 = await registerSession(server);
+    const s2 = await registerSession(server);
+    const e1 = await registerWorker(server, s1);
+    const e2 = await registerWorker(server, s2);
+
+    // Both freshly created → idle.
+    expect(server.sessions.get(s1)?.activity).toEqual({ kind: "idle" });
+    expect(server.sessions.get(s2)?.activity).toEqual({ kind: "idle" });
+
+    // s1 → running; s2 is untouched and keeps its own idle.
+    expect((await putStatus(server, s1, e1, "running")).status).toBe(200);
+    expect(server.sessions.get(s1)?.activity).toEqual({ kind: "running" });
+    expect(server.sessions.get(s2)?.activity).toEqual({ kind: "idle" });
+
+    // s2 → requires_action; s1 keeps its own running (a transition on s2 never moves s1).
+    expect((await putStatus(server, s2, e2, "requires_action")).status).toBe(200);
+    expect(server.sessions.get(s2)?.activity).toEqual({
+      kind: "requires_action",
+      detail: DEFAULT_REQUIRES_ACTION_DETAIL,
+    });
+    expect(server.sessions.get(s1)?.activity).toEqual({ kind: "running" });
+
+    // Cross their states — s1 → requires_action, s2 → running — so a shared-status bug
+    // (one map cell, last write wins) would surface as a session wearing the other's status.
+    expect((await putStatus(server, s1, e1, "requires_action")).status).toBe(200);
+    expect((await putStatus(server, s2, e2, "running")).status).toBe(200);
+    expect(server.sessions.get(s1)?.activity).toEqual({
+      kind: "requires_action",
+      detail: DEFAULT_REQUIRES_ACTION_DETAIL,
+    });
+    expect(server.sessions.get(s2)?.activity).toEqual({ kind: "running" });
+
+    // s1 → idle; s2 keeps its own running. Each reported ONLY its own status at every step.
+    expect((await putStatus(server, s1, e1, "idle")).status).toBe(200);
+    expect(server.sessions.get(s1)?.activity).toEqual({ kind: "idle" });
+    expect(server.sessions.get(s2)?.activity).toEqual({ kind: "running" });
+  });
+
+  it("carries three concurrent sessions each in a DISTINCT tri-state simultaneously", async () => {
+    const server = await startTestServer();
+    const running = await registerSession(server);
+    const waiting = await registerSession(server);
+    const quiet = await registerSession(server);
+    const runningEpoch = await registerWorker(server, running);
+    const waitingEpoch = await registerWorker(server, waiting);
+    const quietEpoch = await registerWorker(server, quiet);
+
+    // Drive the three workers to three different statuses over their OWN channels.
+    expect((await putStatus(server, running, runningEpoch, "running")).status).toBe(200);
+    expect((await putStatus(server, waiting, waitingEpoch, "requires_action")).status).toBe(200);
+    expect((await putStatus(server, quiet, quietEpoch, "idle")).status).toBe(200);
+
+    // All three tri-states co-exist, one per session — never confused across sessions.
+    expect(server.sessions.get(running)?.activity).toEqual({ kind: "running" });
+    expect(server.sessions.get(waiting)?.activity).toEqual({
+      kind: "requires_action",
+      detail: DEFAULT_REQUIRES_ACTION_DETAIL,
+    });
+    expect(server.sessions.get(quiet)?.activity).toEqual({ kind: "idle" });
   });
 });
 
