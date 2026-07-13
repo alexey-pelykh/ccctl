@@ -20,8 +20,12 @@
  * it is reachable at; and {@link TailscaleTunnel.teardown | teardown} releases
  * it cleanly. Which authenticated devices may reach the endpoint is governed by
  * the tailnet's own ACL policy — operator-owned central state the adapter relies
- * on and deliberately never provisions or overwrites. The Cloudflare / Headscale
- * backends are still to come.
+ * on by default and never edits in place. It can OPTIONALLY narrow that policy
+ * through the {@link TailscaleAclClient} API seam: an opt-in, additive grant it
+ * appends on {@link TailscaleTunnel.establish | establish} and removes on
+ * {@link TailscaleTunnel.teardown | teardown}, scoped to its own managed grant so
+ * it never overwrites the operator's hand-authored rules. The Cloudflare /
+ * Headscale backends are still to come.
  */
 
 import { execFile } from "node:child_process";
@@ -147,6 +151,153 @@ export const defaultCommandRunner: CommandRunner = {
 };
 
 // ---------------------------------------------------------------------------
+// Tailscale ACL-provisioning seam
+//
+// Separate from the CLI seam above: provisioning speaks the Tailscale HTTP API,
+// not the local `tailscale` binary (the CLI has no policy-write verb, and the
+// mandatory-auth check the adapter already relies on is deliberately CLI-only).
+// It sits behind this injectable seam for the same determinism discipline —
+// provisioning is unit-tested with an in-memory fake, no live tailnet and no API
+// token — and, being OPT-IN, is absent by default: a TailscaleTunnel with no
+// provisioning drives exactly `serve` + `status` and relies on the operator's
+// ACL, exactly as before (#139).
+// ---------------------------------------------------------------------------
+
+/**
+ * A tailnet ACL policy as a JSON object. Opaque to the adapter, which preserves
+ * every key verbatim on write and only ever touches the one `grants` collection
+ * it manages — so an operator's `acls`, `groups`, `tagOwners`, `ssh`, `hosts`, …
+ * survive a provision/revert round-trip unchanged.
+ */
+export type AclPolicy = Record<string, unknown>;
+
+/**
+ * A single ACL grant (a Tailscale `grants[]` entry) as a plain JSON object. The
+ * adapter appends exactly one operator-declared grant of this shape and, on
+ * teardown, removes the one grant equal to it — the whole of its managed scope.
+ */
+export type AclGrant = Record<string, unknown>;
+
+/**
+ * A fetched {@link AclPolicy} plus the optimistic-concurrency token to write it
+ * back under — the Tailscale API's `ETag`, echoed on save as `If-Match` so a
+ * concurrent operator edit is rejected rather than silently clobbered.
+ */
+export interface AclPolicyDocument {
+  readonly policy: AclPolicy;
+  readonly etag: string;
+}
+
+/**
+ * The injectable Tailscale-API seam (parallel to {@link CommandRunner}): read the
+ * tailnet's ACL policy and write it back under an `If-Match` concurrency token.
+ * Deliberately low-level — read/modify/write is the ONLY policy mutation the
+ * Tailscale API offers (there is no per-rule endpoint), and keeping the merge in
+ * the adapter (not behind this seam) is what makes the non-destructive invariant
+ * directly unit-testable against an in-memory fake.
+ */
+export interface TailscaleAclClient {
+  /** Fetch the current policy plus its concurrency token. */
+  fetchPolicy(): Promise<AclPolicyDocument>;
+  /** Write `policy` back, guarded by `etag` (sent as `If-Match`). */
+  savePolicy(policy: AclPolicy, etag: string): Promise<void>;
+}
+
+/**
+ * Opt-in ACL provisioning for {@link TailscaleTunnel}: the API {@link client} plus
+ * the single scoped {@link grant} that IS the adapter's entire managed scope. On
+ * establish the grant is appended; on teardown the one grant equal to it is
+ * removed. Everything else in the operator's policy is preserved verbatim — the
+ * adapter never owns the whole policy and never edits an operator rule in place.
+ *
+ * The grant is operator-declared (typically destined for a ccctl-owned tag the
+ * operator set `tagOwners` for), so *which* devices it admits is the operator's
+ * call; the adapter only brackets it to the session lifecycle.
+ */
+export interface TailscaleAclProvisioning {
+  readonly client: TailscaleAclClient;
+  readonly grant: AclGrant;
+}
+
+/**
+ * Construction config for {@link defaultTailscaleAclClient}. The {@link token} is
+ * a bearer credential — a Tailscale API access token, or (recommended) an OAuth
+ * client's short-lived access token with the `acl` scope. It is supplied HERE and
+ * captured in the returned client's closure; it never lands on a tunnel instance,
+ * an {@link EstablishedTunnel} / {@link TunnelStatus}, the policy document, or a
+ * log line (see ADR-002 — non-persisting credential posture).
+ */
+export interface TailscaleAclClientConfig {
+  /** The bearer credential sent as `Authorization: Bearer <token>`. */
+  readonly token: string;
+  /** The tailnet to target; `"-"` (the default) means the credential's own tailnet. */
+  readonly tailnet?: string;
+  /** API base URL; defaults to Tailscale's public API. Overridable for tests / self-host. */
+  readonly baseUrl?: string;
+  /** The `fetch` implementation; defaults to the global. Injectable so the client is unit-testable. */
+  readonly fetch?: typeof globalThis.fetch;
+}
+
+/** Tailscale's public API base — where {@link defaultTailscaleAclClient} talks by default. */
+const TAILSCALE_API_BASE = "https://api.tailscale.com/api/v2";
+
+/**
+ * The default {@link TailscaleAclClient}: the real Tailscale-API implementation,
+ * to {@link defaultCommandRunner} what the CLI seam has. `GET`/`POST` the tailnet
+ * `acl` endpoint with a `Bearer` credential and `If-Match` optimistic concurrency.
+ * `fetch` is injectable (defaulting to the global) so the wiring — credential
+ * header, ETag round-trip, error handling — is exercised with a fake, no network.
+ */
+export function defaultTailscaleAclClient(config: TailscaleAclClientConfig): TailscaleAclClient {
+  const tailnet = config.tailnet ?? "-";
+  const baseUrl = config.baseUrl ?? TAILSCALE_API_BASE;
+  const doFetch = config.fetch ?? globalThis.fetch;
+  const aclUrl = `${baseUrl}/tailnet/${encodeURIComponent(tailnet)}/acl`;
+  // The credential is captured HERE and only ever leaves as an `Authorization`
+  // request header — never stored on the tunnel, put on an EstablishedTunnel /
+  // TunnelStatus / the policy, or logged (ADR-002).
+  const authorization = `Bearer ${config.token}`;
+  return {
+    async fetchPolicy(): Promise<AclPolicyDocument> {
+      const response = await doFetch(aclUrl, {
+        method: "GET",
+        headers: { Accept: "application/json", Authorization: authorization },
+      });
+      if (!response.ok) {
+        throw new Error(
+          `ccctl: tailscale ACL fetch failed (HTTP ${response.status}) — check the API credential and tailnet`,
+        );
+      }
+      const etag = response.headers.get("ETag") ?? "";
+      const policy: unknown = await response.json();
+      if (typeof policy !== "object" || policy === null || Array.isArray(policy)) {
+        throw new Error("ccctl: tailscale ACL response is not a JSON object");
+      }
+      // A non-null, non-array object is already assignable to AclPolicy (its values
+      // are `unknown`); the adapter narrows each key it touches at the use site.
+      return { policy: policy as AclPolicy, etag };
+    },
+    async savePolicy(policy: AclPolicy, etag: string): Promise<void> {
+      const response = await doFetch(aclUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: authorization,
+          // If-Match carries the fetchPolicy ETag: the write is rejected if the
+          // operator changed the policy meanwhile, so a concurrent hand-edit is
+          // never silently overwritten. Omitted only if the fetch reported none.
+          ...(etag === "" ? {} : { "If-Match": etag }),
+        },
+        body: JSON.stringify(policy),
+      });
+      if (!response.ok) {
+        throw new Error(`ccctl: tailscale ACL save failed (HTTP ${response.status}) — the policy was not modified`);
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Tailscale
 // ---------------------------------------------------------------------------
 
@@ -197,15 +348,30 @@ interface TailscaleSelf {
  * the mapping this `establish` brought up — a fresh instance per `establish`
  * (see {@link ADAPTERS}). Which authenticated devices may actually reach the
  * endpoint is governed by the tailnet's own ACL policy — operator-owned central
- * state the adapter relies on and deliberately never provisions or overwrites
- * (mutating it per-establish would clobber the operator's hand-authored policy,
+ * state the adapter relies on by default and never edits in place (owning the
+ * whole policy per-establish would clobber the operator's hand-authored rules,
  * exactly the blunt-instrument reach `teardown` avoids by not running `serve
  * reset`).
+ *
+ * Passing a {@link TailscaleAclProvisioning} opts into narrowing that policy: the
+ * adapter appends the one operator-declared scoped grant on `establish` (after
+ * mandatory-auth is verified) and removes it on `teardown`, via the injected
+ * {@link TailscaleAclClient} API seam. It is additive and non-destructive — the
+ * read/modify/write preserves every operator rule verbatim and touches only its
+ * own managed grant — and fail-closed: a failed revert leaves the tunnel
+ * established and retryable, never an orphaned grant on the success path.
  */
 export class TailscaleTunnel implements Tunnel {
   readonly kind = "tailscale" as const;
 
   readonly #runner: CommandRunner;
+
+  /**
+   * Opt-in ACL provisioning, or `null` to rely on the operator's policy (the
+   * default). When set, `establish` appends the scoped grant and `teardown`
+   * removes it; when `null`, the adapter never touches tailnet ACL policy.
+   */
+  readonly #provisioning: TailscaleAclProvisioning | null;
 
   /**
    * The loopback endpoint currently served, recorded the moment `tailscale
@@ -225,8 +391,24 @@ export class TailscaleTunnel implements Tunnel {
    */
   #established: EstablishedTunnel | null = null;
 
-  constructor(runner: CommandRunner = defaultCommandRunner) {
+  /**
+   * The grant this `establish` appended to the operator's policy, recorded only
+   * AFTER the write succeeds — so a failed provision leaves nothing to revert.
+   * `teardown` removes the one grant equal to it; `null` when nothing is
+   * provisioned (no provisioning injected, provision not yet run, or reverted).
+   */
+  #provisionedGrant: AclGrant | null = null;
+
+  /**
+   * Whether this `establish` created the policy's `grants` key (it was absent
+   * before). If so, `teardown` deletes the now-empty key to leave the
+   * operator's policy as it was found, rather than a stray `grants: []`.
+   */
+  #createdGrantsKey = false;
+
+  constructor(runner: CommandRunner = defaultCommandRunner, provisioning: TailscaleAclProvisioning | null = null) {
     this.#runner = runner;
+    this.#provisioning = provisioning;
   }
 
   async establish(local: HostEndpoint): Promise<EstablishedTunnel> {
@@ -248,7 +430,20 @@ export class TailscaleTunnel implements Tunnel {
     // stays cleanly releasable.
     this.#servedLocal = local;
 
-    const established: EstablishedTunnel = { kind: this.kind, publicHost: await this.#resolveReachableHost() };
+    // Resolve the reachable host, which also enforces mandatory tunnel-auth.
+    const publicHost = await this.#resolveReachableHost();
+
+    // Only NOW — the serve is up and the node is a verified, authenticated tailnet
+    // member — provision the scoped ACL grant, if provisioning was injected. Opt-in:
+    // with none, this is skipped and the adapter relies on the operator's policy, so
+    // a completed establish still drives exactly `serve` + `status` (no policy write).
+    // Provisioning last means a provision failure rejects establish with the serve
+    // still cleanly releasable and no grant left behind (nothing was recorded).
+    if (this.#provisioning !== null) {
+      await this.#provisionAcl(this.#provisioning);
+    }
+
+    const established: EstablishedTunnel = { kind: this.kind, publicHost };
     this.#established = established;
     return established;
   }
@@ -265,9 +460,20 @@ export class TailscaleTunnel implements Tunnel {
   }
 
   async teardown(): Promise<void> {
+    // Revert the scoped ACL grant FIRST — withdraw authorization before releasing
+    // the serve (fail-closed) and leave no orphaned grant behind. Reached only when
+    // `establish` provisioned one; if it rejects, state is preserved and the serve
+    // is NOT turned off, so `teardown` can be retried (symmetric with the serve-off
+    // retry below). A grant is only ever recorded once its write succeeded, and
+    // `#provisioning` is non-`null` whenever a grant was recorded.
+    const provisioned = this.#provisionedGrant;
+    if (provisioned !== null && this.#provisioning !== null) {
+      await this.#revertAcl(this.#provisioning, provisioned);
+    }
+
     const served = this.#servedLocal;
     if (served === null) {
-      return; // Nothing established (or already torn down) — a clean no-op.
+      return; // Nothing served (or already released) — a clean no-op.
     }
     // Turn off exactly the mapping `establish` turned on: the same serve target
     // plus a trailing `off` (`tailscale serve --bg <target> off`). Targeted, so
@@ -307,6 +513,64 @@ export class TailscaleTunnel implements Tunnel {
       );
     }
     return host;
+  }
+
+  /**
+   * Append the scoped grant to the operator's policy, non-destructively:
+   * read → clone → push our grant onto `grants` (creating the key only if absent)
+   * → write back under the fetched `If-Match` ETag. Every operator key is carried
+   * verbatim; only `grants` is touched. Records what was added — and whether the
+   * key was created — AFTER the write succeeds, so `teardown` reverts exactly this
+   * and a failed write leaves nothing recorded to revert.
+   */
+  async #provisionAcl(provisioning: TailscaleAclProvisioning): Promise<void> {
+    const { client, grant } = provisioning;
+    const { policy, etag } = await client.fetchPolicy();
+
+    const existing = policy.grants;
+    const hadGrants = Array.isArray(existing);
+    // Shallow-clone the top level (operator keys carried by reference, never
+    // mutated) and give `grants` a fresh array so the operator's object is untouched.
+    const next: AclPolicy = {
+      ...policy,
+      grants: [...(hadGrants ? (existing as readonly unknown[]) : []), structuredClone(grant)],
+    };
+
+    await client.savePolicy(next, etag);
+    this.#provisionedGrant = grant;
+    this.#createdGrantsKey = !hadGrants;
+  }
+
+  /**
+   * Remove the one grant equal to `provisioned` from the operator's policy:
+   * read → drop exactly that grant from `grants` (a single match, so a duplicate
+   * operator grant of the same shape is left alone) → write back under `If-Match`.
+   * If we created the `grants` key and it is now empty, delete it to leave the
+   * operator's policy as it was found; if an operator grant was added meanwhile, the
+   * key stays. Writes only when a grant was actually removed. State is cleared only
+   * once the write succeeds (or there was nothing to remove), so a failed write is
+   * retryable and never orphans the grant.
+   */
+  async #revertAcl(provisioning: TailscaleAclProvisioning, provisioned: AclGrant): Promise<void> {
+    const { client } = provisioning;
+    const { policy, etag } = await client.fetchPolicy();
+
+    const existing = policy.grants;
+    if (Array.isArray(existing)) {
+      const { result, removed } = removeFirstEqual(existing, provisioned);
+      if (removed) {
+        const next: AclPolicy = { ...policy };
+        if (this.#createdGrantsKey && result.length === 0) {
+          delete next.grants;
+        } else {
+          next.grants = result;
+        }
+        await client.savePolicy(next, etag);
+      }
+    }
+
+    this.#provisionedGrant = null;
+    this.#createdGrantsKey = false;
   }
 }
 
@@ -378,6 +642,57 @@ function tailnetHostFromSelf(self: TailscaleSelf): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Structural equality for the JSON values an ACL grant is made of (objects,
+ * arrays, and primitives). Used to remove exactly the grant this adapter added on
+ * teardown, comparing by value because the policy is re-fetched (and may be
+ * re-serialized by the API) between provision and revert — reference identity
+ * would not survive the round-trip. Object key ORDER is irrelevant; key SET and
+ * per-key values must match.
+ */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+    return false;
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    return a.every((value, index) => deepEqual(value, b[index]));
+  }
+  const aObject = a as Record<string, unknown>;
+  const bObject = b as Record<string, unknown>;
+  const aKeys = Object.keys(aObject);
+  if (aKeys.length !== Object.keys(bObject).length) {
+    return false;
+  }
+  return aKeys.every(
+    (key) => Object.prototype.hasOwnProperty.call(bObject, key) && deepEqual(aObject[key], bObject[key]),
+  );
+}
+
+/**
+ * Return `items` without its FIRST element {@link deepEqual} to `target`, plus
+ * whether one was removed. A single match (not all), so a duplicate operator
+ * grant of the same shape is never collaterally dropped — the adapter added
+ * exactly one, so it removes exactly one.
+ */
+function removeFirstEqual(items: readonly unknown[], target: unknown): { result: unknown[]; removed: boolean } {
+  const result: unknown[] = [];
+  let removed = false;
+  for (const item of items) {
+    if (!removed && deepEqual(item, target)) {
+      removed = true;
+      continue;
+    }
+    result.push(item);
+  }
+  return { result, removed };
 }
 
 // ---------------------------------------------------------------------------

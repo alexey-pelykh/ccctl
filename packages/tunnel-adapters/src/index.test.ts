@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { HostEndpoint } from "@ccctl/core";
 import {
   ADAPTERS,
   CloudflareTunnel,
+  defaultTailscaleAclClient,
   HeadscaleTunnel,
   TailscaleTunnel,
+  type AclGrant,
+  type AclPolicy,
   type CommandOutput,
   type CommandRunner,
+  type TailscaleAclClient,
   type TunnelKind,
 } from "./index.js";
 
@@ -320,5 +324,271 @@ describe("ADAPTERS registry (consumed by @ccctl/cli)", () => {
       // Fresh instance per call — a tunnel is a stateful lifecycle object.
       expect(first).not.toBe(second);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ACL provisioning (#148)
+// ---------------------------------------------------------------------------
+
+/** A representative operator-authored policy the adapter must never disturb. */
+const OPERATOR_POLICY: AclPolicy = {
+  acls: [{ action: "accept", src: ["group:eng"], dst: ["*:*"] }],
+  groups: { "group:eng": ["alice@example.com"] },
+  tagOwners: { "tag:ccctl": ["group:eng"] },
+  ssh: [{ action: "accept", src: ["autogroup:member"], dst: ["autogroup:self"], users: ["autogroup:nonroot"] }],
+};
+
+/** The single ccctl-owned, scoped grant the adapter appends/removes (its managed scope). */
+const CCCTL_GRANT: AclGrant = { src: ["group:eng"], dst: ["tag:ccctl"], ip: ["tcp:*"] };
+
+/**
+ * An in-memory {@link TailscaleAclClient} — the injected API seam, so provisioning
+ * is exercised with no live tailnet and no token. Holds a policy + ETag; a save
+ * with a stale ETag is rejected (optimistic concurrency, like the real API), and
+ * `structuredClone` on both read and write means the adapter can never alias the
+ * stored policy — a change only lands through `savePolicy`, exactly as over HTTP.
+ */
+function fakeAclClient(initial: AclPolicy): {
+  client: TailscaleAclClient;
+  current: () => AclPolicy;
+  fetchCount: () => number;
+  saveCount: () => number;
+} {
+  let policy = structuredClone(initial);
+  let version = 0;
+  let fetches = 0;
+  let saves = 0;
+  const client: TailscaleAclClient = {
+    fetchPolicy() {
+      fetches += 1;
+      return Promise.resolve({ policy: structuredClone(policy), etag: `etag-${version}` });
+    },
+    savePolicy(next, etag) {
+      if (etag !== `etag-${version}`) {
+        return Promise.reject(new Error(`ccctl-test: stale ETag ${etag}`));
+      }
+      policy = structuredClone(next);
+      version += 1;
+      saves += 1;
+      return Promise.resolve();
+    },
+  };
+  return { client, current: () => structuredClone(policy), fetchCount: () => fetches, saveCount: () => saves };
+}
+
+/** Read a single header value regardless of the `HeadersInit` shape the client used. */
+function headerValue(headers: HeadersInit | undefined, name: string): string | null {
+  return new Headers(headers).get(name);
+}
+
+describe("TailscaleTunnel ACL provisioning (AC: opt-in, additive, non-destructive)", () => {
+  it("appends only its scoped grant on establish, creating the grants key, preserving every operator rule", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+
+    await new TailscaleTunnel(runner, { client: acl.client, grant: CCCTL_GRANT }).establish(LOOPBACK);
+
+    const after = acl.current();
+    // Every operator section is carried through verbatim …
+    expect(after.acls).toEqual(OPERATOR_POLICY.acls);
+    expect(after.groups).toEqual(OPERATOR_POLICY.groups);
+    expect(after.tagOwners).toEqual(OPERATOR_POLICY.tagOwners);
+    expect(after.ssh).toEqual(OPERATOR_POLICY.ssh);
+    // … and exactly our one scoped grant is added.
+    expect(after.grants).toEqual([CCCTL_GRANT]);
+  });
+
+  it("removes exactly its grant on teardown, restoring the operator's policy unchanged", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const tunnel = new TailscaleTunnel(runner, { client: acl.client, grant: CCCTL_GRANT });
+
+    await tunnel.establish(LOOPBACK);
+    await tunnel.teardown();
+
+    // The `grants` key the adapter created is gone → identical to the original.
+    expect(acl.current()).toEqual(OPERATOR_POLICY);
+    expect(acl.current()).not.toHaveProperty("grants");
+  });
+
+  it("appends to and prunes from an existing operator grants list without disturbing operator grants", async () => {
+    const operatorGrant = { src: ["group:ops"], dst: ["tag:infra"], ip: ["tcp:22"] };
+    const acl = fakeAclClient({ ...OPERATOR_POLICY, grants: [operatorGrant] });
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const tunnel = new TailscaleTunnel(runner, { client: acl.client, grant: CCCTL_GRANT });
+
+    await tunnel.establish(LOOPBACK);
+    // Appended after the operator's own grant, which is untouched.
+    expect(acl.current().grants).toEqual([operatorGrant, CCCTL_GRANT]);
+
+    await tunnel.teardown();
+    // Only ours removed; the operator's grant AND the key it owns remain.
+    expect(acl.current().grants).toEqual([operatorGrant]);
+  });
+
+  it("drives only serve + status on the CLI when provisioning — policy writes ride the API seam", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    const { runner, calls } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+
+    await new TailscaleTunnel(runner, { client: acl.client, grant: CCCTL_GRANT }).establish(LOOPBACK);
+
+    // The `tailscale` binary is still only ever `serve` then `status` — the ACL
+    // write went through the injected API client, never a policy CLI verb.
+    expect(calls.map((c) => c.args[0])).toEqual(["serve", "status"]);
+    expect(acl.saveCount()).toBe(1);
+  });
+
+  it("provisions only after mandatory tunnel-auth passes: an unauthenticated node writes no policy", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." }, "NeedsLogin")));
+
+    await expect(
+      new TailscaleTunnel(runner, { client: acl.client, grant: CCCTL_GRANT }).establish(LOOPBACK),
+    ).rejects.toThrow(/mandatory tunnel-auth/);
+
+    // The policy was never even read, let alone written.
+    expect(acl.fetchCount()).toBe(0);
+    expect(acl.current()).toEqual(OPERATOR_POLICY);
+  });
+
+  it("leaves the operator policy intact and the serve releasable when the provisioning write fails (half-up)", async () => {
+    let fetches = 0;
+    const failing: TailscaleAclClient = {
+      fetchPolicy: () => {
+        fetches += 1;
+        return Promise.resolve({ policy: structuredClone(OPERATOR_POLICY), etag: "etag-0" });
+      },
+      savePolicy: () => Promise.reject(new Error("ccctl-test: acl save boom")),
+    };
+    const { runner, calls } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const tunnel = new TailscaleTunnel(runner, { client: failing, grant: CCCTL_GRANT });
+
+    await expect(tunnel.establish(LOOPBACK)).rejects.toThrow(/acl save boom/);
+    // Provisioning failed → not a usable up.
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: false });
+
+    await tunnel.teardown();
+    // teardown attempted NO ACL revert (nothing was recorded) — only establish read …
+    expect(fetches).toBe(1);
+    // … yet the serve is still turned off cleanly.
+    expect(calls.some((c) => c.args.join(" ") === "serve --bg http://127.0.0.1:4321 off")).toBe(true);
+  });
+
+  it("stays established and retries cleanly when the teardown revert write fails once", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    let failRevertOnce = true;
+    const flaky: TailscaleAclClient = {
+      fetchPolicy: () => acl.client.fetchPolicy(),
+      savePolicy: (next, etag) => {
+        // Fail the revert write (the 2nd save overall) exactly once; retries pass.
+        if (acl.saveCount() === 1 && failRevertOnce) {
+          failRevertOnce = false;
+          return Promise.reject(new Error("ccctl-test: revert boom"));
+        }
+        return acl.client.savePolicy(next, etag);
+      },
+    };
+    const { runner, calls } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const tunnel = new TailscaleTunnel(runner, { client: flaky, grant: CCCTL_GRANT });
+    await tunnel.establish(LOOPBACK);
+
+    // Revert write fails → teardown rejects, tunnel stays up, serve NOT yet released.
+    await expect(tunnel.teardown()).rejects.toThrow(/revert boom/);
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: true, publicHost: "host.ts.net" });
+    expect(calls.some((c) => c.args.includes("off"))).toBe(false);
+
+    // Retry: revert now succeeds, then the serve is turned off → fully clean.
+    await tunnel.teardown();
+    expect(acl.current()).toEqual(OPERATOR_POLICY);
+    expect(calls.some((c) => c.args.join(" ") === "serve --bg http://127.0.0.1:4321 off")).toBe(true);
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: false });
+  });
+
+  it("keeps the credential off the tunnel's outputs: establish / status carry only kind + publicHost", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const tunnel = new TailscaleTunnel(runner, { client: acl.client, grant: CCCTL_GRANT });
+
+    const established = await tunnel.establish(LOOPBACK);
+
+    // No credential/grant field is ever surfaced — the outward shapes are unchanged.
+    expect(Object.keys(established).sort()).toEqual(["kind", "publicHost"]);
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: true, publicHost: "host.ts.net" });
+  });
+});
+
+describe("defaultTailscaleAclClient (AC: credential rides the injectable seam, never logged)", () => {
+  it("fetches with a Bearer credential + reads the ETag; saves with If-Match and the JSON body", async () => {
+    const token = "tskey-secret-DO-NOT-LOG";
+    const policy = { acls: [{ action: "accept" }] };
+    const calls: { url: string; init: RequestInit }[] = [];
+    const fetchStub: typeof globalThis.fetch = (input, init) => {
+      calls.push({ url: String(input), init: init ?? {} });
+      return Promise.resolve(
+        (init?.method ?? "GET") === "GET"
+          ? new Response(JSON.stringify(policy), { status: 200, headers: { ETag: '"v42"' } })
+          : new Response("", { status: 200 }),
+      );
+    };
+
+    const client = defaultTailscaleAclClient({ token, tailnet: "example.com", fetch: fetchStub });
+    const doc = await client.fetchPolicy();
+    expect(doc).toEqual({ policy, etag: '"v42"' });
+    await client.savePolicy({ acls: [], grants: [{ src: ["*"] }] }, '"v42"');
+
+    const [get, post] = calls;
+    expect(get.url).toBe("https://api.tailscale.com/api/v2/tailnet/example.com/acl");
+    expect(headerValue(get.init.headers, "Authorization")).toBe(`Bearer ${token}`);
+    expect(post.init.method).toBe("POST");
+    expect(headerValue(post.init.headers, "Authorization")).toBe(`Bearer ${token}`);
+    // The fetched ETag rides back as If-Match — optimistic concurrency on the write.
+    expect(headerValue(post.init.headers, "If-Match")).toBe('"v42"');
+    expect(JSON.parse(String(post.init.body))).toEqual({ acls: [], grants: [{ src: ["*"] }] });
+  });
+
+  it("targets the credential's own tailnet by default (tailnet `-`)", async () => {
+    const urls: string[] = [];
+    const fetchStub: typeof globalThis.fetch = (input) => {
+      urls.push(String(input));
+      return Promise.resolve(new Response(JSON.stringify({}), { headers: { ETag: "" } }));
+    };
+
+    await defaultTailscaleAclClient({ token: "t", fetch: fetchStub }).fetchPolicy();
+
+    expect(urls[0]).toBe("https://api.tailscale.com/api/v2/tailnet/-/acl");
+  });
+
+  it("uses the credential but never logs it", async () => {
+    const token = "tskey-secret-NEVER-LOGGED";
+    const logs: string[] = [];
+    for (const method of ["log", "info", "warn", "error", "debug"] as const) {
+      vi.spyOn(console, method).mockImplementation((...args: unknown[]) => {
+        logs.push(args.map(String).join(" "));
+      });
+    }
+    const fetchStub: typeof globalThis.fetch = (_input, init) =>
+      Promise.resolve(
+        (init?.method ?? "GET") === "GET"
+          ? new Response(JSON.stringify({ acls: [] }), { headers: { ETag: '"v1"' } })
+          : new Response("", { status: 200 }),
+      );
+
+    const client = defaultTailscaleAclClient({ token, fetch: fetchStub });
+    const { etag } = await client.fetchPolicy();
+    await client.savePolicy({ acls: [] }, etag);
+    vi.restoreAllMocks();
+
+    expect(logs.join("\n")).not.toContain(token);
+  });
+
+  it("rejects a non-OK API response on both fetch and save", async () => {
+    const forbidden: typeof globalThis.fetch = () => Promise.resolve(new Response("no", { status: 403 }));
+    await expect(defaultTailscaleAclClient({ token: "t", fetch: forbidden }).fetchPolicy()).rejects.toThrow(/HTTP 403/);
+
+    const conflict: typeof globalThis.fetch = () => Promise.resolve(new Response("stale", { status: 412 }));
+    await expect(defaultTailscaleAclClient({ token: "t", fetch: conflict }).savePolicy({}, '"v1"')).rejects.toThrow(
+      /HTTP 412/,
+    );
   });
 });
