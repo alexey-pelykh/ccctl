@@ -41,7 +41,16 @@
  *     inconclusive`) against the golden's pinned shapes, so a green hermetic run plus a
  *     green live run means the golden encodes the wire a real worker actually speaks.
  *     Fenced on CCCTL_E2E + CCCTL_SDK_URL + ANTHROPIC_API_KEY; skips-never-fakes (see
- *     `control-plane.e2e.test.ts`).
+ *     `control-plane.e2e.test.ts`); and
+ *   - the hermetic IDLE-HOLD regression (#167) — {@link assertIdleHeldPastLivenessTimeout}
+ *     + {@link classifyIdleHold}, the deterministic proof of the server's #166
+ *     downstream-liveness fix. The captured-wire golden pins each leg's SHAPE but is
+ *     blind to whether the server HOLDS the worker downstream alive over time; this drives
+ *     a worker STAND-IN embodying the reader's ~45s liveness contract against the real
+ *     server (booted with a SHORT liveness interval) and asserts the idle downstream stays
+ *     open past the timeout, with a `client_event` liveness frame in the window and no drop /
+ *     re-register. A starved negative control self-guards the "no drop" verdict (the #134
+ *     posture). Hermetic — gates on every run (see `worker-idle-hold.e2e.test.ts`).
  *
  * The live-worker oracle drives the full happy path with a REAL patched worker and a
  * real egress to api.anthropic.com — fenced to the credentialed wave; the hermetic
@@ -80,3 +89,4 @@ export * from "./one-session-harness.js";
 export * from "./multi-session-harness.js";
 export * from "./bearer-canary.js";
 export * from "./live-worker-oracle.js";
+export * from "./worker-idle-hold.js";
