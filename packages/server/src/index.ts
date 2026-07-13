@@ -94,6 +94,16 @@ import {
 // session-create-wire.test.ts.
 export { toSessionCreateResponseWire, type SessionCreateResponseWire } from "./session-create-wire.js";
 
+// Re-export the browser-facing session-namespace wire types (#20 list, #31 launch) on the
+// public surface, for the SAME contract-consumer reason as the §2 session-create wire above:
+// a UI client — the web UI, and now the `ccctl` CLI's launch/attach on-ramp (#38) — asserts
+// against the PINNED camelCase projection instead of re-transcribing its shape, so a wire drift
+// breaks the consumer's typecheck rather than silently mismatching at runtime. `SessionSummaryWire`
+// is one entry of the `GET /api/sessions` list; `LaunchAcceptedWire` is the `POST /api/sessions`
+// launch-accepted body. Both are defined + wire-tested in ui-sessions.ts / ui-session-launch.ts.
+export type { SessionSummaryWire } from "./ui-sessions.js";
+export type { LaunchAcceptedWire } from "./ui-session-launch.js";
+
 // Re-export the baseline startup guarantees (#14) on the public surface. The daemon
 // (@ccctl/cli's `serve`) applies them before binding, and any embedder gets the same
 // refuse-start-without-auth + localhost-bind baseline. Defined and unit-tested in

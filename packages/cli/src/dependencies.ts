@@ -18,6 +18,7 @@
 import { spawn } from "node:child_process";
 import { startServer, type CcctlServer, type ServerConfig } from "@ccctl/server";
 import { ADAPTERS, type Tunnel, type TunnelKind } from "@ccctl/tunnel-adapters";
+import { defaultSessionClient, type SessionClient } from "./session-client.js";
 
 /** The command-line name of the external patcher the `patch` verb delegates to. */
 export const PATCHER_BIN = "ccctl-patch";
@@ -34,6 +35,12 @@ export interface CliDependencies {
   readonly adapters: Record<TunnelKind, () => Tunnel>;
   /** Delegate to the external patcher (the `patch` verb) — {@link defaultRunPatcher} in production. */
   readonly runPatcher: (args: readonly string[]) => Promise<void>;
+  /**
+   * The `/api/sessions` client the `launch` / `attach` verbs drive against a running daemon
+   * (#38) — {@link defaultSessionClient} in production. Behind a seam so the verbs are exercised
+   * with a fake (no real socket, no running daemon), the same as the three seams above.
+   */
+  readonly sessionClient: SessionClient;
 }
 
 /**
@@ -75,9 +82,10 @@ export function defaultRunPatcher(args: readonly string[]): Promise<void> {
   });
 }
 
-/** The production seams: the real daemon, the real tunnel adapters, and the real patcher delegation. */
+/** The production seams: the real daemon, the real tunnel adapters, the real patcher delegation, and the real session client. */
 export const defaultDependencies: CliDependencies = {
   startServer,
   adapters: ADAPTERS,
   runPatcher: defaultRunPatcher,
+  sessionClient: defaultSessionClient,
 };

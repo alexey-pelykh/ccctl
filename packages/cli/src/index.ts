@@ -19,13 +19,33 @@
  * and expose it via a `tunnel`. `serve` still enforces the baseline startup guards
  * (refuse-start-without-auth + localhost-bind, #14) BEFORE anything binds; completing
  * each guard to spec is tracked separately (the auth credential boundary is #57, the
- * full localhost-bind guarantee is #58). This module builds the command tree; `cli.ts`
- * is the thin executable that runs it.
+ * full localhost-bind guarantee is #58).
+ *
+ * Two more verbs BEGIN the launch/attach UX (#38) — unlike the three above (which stand the
+ * local setup up), these are CLIENTS of an already-running daemon's browser-facing session
+ * namespace, driving it from the command line the same way the phone does:
+ *
+ *   - `ccctl launch` — drive a UC2 "New session" launch (`POST /api/sessions`) on the running
+ *     daemon and report how to attach the surface it brought up.
+ *   - `ccctl attach` — the UC1 attach on-ramp: list the daemon's running sessions
+ *     (`GET /api/sessions`) to pick one to attach to.
+ *
+ * Both go THROUGH the daemon, so a CLI-launched session lands in the same `/api/sessions`
+ * list as the phone-driven ones. This is the on-ramp only: completing the attach (selecting a
+ * session and taking over its terminal) and the full "New session" UX is #72. This module builds
+ * the command tree; `cli.ts` is the thin executable that runs it.
  */
 
 import { Command } from "commander";
-import { formatAuthority, type HostEndpoint } from "@ccctl/core";
-import { DEFAULT_HOST, requireLocalServerAuth, resolveBindHost } from "@ccctl/server";
+import {
+  formatAuthority,
+  isPermissionMode,
+  PERMISSION_MODES,
+  type HostEndpoint,
+  type PermissionMode,
+  type SessionActivity,
+} from "@ccctl/core";
+import { DEFAULT_HOST, requireLocalServerAuth, resolveBindHost, type SessionLaunchOptions } from "@ccctl/server";
 import type { TunnelKind } from "@ccctl/tunnel-adapters";
 import { defaultDependencies, type CliDependencies } from "./dependencies.js";
 
@@ -72,6 +92,36 @@ async function establishAndReport(
 ): Promise<void> {
   const established = await adapters[kind]().establish(local);
   console.log(`ccctl: reachable via ${established.kind} at ${established.publicHost}`);
+}
+
+/**
+ * Narrow an operator-supplied permission mode to a {@link PermissionMode}, failing closed on an
+ * unknown one — the same fail-fast, no-side-effects discipline as {@link parsePort} /
+ * {@link requireTunnelKind}, so a typo is a clear upfront error BEFORE any network round-trip
+ * rather than a daemon-side `400`. The accepted set is the pinned `@ccctl/core` one, so it never
+ * drifts from what a launch actually honors.
+ */
+function requirePermissionMode(value: string): PermissionMode {
+  if (!isPermissionMode(value)) {
+    throw new Error(`ccctl: invalid permission mode "${value}" — expected one of ${PERMISSION_MODES.join(", ")}`);
+  }
+  return value;
+}
+
+/**
+ * Render a session's derived {@link SessionActivity} as a one-line phrase for the `attach`
+ * on-ramp list. Exhaustive over the union so a new activity kind is a compile error here rather
+ * than a silently-dropped state.
+ */
+function describeActivity(activity: SessionActivity): string {
+  switch (activity.kind) {
+    case "running":
+      return "running";
+    case "requires_action":
+      return `requires action — ${activity.detail}`;
+    case "idle":
+      return "idle";
+  }
 }
 
 /**
@@ -157,6 +207,75 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       const port = parsePort(options.port);
 
       await establishAndReport(deps.adapters, kind, { host, port });
+    });
+
+  // --- launch: drive a UC2 "New session" launch on a running daemon -----------------
+  program
+    .command("launch")
+    .description("Launch a new session (UC2) on a running ccctl daemon and report how to attach it")
+    .option("-p, --port <port>", "loopback port the daemon is on", "4321")
+    .option("--host <host>", "loopback host the daemon is on", DEFAULT_HOST)
+    .option("--cwd <path>", "working directory to root the session at", process.cwd())
+    .option("-m, --permission-mode <mode>", `permission mode (${PERMISSION_MODES.join(" | ")})`, "default")
+    .option("--project <name>", "logical project label carried to the session surface")
+    .option("--initial-prompt <text>", "seed the session with a first prompt")
+    .action(
+      async (options: {
+        port: string;
+        host: string;
+        cwd: string;
+        permissionMode: string;
+        project?: string;
+        initialPrompt?: string;
+      }) => {
+        // Validate every input up front — a bad host/port/mode fails fast with no network round-trip,
+        // the same fail-closed-before-side-effects discipline `serve` applies before binding. The
+        // optionals are OMITTED (not set to `undefined`) when absent, matching the daemon's launch
+        // body under `exactOptionalPropertyTypes`.
+        const target: HostEndpoint = { host: resolveBindHost(options.host), port: parsePort(options.port) };
+        const launchOptions: SessionLaunchOptions = {
+          cwd: options.cwd,
+          permissionMode: requirePermissionMode(options.permissionMode),
+          ...(options.project !== undefined ? { project: options.project } : {}),
+          ...(options.initialPrompt !== undefined ? { initialPrompt: options.initialPrompt } : {}),
+        };
+
+        const accepted = await deps.sessionClient.launch(target, launchOptions);
+        console.log(`ccctl: launched a new session on ${serverUrl(target.host, target.port)}`);
+        // The tmux backend is fully attachable (a concrete `tmux attach` line); the owned-pty
+        // fallback surfaces its degradation instead of pretending otherwise — pass the daemon's
+        // own hint through either way.
+        console.log(
+          accepted.attachable
+            ? `ccctl: attach it with — ${accepted.hint}`
+            : `ccctl: this surface is not fully attachable — ${accepted.hint}`,
+        );
+        // The launch confirms a terminal came up; the launched worker registers itself over the
+        // bridge and then shows up in `ccctl attach` on its own (a later credentialed wave).
+        console.log("ccctl: it joins `ccctl attach` once its worker registers.");
+      },
+    );
+
+  // --- attach: the UC1 attach on-ramp — list a running daemon's sessions ------------
+  program
+    .command("attach")
+    .description("List a running ccctl daemon's sessions to attach to (the UC1 attach on-ramp)")
+    .option("-p, --port <port>", "loopback port the daemon is on", "4321")
+    .option("--host <host>", "loopback host the daemon is on", DEFAULT_HOST)
+    .action(async (options: { port: string; host: string }) => {
+      const target: HostEndpoint = { host: resolveBindHost(options.host), port: parsePort(options.port) };
+      // The list carries EVERY tracked session, whatever launched it — so a phone-driven session
+      // and a `ccctl launch` one enumerate side by side here (the shared `/api/sessions` collection).
+      const sessions = await deps.sessionClient.list(target);
+      const where = serverUrl(target.host, target.port);
+      if (sessions.length === 0) {
+        console.log(`ccctl: no sessions on ${where} yet — launch one with \`ccctl launch\`.`);
+        return;
+      }
+      console.log(`ccctl: ${sessions.length} session${sessions.length === 1 ? "" : "s"} on ${where}:`);
+      for (const session of sessions) {
+        console.log(`  ${session.id}  [${session.status}] ${describeActivity(session.activity)}`);
+      }
     });
 
   return program;

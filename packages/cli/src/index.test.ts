@@ -2,9 +2,17 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { LOCAL_SERVER_AUTH_ENV, type CcctlServer } from "@ccctl/server";
+import type { HostEndpoint } from "@ccctl/core";
+import {
+  LOCAL_SERVER_AUTH_ENV,
+  type CcctlServer,
+  type LaunchAcceptedWire,
+  type SessionLaunchOptions,
+  type SessionSummaryWire,
+} from "@ccctl/server";
 import type { EstablishedTunnel, Tunnel, TunnelKind } from "@ccctl/tunnel-adapters";
 import type { CliDependencies } from "./dependencies.js";
+import type { SessionClient } from "./session-client.js";
 import { buildProgram } from "./index.js";
 
 // The verbs orchestrate three real capabilities (daemon, tunnels, patcher) behind the
@@ -31,6 +39,10 @@ function makeServer(host: string, port: number, close: () => Promise<void>): Ccc
 interface FakeDepsOptions {
   /** Override the tunnel `establish` (e.g. to reject); defaults to a successful Tailscale host. */
   readonly establish?: (local: { host: string; port: number }) => Promise<EstablishedTunnel>;
+  /** Override the session-client `launch` (e.g. to reject); defaults to an attachable tmux surface. */
+  readonly launch?: (target: HostEndpoint, options: SessionLaunchOptions) => Promise<LaunchAcceptedWire>;
+  /** Override the session-client `list` (e.g. to reject or seed sessions); defaults to an empty list. */
+  readonly list?: (target: HostEndpoint) => Promise<SessionSummaryWire[]>;
 }
 
 /** Build fake {@link CliDependencies} plus handles to the spies the assertions read. */
@@ -40,6 +52,8 @@ function makeDeps(options: FakeDepsOptions = {}): {
   establish: ReturnType<typeof vi.fn>;
   runPatcher: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
+  launch: ReturnType<typeof vi.fn>;
+  list: ReturnType<typeof vi.fn>;
 } {
   // A fake bind: echo the requested host, and resolve `--port 0` to a concrete ephemeral
   // port so a test can prove `server.address` (not the requested port) is what's reported.
@@ -64,7 +78,24 @@ function makeDeps(options: FakeDepsOptions = {}): {
     headscale: () => makeTunnel("headscale"),
   };
   const runPatcher = vi.fn((_args: readonly string[]) => Promise.resolve());
-  return { deps: { startServer, adapters, runPatcher }, startServer, establish, runPatcher, close };
+  // The `/api/sessions` client the launch/attach verbs drive. `launch` defaults to an attachable
+  // tmux surface; `list` defaults to empty — a test overrides either to reject or to seed sessions.
+  const launch = vi.fn(
+    options.launch ??
+      ((_target: HostEndpoint, _launchOptions: SessionLaunchOptions) =>
+        Promise.resolve({ attachable: true, hint: "tmux attach -t ccctl:1" } satisfies LaunchAcceptedWire)),
+  );
+  const list = vi.fn(options.list ?? ((_target: HostEndpoint) => Promise.resolve([] as SessionSummaryWire[])));
+  const sessionClient: SessionClient = { launch, list };
+  return {
+    deps: { startServer, adapters, runPatcher, sessionClient },
+    startServer,
+    establish,
+    runPatcher,
+    close,
+    launch,
+    list,
+  };
 }
 
 const originalAuth = process.env[LOCAL_SERVER_AUTH_ENV];
@@ -273,6 +304,143 @@ describe("ccctl tunnel — establishes the tunnel (AC3)", () => {
     });
     await expect(buildProgram(deps).parseAsync(["tunnel", "cloudflare"], { from: "user" })).rejects.toThrow(
       /not implemented yet \(skeleton\)/,
+    );
+  });
+});
+
+describe("ccctl launch — drives a UC2 launch on a running daemon (AC1)", () => {
+  it("launches on the default loopback daemon with the working directory + default mode, reporting the attach hint", async () => {
+    const { deps, launch } = makeDeps();
+    await buildProgram(deps).parseAsync(["launch"], { from: "user" });
+    // Default target is the daemon's default loopback host:port; default mode is `default`; the
+    // cwd defaults to the process cwd; project / initialPrompt are OMITTED (not `undefined`) when unset.
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(launch).toHaveBeenCalledWith(
+      { host: "127.0.0.1", port: 4321 },
+      { cwd: process.cwd(), permissionMode: "default" },
+    );
+    expect(loggedText()).toContain("launched a new session on http://127.0.0.1:4321");
+    expect(loggedText()).toContain("attach it with — tmux attach -t ccctl:1");
+  });
+
+  it("passes an explicit --host/--port/--cwd/--permission-mode plus --project and --initial-prompt through", async () => {
+    const { deps, launch } = makeDeps();
+    await buildProgram(deps).parseAsync(
+      [
+        "launch",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8080",
+        "--cwd",
+        "/work/repo",
+        "--permission-mode",
+        "acceptEdits",
+        "--project",
+        "oracle",
+        "--initial-prompt",
+        "ship it",
+      ],
+      { from: "user" },
+    );
+    expect(launch).toHaveBeenCalledWith(
+      { host: "127.0.0.1", port: 8080 },
+      { cwd: "/work/repo", permissionMode: "acceptEdits", project: "oracle", initialPrompt: "ship it" },
+    );
+  });
+
+  it("surfaces a degraded (not fully attachable) surface's hint instead of an attach command", async () => {
+    const { deps } = makeDeps({
+      launch: () =>
+        Promise.resolve({ attachable: false, hint: "owned pty — reachable only from this daemon (degraded)" }),
+    });
+    await buildProgram(deps).parseAsync(["launch"], { from: "user" });
+    expect(loggedText()).toContain("not fully attachable — owned pty — reachable only from this daemon (degraded)");
+  });
+
+  it("fails closed on an unknown --permission-mode BEFORE any network round-trip", async () => {
+    const { deps, launch } = makeDeps();
+    await expect(
+      buildProgram(deps).parseAsync(["launch", "--permission-mode", "yolo"], { from: "user" }),
+    ).rejects.toThrow(/invalid permission mode "yolo"/);
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid --port before contacting the daemon", async () => {
+    const { deps, launch } = makeDeps();
+    await expect(buildProgram(deps).parseAsync(["launch", "--port", "not-a-port"], { from: "user" })).rejects.toThrow(
+      /invalid port/,
+    );
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it("refuses a 0.0.0.0 daemon host (never the wildcard)", async () => {
+    const { deps, launch } = makeDeps();
+    await expect(buildProgram(deps).parseAsync(["launch", "--host", "0.0.0.0"], { from: "user" })).rejects.toThrow(
+      /refusing to bind 0\.0\.0\.0/,
+    );
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it("propagates a daemon-side launch refusal (e.g. no launcher configured) as a rejection (→ non-zero exit)", async () => {
+    const { deps } = makeDeps({
+      launch: () =>
+        Promise.reject(
+          new Error("ccctl: the daemon has no session launcher configured — it cannot launch sessions yet"),
+        ),
+    });
+    await expect(buildProgram(deps).parseAsync(["launch"], { from: "user" })).rejects.toThrow(
+      /no session launcher is configured|has no session launcher configured/,
+    );
+  });
+});
+
+describe("ccctl attach — the UC1 attach on-ramp lists running sessions (AC1 + AC2)", () => {
+  it("lists every session the daemon carries — a phone-driven one and a CLI-launched one side by side (AC2)", async () => {
+    // The list is the shared `/api/sessions` collection, so sessions of EVERY origin enumerate
+    // together — this is the "appears in the session list alongside phone-driven ones" AC, read
+    // from the client side (the CLI renders whatever the unified list returns).
+    const { deps, list } = makeDeps({
+      list: () =>
+        Promise.resolve([
+          { id: "phone-sess", status: "ready", activity: { kind: "running" } },
+          { id: "cli-sess", status: "busy", activity: { kind: "requires_action", detail: "approve edit" } },
+        ]),
+    });
+    await buildProgram(deps).parseAsync(["attach"], { from: "user" });
+    expect(list).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 });
+    const text = loggedText();
+    expect(text).toContain("2 sessions on http://127.0.0.1:4321");
+    expect(text).toContain("phone-sess  [ready] running");
+    expect(text).toContain("cli-sess  [busy] requires action — approve edit");
+  });
+
+  it("reports an empty daemon with a launch hint rather than a bare blank", async () => {
+    const { deps } = makeDeps({ list: () => Promise.resolve([]) });
+    await buildProgram(deps).parseAsync(["attach"], { from: "user" });
+    expect(loggedText()).toContain("no sessions on http://127.0.0.1:4321 yet");
+  });
+
+  it("lists against an explicit --host and --port", async () => {
+    const { deps, list } = makeDeps();
+    await buildProgram(deps).parseAsync(["attach", "--host", "127.0.0.1", "--port", "9999"], { from: "user" });
+    expect(list).toHaveBeenCalledWith({ host: "127.0.0.1", port: 9999 });
+  });
+
+  it("rejects an invalid --port before contacting the daemon", async () => {
+    const { deps, list } = makeDeps();
+    await expect(buildProgram(deps).parseAsync(["attach", "--port", "99999"], { from: "user" })).rejects.toThrow(
+      /invalid port/,
+    );
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("propagates a list failure as a rejection (→ non-zero exit)", async () => {
+    const { deps } = makeDeps({
+      list: () => Promise.reject(new Error("ccctl: could not list sessions — GET /api/sessions returned 500")),
+    });
+    await expect(buildProgram(deps).parseAsync(["attach"], { from: "user" })).rejects.toThrow(
+      /could not list sessions/,
     );
   });
 });
