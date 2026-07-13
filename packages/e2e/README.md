@@ -90,6 +90,32 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   `control-plane.e2e.test.ts` drives it; the pure fence + tri-state classifier are
   unit-tested credential-free in `live-worker-oracle.test.ts`.
 
+- **Idle-hold regression (#167)** — `worker-idle-hold.ts` is the hermetic, deterministic
+  proof of the server's **#166** downstream-liveness fix. The captured-wire golden pins each
+  bridge leg's **shape**, but is blind to whether the server **holds the worker downstream
+  alive over time**: a server that opens `…/worker/events/stream` and then goes silent passes
+  the golden yet fails a real worker, which enforces a **~45s downstream-liveness timeout**
+  (counting **only** `client_event` frames) and reconnect-loops on an idle session. The
+  regression drives a worker **stand-in** that embodies that timeout contract — it holds **one**
+  registration and **one** downstream open and runs a liveness monitor that resets a deadline on
+  every `client_event` frame and records a **drop** if the gap ever exceeds it — against the
+  **real** `@ccctl/server` booted with a **short** liveness interval
+  (`workerLivenessIntervalMs`, the config the server unit suite already uses). It asserts the
+  idle downstream **stays open past the timeout, with ≥1 `client_event` liveness frame inside the
+  window and zero drops** — so `drops === 0` **is** the receiver-grounded proof of "held with no
+  reconnect / re-register" (a drop is exactly the `connect → liveness-timeout → reconnect` flap
+  #166 removes, so the stand-in need not perform the reconnect to prove the server prevented its
+  trigger). It **fails on the pre-#166 behavior** by construction (a silent downstream → the
+  deadline fires, no frame in the window). And it is **self-guarded** in the `probeStandInLiveness`
+  (#134) posture: a **starved** negative control (a liveness interval pushed far above the hold
+  window reproduces pre-#166 within it) proves the same stand-in **does** record a drop, so the
+  positive "no drop" is never a vacuous pass. Time is **scaled** to ms (a wall-clock ~45s is unfit
+  for CI), with a deliberately **wider** interval/timeout margin than production — which removes
+  ms-scale jitter flakiness and only strengthens the regression (pre-#166 emits **zero** frames,
+  so it times out for any deadline). Hermetic (loopback only, no patched worker or credentials),
+  so it gates on every run: `worker-idle-hold.e2e.test.ts` drives it against the real server and
+  `worker-idle-hold.test.ts` pins the pure `classifyIdleHold` verdict credential-free.
+
 ## What is fenced to the credentialed wave
 
 - The **live-worker oracle** above is wired but **fenced** — it runs only when
