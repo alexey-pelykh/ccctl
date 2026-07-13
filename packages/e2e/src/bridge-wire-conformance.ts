@@ -106,10 +106,38 @@ export const BRIDGE_ENVIRONMENT_REGISTER_BODY = {
 
 /**
  * The account-Bearer-authorized §2 request body the mock bridge sends (snake_case wire).
+ * The context is carried under **`session_context`** — the field the observed worker
+ * actually sends (issue #154), NOT the superseded top-level `context`
+ * ({@link BRIDGE_SESSION_CREATE_SUPERSEDED_BODY}). The worker also carries extra keys the
+ * server accepts and IGNORES: `sources` / `outcomes` / `reuse_outcome_branches` inside
+ * `session_context`, and a top-level `environment_id` — sent here so a green run exercises
+ * the server's accept-and-drop path, not just the two load-bearing fields (model + cwd).
  * Exported as the SINGLE source of the §2 request wire — shared with the live-worker
  * oracle (#133) so the hermetic and credentialed drivers never diverge on the §2 body.
  */
 export const BRIDGE_SESSION_CREATE_BODY = {
+  session_context: {
+    model: "claude-opus-4-8",
+    cwd: "/e2e/proj",
+    sources: [{ kind: "git", url: "https://example.test/repo.git" }],
+    outcomes: ["merge"],
+    reuse_outcome_branches: true,
+  },
+  environment_id: "e2e-env",
+  source: "e2e",
+  permission_mode: "default",
+} as const;
+
+/**
+ * The SUPERSEDED pre-#154 §2 request body — the context under a top-level `context`
+ * instead of `session_context`, and none of the worker's current extras. The conformant
+ * server FAILS THIS CLOSED (`400`): the worker sends `session_context` now, so a body
+ * carrying only the old `context` is drift. The hermetic golden POSTs this as a NEGATIVE
+ * probe ({@link assertServerSpeaksBridgeContract}) and asserts the `400` — a server that
+ * still read `context` would accept it (`201`) and fail the probe, which is how the golden
+ * fails a server that agrees with itself but not the worker on §2 (issue #155).
+ */
+export const BRIDGE_SESSION_CREATE_SUPERSEDED_BODY = {
   context: { model: "claude-opus-4-8", cwd: "/e2e/proj" },
   source: "e2e",
   permission_mode: "default",
@@ -128,6 +156,28 @@ export function assertEnvironmentRegisterResponseWire(body: string): Environment
   const record = parseJsonObject(body, "environment-register");
   assertExactKeys(record, ENV_REGISTER_WIRE_KEYS, "environment-register");
   return { environment_id: requireStringField(record, "environment_id", "environment-register") };
+}
+
+/**
+ * The pinned §1 register response STATUS: `200`. The observed worker rejects a non-200
+ * register (`Registration: Failed with status 201`), so the conformant server answers
+ * `200`, NOT the pre-#154 `201` (issue #154). Pinned INDEPENDENTLY of the server — a
+ * STATUS pin alongside the body-shape pins, so a leg can drift on the status alone.
+ */
+export const BRIDGE_REGISTER_STATUS = 200;
+
+/**
+ * Assert a §1 register response STATUS is the pinned `200`. A `201` — the pre-#154 status
+ * the observed worker rejects — fails closed here, so the golden catches a server that
+ * emits the register BODY the golden encodes but under the wrong STATUS: the "assert the
+ * 200 status, not just the body" leg (issue #155).
+ */
+export function assertRegisterStatus(status: number): void {
+  if (status !== BRIDGE_REGISTER_STATUS) {
+    throw new Error(
+      `ccctl e2e: §1 register expected status ${BRIDGE_REGISTER_STATUS}, got ${status} (a 201 is the pre-#154 status the observed worker rejects, #154/#155)`,
+    );
+  }
 }
 
 /**
@@ -176,6 +226,42 @@ export function assertWorkItemWire(body: string): { readonly item: WorkItemWire;
   return { item, secret: decodeWorkSecret(secret) };
 }
 
+/**
+ * The §3/§4 work-item lifecycle verbs the worker drives AFTER delivery — each a sibling
+ * `POST …/work/{workId}/{verb}` leg the server acknowledges `200` (issue #154). Pinned
+ * here so the golden drives the exact set the worker speaks.
+ */
+export const WORK_LIFECYCLE_VERBS = ["ack", "heartbeat", "stop"] as const;
+
+/**
+ * Assert a §3/§4 work-lifecycle response STATUS is the routed `200`. Before #154 these
+ * three verbs were UNROUTED and `404`'d (only `…/work/poll` matched), which the worker
+ * surfaced as its generic "Remote Control may not be available" text — so a `404` here is
+ * exactly that pre-#154 divergence and fails closed (issue #155).
+ */
+export function assertWorkLifecycleStatus(verb: string, status: number): void {
+  if (status !== 200) {
+    throw new Error(
+      `ccctl e2e: §3/§4 work/${verb} expected status 200, got ${status} (a 404 is the pre-#154 unrouted divergence, #154/#155)`,
+    );
+  }
+}
+
+/**
+ * Assert a §4 worker-state-restore (`GET …/worker`) response STATUS is the routed `200`.
+ * Before #154 the bare `…/worker` path was PUT-only, so a GET `405`'d and the child
+ * retried in a loop; it is now method-multiplexed (GET restore / PUT status) and answers
+ * an empty `200`. The BODY is NOT pinned ("empty 200 tolerated" — an empty `{ worker: null }`
+ * is fine); only the routed status is, so a `405` fails closed (issue #155).
+ */
+export function assertWorkerStateRestoreStatus(status: number): void {
+  if (status !== 200) {
+    throw new Error(
+      `ccctl e2e: §4 GET …/worker expected status 200 (empty body tolerated), got ${status} (a 405 is the pre-#154 PUT-only divergence, #154/#155)`,
+    );
+  }
+}
+
 /** A registered environment: its server-assigned id (no work-poll token, #130). */
 export interface RegisteredEnvironment {
   readonly environmentId: string;
@@ -195,14 +281,13 @@ export interface DeliveredWork {
 /**
  * §1 — register the environment (`POST /v1/environments/bridge`, account Bearer, the
  * observed `machine_name` / nullable `git_repo_url` / `metadata` body). Asserts the
- * `201` and the pinned `{ environment_id }` wire, then returns the environment id the
- * §3 poll path interpolates.
+ * pinned `200` status ({@link assertRegisterStatus} — a `201` fails closed, #154) and the
+ * pinned `{ environment_id }` wire, then returns the environment id the §3 poll path
+ * interpolates.
  */
 export async function registerEnvironment(server: CcctlServer, bearer: string): Promise<RegisteredEnvironment> {
   const res = await postJson(bridgeUrl(server, ENVIRONMENTS_BRIDGE_PATH), bearer, BRIDGE_ENVIRONMENT_REGISTER_BODY);
-  if (res.status !== 201) {
-    throw new Error(`ccctl e2e: environment register expected 201 from the local server, got ${res.status}`);
-  }
+  assertRegisterStatus(res.status);
   const wire = assertEnvironmentRegisterResponseWire(await res.text());
   return { environmentId: wire.environment_id };
 }
@@ -236,20 +321,47 @@ export async function pollWork(server: CcctlServer, environmentId: string): Prom
 }
 
 /**
+ * §3/§4 — drive the work-item lifecycle the worker speaks AFTER delivery:
+ * `POST …/work/{workId}/{ack,heartbeat,stop}` (UNCREDENTIALED, like the poll), asserting
+ * each verb is ROUTED `200` ({@link assertWorkLifecycleStatus}). Before #154 these three
+ * 404'd (only `…/work/poll` was routed), which the worker surfaced as its generic "Remote
+ * Control may not be available" text; a `404` fails closed here, so the golden catches a
+ * server that delivers work but cannot acknowledge its lifecycle (issue #155).
+ */
+export async function assertWorkLifecycleRouted(
+  server: CcctlServer,
+  environmentId: string,
+  workId: string,
+): Promise<void> {
+  for (const verb of WORK_LIFECYCLE_VERBS) {
+    const res = await postJson(bridgeUrl(server, workLifecyclePath(environmentId, workId, verb)), null, {});
+    assertWorkLifecycleStatus(verb, res.status);
+  }
+}
+
+/**
  * Drive the WHOLE observed environments-bridge contract face against a REAL
  * {@link CcctlServer} and assert conformance end-to-end. A green run implies
  * interoperability: the server speaks the observed `register → session-create →
  * work-poll` face, mints a decodable work-secret, enforces the account-Bearer boundary
- * on §1/§2, serves the §3 poll UNCREDENTIALED, and stands up the §4/§5 channel
- * handshake — so the mock bridge is talking to the transport a real worker uses.
+ * on §1/§2, serves the §3 poll UNCREDENTIALED, routes the work-item lifecycle and the
+ * worker-state restore the child drives, and stands up the §4/§5 channel handshake — so
+ * the mock bridge is talking to the transport a real worker uses.
  *
- * Checks, all grounded in the live server's own responses / state:
+ * The four residual legs #154 conformed are pinned fail-closed here (issue #155), so the
+ * golden fails a server that "agrees with itself" but not the worker on any of them:
  *
- *   - §1 register — `201` + `{ environment_id }`; and, WITHOUT the account Bearer, `401`.
- *   - §2 session create — `201` + `{ session_id }` (no ws_url); and, WITHOUT the account
- *     Bearer, `401`.
+ *   - §1 register — `200`, NOT the pre-#154 `201` the worker rejects (#154) + `{ environment_id }`;
+ *     and, WITHOUT the account Bearer, `401`.
+ *   - §2 session create — the `session_context` body (#154) → `201` + `{ session_id }` (no
+ *     ws_url); WITHOUT the account Bearer, `401`; and the SUPERSEDED top-level `context`
+ *     body fails closed `400` (a server that still read `context` would accept it).
  *   - §3 work poll — UNCREDENTIALED, a single item whose `secret` decodes with both inner
  *     fields, `data` naming the created session.
+ *   - §3/§4 work lifecycle — `POST …/work/{id}/{ack,heartbeat,stop}` each ROUTED `200`,
+ *     NOT the pre-#154 `404` (#154).
+ *   - §4 worker restore — `GET …/worker` method-multiplexed `200`, NOT the pre-#154 `405`
+ *     that looped the child (#154).
  *   - §4/§5 — `worker/register` → `{ worker_epoch }`; the `PUT worker` status gate `200`s
  *     on `idle`.
  *
@@ -276,6 +388,19 @@ export async function assertServerSpeaksBridgeContract(server: CcctlServer, bear
       `ccctl e2e: §2 session create without the account Bearer expected 401, got ${sessionNoBearer.status}`,
     );
   }
+  // §2 fail-closed — the SUPERSEDED top-level `context` body is drift (the worker sends
+  // `session_context` now, #154), so the conformant server rejects it 400. A server that
+  // still read `context` would accept it (201) and fail this probe (issue #155).
+  const sessionSuperseded = await postJson(
+    bridgeUrl(server, SESSIONS_PATH),
+    bearer,
+    BRIDGE_SESSION_CREATE_SUPERSEDED_BODY,
+  );
+  if (sessionSuperseded.status !== 400) {
+    throw new Error(
+      `ccctl e2e: §2 session create with the superseded top-level \`context\` expected 400 (the worker sends \`session_context\` now, #154), got ${sessionSuperseded.status}`,
+    );
+  }
 
   // §3 — the poll is UNCREDENTIALED and delivers the auto-enqueued single item for THIS
   // session, whose secret decodes with both inner fields.
@@ -283,6 +408,14 @@ export async function assertServerSpeaksBridgeContract(server: CcctlServer, bear
   if (item.data.type !== "session" || item.data.id !== sessionId) {
     throw new Error(`ccctl e2e: §3 poll did not deliver the session-dispatch item for ${sessionId}`);
   }
+
+  // §3/§4 — the work-item lifecycle the worker drives after delivery is ROUTED (each verb
+  // 200, not the pre-#154 404), keyed on the delivered item's id (issue #155).
+  await assertWorkLifecycleRouted(server, environmentId, item.id);
+
+  // §4 — the worker-state restore on the bare `…/worker` path is method-multiplexed to
+  // accept GET (a 200, not the pre-#154 405 that looped the child, issue #155).
+  await assertWorkerStateRestore(server, sessionId);
 
   // §4/§5 — the channel handshake: register mints a worker_epoch; the PUT status gate 200s on idle.
   const epoch = await assertWorkerRegister(server, sessionId);
@@ -297,6 +430,26 @@ export async function assertServerSpeaksBridgeContract(server: CcctlServer, bear
 /** The observed §4/§5 channel root for a session — pinned here, not imported (#130). */
 export function workerChannelBase(sessionId: string): string {
   return `/v1/code/sessions/${sessionId}/worker`;
+}
+
+/** The observed §3/§4 work-item lifecycle path for a verb — pinned here, not imported (#154). */
+export function workLifecyclePath(environmentId: string, workId: string, verb: string): string {
+  return `/v1/environments/${environmentId}/work/${workId}/${verb}`;
+}
+
+/**
+ * §4 — drive the worker-state restore the child calls on the bare `…/worker` path:
+ * `GET …/worker`, asserting the leg is method-multiplexed to accept GET
+ * ({@link assertWorkerStateRestoreStatus} — a `405` fails closed). Before #154 the bare
+ * path was PUT-only, so a GET `405`'d and the child retried in a loop; the golden now
+ * proves the GET restore is routed (an empty `200`, body untouched — issue #155).
+ */
+export async function assertWorkerStateRestore(server: CcctlServer, sessionId: string): Promise<void> {
+  const res = await fetch(bridgeUrl(server, workerChannelBase(sessionId)), {
+    method: "GET",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  assertWorkerStateRestoreStatus(res.status);
 }
 
 /** §4 — `POST worker/register` `{}` and assert `{ worker_epoch }`; returns the epoch. */

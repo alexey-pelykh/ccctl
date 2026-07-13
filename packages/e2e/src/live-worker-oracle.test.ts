@@ -36,6 +36,7 @@ function conformingWorkPollBody(sessionId = "sess-1"): string {
 function verifiedCapture(): LiveCapture {
   return {
     registerBody: JSON.stringify({ environment_id: "env-1" }),
+    registerStatus: 200,
     sessionCreateBody: JSON.stringify({ session_id: "sess-1" }),
     workPollBody: conformingWorkPollBody(),
     workerRegistered: true,
@@ -112,6 +113,18 @@ describe("classifyObservedWire — the self-classifying tri-state verdict (#133)
       });
       expect(report.verdict).toBe("drift");
       expect(report.divergentLegs).toEqual([ORACLE_LEG.register]);
+    });
+
+    it("flags a §1 register STATUS drift — a 201 (the pre-#154 status the worker rejects) with a CONFORMING body (#155)", () => {
+      // The exact "assert the 200 status, not just the body" gap: a server that emits the
+      // pinned { environment_id } body but under the pre-#154 201 must still drift.
+      const report = classifyObservedWire({
+        ...verifiedCapture(),
+        registerStatus: 201,
+      });
+      expect(report.verdict).toBe("drift");
+      expect(report.divergentLegs).toEqual([ORACLE_LEG.register]);
+      expect(report.reason).toContain("expected status 200, got 201");
     });
 
     it("flags a §2 resurrected ws_url (the SSE control path never reads one, #130)", () => {

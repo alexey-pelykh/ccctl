@@ -69,6 +69,7 @@ import { environmentWorkPollPath, ENVIRONMENTS_BRIDGE_PATH, formatAuthority, SES
 import type { CcctlServer } from "@ccctl/server";
 import {
   assertEnvironmentRegisterResponseWire,
+  assertRegisterStatus,
   assertSessionCreateResponseWire,
   assertWorkItemWire,
   BRIDGE_ENVIRONMENT_REGISTER_BODY,
@@ -162,14 +163,17 @@ export const ORACLE_LEG = {
  *
  * The three `*Body` fields are the RAW response bytes the live server returned on each
  * bridge leg (`undefined` when the leg was never reached because an upstream leg drifted
- * and no id could be extracted to issue the next request). The three booleans are the
- * real worker's §4/§5 liveness, each read from the server's OWN state (the held-open
- * worker downstream it tracks, the `idle` activity it derived, the turn it ran) — never a
- * self-report.
+ * and no id could be extracted to issue the next request). `registerStatus` is the §1
+ * response STATUS captured alongside its body, so the oracle asserts the register 200 —
+ * not just the register body shape (issue #155). The three booleans are the real worker's
+ * §4/§5 liveness, each read from the server's OWN state (the held-open worker downstream it
+ * tracks, the `idle` activity it derived, the turn it ran) — never a self-report.
  */
 export interface LiveCapture {
   /** Raw §1 `POST /v1/environments/bridge` response body, or `undefined` if never captured. */
   readonly registerBody?: string | undefined;
+  /** The §1 register response STATUS (the pinned `200`, #154), or `undefined` if never captured. A non-200 is register-leg drift. */
+  readonly registerStatus?: number | undefined;
   /** Raw §2 `POST /v1/sessions` response body, or `undefined` if never captured. */
   readonly sessionCreateBody?: string | undefined;
   /** Raw §3 `GET …/work/poll` response body, or `undefined` if never captured. */
@@ -202,7 +206,9 @@ export interface OracleReport {
  *
  *   1. **drift** — any captured `*Body` FAILS the golden's own pinned assertion
  *      ({@link assertEnvironmentRegisterResponseWire} / {@link assertSessionCreateResponseWire} /
- *      {@link assertWorkItemWire}). Every failing leg is named, each with its shape error.
+ *      {@link assertWorkItemWire}), OR the captured §1 register STATUS is not the pinned
+ *      `200` ({@link assertRegisterStatus} — a `201` is the pre-#154 divergence, #155).
+ *      Every failing leg is named, each with its shape / status error.
  *   2. **inconclusive** — no drift, but a required leg was never observed: a bridge body
  *      is `undefined`, or the real worker never registered / never reached `idle` / never
  *      completed a turn. The gaps are named.
@@ -210,9 +216,11 @@ export interface OracleReport {
  *      worker registered, reached `idle`, and completed one turn.
  */
 export function classifyObservedWire(capture: LiveCapture): OracleReport {
-  // 1. Drift — any captured body that fails its pinned golden shape. Checked FIRST so a
-  //    present-but-divergent leg is never masked by a downstream inconclusive gap.
+  // 1. Drift — any captured body that fails its pinned golden shape, or the §1 register
+  //    STATUS that is not the pinned 200. Checked FIRST so a present-but-divergent leg is
+  //    never masked by a downstream inconclusive gap.
   const drifts: string[] = [];
+  checkPinnedRegisterStatus(capture.registerStatus, drifts);
   checkPinnedShape(capture.registerBody, ORACLE_LEG.register, assertEnvironmentRegisterResponseWire, drifts);
   checkPinnedShape(capture.sessionCreateBody, ORACLE_LEG.sessionCreate, assertSessionCreateResponseWire, drifts);
   checkPinnedShape(capture.workPollBody, ORACLE_LEG.workPoll, assertWorkItemWire, drifts);
@@ -278,6 +286,23 @@ function checkPinnedShape(
     assertShape(body);
   } catch (error) {
     drifts.push(`${leg}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * Run the pinned §1 register STATUS assertion ({@link assertRegisterStatus}) over the
+ * captured status; on throw (a non-200 — the pre-#154 201 the worker rejects), record a
+ * register-leg drift. Absence is an inconclusive gap (handled via the body check in the
+ * caller), never a drift — a leg that never answered has no status to pin (issue #155).
+ */
+function checkPinnedRegisterStatus(status: number | undefined, drifts: string[]): void {
+  if (status === undefined) {
+    return;
+  }
+  try {
+    assertRegisterStatus(status);
+  } catch (error) {
+    drifts.push(`${ORACLE_LEG.register}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -428,24 +453,28 @@ export async function driveLiveWorkerOracle(options: DriveOracleOptions): Promis
   const controlBaseUrl = `http://${formatAuthority(server.address.host, server.address.port)}`;
 
   // §1/§2/§3 — the bridge legs. Capture each RAW response body (for the pinned-shape
-  // check) and, when a leg conforms, extract the id/secret needed to drive the next.
-  const registerBody = await captureBody(
+  // check), plus the §1 register STATUS (pinned 200, #155), and, when a leg conforms,
+  // extract the id/secret needed to drive the next.
+  const register = await captureResponse(
     server,
     ENVIRONMENTS_BRIDGE_PATH,
     "POST",
     bearer,
     BRIDGE_ENVIRONMENT_REGISTER_BODY,
   );
+  const registerBody = register.body;
+  const registerStatus = register.status;
   const environmentId = tryExtract(() => assertEnvironmentRegisterResponseWire(registerBody ?? "").environment_id);
 
-  const sessionCreateBody = await captureBody(server, SESSIONS_PATH, "POST", bearer, BRIDGE_SESSION_CREATE_BODY);
+  const sessionCreateBody = (await captureResponse(server, SESSIONS_PATH, "POST", bearer, BRIDGE_SESSION_CREATE_BODY))
+    .body;
   const sessionId = tryExtract(() => assertSessionCreateResponseWire(sessionCreateBody ?? "").session_id);
 
   // §3 is reachable only when §1 gave an environment id; poll AFTER §2 so the auto-enqueued
   // session item is delivered immediately.
   const workPollBody =
     environmentId !== undefined
-      ? await captureBody(server, environmentWorkPollPath(environmentId), "GET", null, undefined)
+      ? (await captureResponse(server, environmentWorkPollPath(environmentId), "GET", null, undefined)).body
       : undefined;
   const workSecret = tryExtract((): DecodedWorkSecret => assertWorkItemWire(workPollBody ?? "").secret);
 
@@ -503,6 +532,7 @@ export async function driveLiveWorkerOracle(options: DriveOracleOptions): Promis
 
   return classifyObservedWire({
     registerBody,
+    registerStatus,
     sessionCreateBody,
     workPollBody,
     workerRegistered,
@@ -535,19 +565,26 @@ async function observeOneTurn(
   return waitForReceiver(() => server.sessions.get(sessionId)?.activity.kind === "idle", timeoutMs);
 }
 
+/** A captured bridge response: the STATUS and RAW body bytes, or both `undefined` when the request could not complete. */
+interface CapturedResponse {
+  readonly status: number | undefined;
+  readonly body: string | undefined;
+}
+
 /**
- * Issue one bridge request and return its RAW response body, or `undefined` if the
- * request could not complete (network / timeout) — an unreachable leg is an inconclusive
- * gap, not a drift. A non-2xx status still returns its body so the pinned-shape check
- * classifies it (a 4xx/5xx body fails the shape gate → `drift`, not a silent pass).
+ * Issue one bridge request and return its STATUS and RAW response body, or both
+ * `undefined` if the request could not complete (network / timeout) — an unreachable leg
+ * is an inconclusive gap, not a drift. A non-2xx response still returns (status + body) so
+ * the pinned checks classify it (a drifted §1 register status or a 4xx/5xx body fails its
+ * gate → `drift`, not a silent pass).
  */
-async function captureBody(
+async function captureResponse(
   server: CcctlServer,
   path: string,
   method: "GET" | "POST",
   bearer: string | null,
   body: unknown,
-): Promise<string | undefined> {
+): Promise<CapturedResponse> {
   const headers: Record<string, string> = {};
   if (method === "POST") {
     headers["content-type"] = "application/json";
@@ -561,9 +598,9 @@ async function captureBody(
   }
   try {
     const res = await fetch(`http://${formatAuthority(server.address.host, server.address.port)}${path}`, init);
-    return await res.text();
+    return { status: res.status, body: await res.text() };
   } catch {
-    return undefined;
+    return { status: undefined, body: undefined };
   }
 }
 

@@ -4,9 +4,15 @@
 import { describe, expect, it } from "vitest";
 import {
   assertEnvironmentRegisterResponseWire,
+  assertRegisterStatus,
   assertSessionCreateResponseWire,
   assertWorkItemWire,
+  assertWorkerStateRestoreStatus,
+  assertWorkLifecycleStatus,
+  BRIDGE_SESSION_CREATE_BODY,
+  BRIDGE_SESSION_CREATE_SUPERSEDED_BODY,
   decodeWorkSecret,
+  WORK_LIFECYCLE_VERBS,
 } from "./bridge-wire-conformance.js";
 
 // Unit coverage of the wire-conformance oracle's PURE per-leg shape assertions,
@@ -200,5 +206,73 @@ describe("decodeWorkSecret — base64url(JSON(WorkSecret)) with both inner field
     expect(() => decodeWorkSecret(encodeSecret({ version: 1, session_ingress_token: "t", api_base_url: "" }))).toThrow(
       /must be a non-empty string/,
     );
+  });
+});
+
+// The four residual legs #154 conformed, pinned fail-closed here (#155). Each pure status
+// assertion ACCEPTS the conformant value and REJECTS the pre-#154 divergence — the "fails
+// on the divergence" direction proven credential-free, alongside the shape assertions
+// above; the "passes on the conformant server" direction is proven live in
+// `wire-conformance.e2e.test.ts` (which drives `assertServerSpeaksBridgeContract`).
+
+describe("assertRegisterStatus — §1 register status is the pinned 200, not the pre-#154 201 (#154/#155)", () => {
+  it("accepts the pinned 200", () => {
+    expect(() => assertRegisterStatus(200)).not.toThrow();
+  });
+
+  it("rejects the pre-#154 201 — the status the observed worker rejects", () => {
+    expect(() => assertRegisterStatus(201)).toThrow(/expected status 200, got 201/);
+  });
+
+  it("rejects any other non-200 status", () => {
+    expect(() => assertRegisterStatus(400)).toThrow(/expected status 200, got 400/);
+    expect(() => assertRegisterStatus(500)).toThrow(/expected status 200/);
+  });
+});
+
+describe("assertWorkLifecycleStatus — §3/§4 lifecycle verbs are routed 200, not the pre-#154 404 (#154/#155)", () => {
+  it("accepts the routed 200 for each verb", () => {
+    for (const verb of WORK_LIFECYCLE_VERBS) {
+      expect(() => assertWorkLifecycleStatus(verb, 200)).not.toThrow();
+    }
+  });
+
+  it("rejects the pre-#154 404 — the unrouted divergence — naming the verb", () => {
+    expect(() => assertWorkLifecycleStatus("ack", 404)).toThrow(/work\/ack expected status 200, got 404/);
+    expect(() => assertWorkLifecycleStatus("heartbeat", 404)).toThrow(/work\/heartbeat expected status 200, got 404/);
+    expect(() => assertWorkLifecycleStatus("stop", 404)).toThrow(/work\/stop expected status 200, got 404/);
+  });
+
+  it("pins exactly the three sibling verbs the worker drives after delivery", () => {
+    expect([...WORK_LIFECYCLE_VERBS]).toEqual(["ack", "heartbeat", "stop"]);
+  });
+});
+
+describe("assertWorkerStateRestoreStatus — §4 GET …/worker is 200, not the pre-#154 405 (#154/#155)", () => {
+  it("accepts the empty 200 (the method-multiplexed restore)", () => {
+    expect(() => assertWorkerStateRestoreStatus(200)).not.toThrow();
+  });
+
+  it("rejects the pre-#154 405 — the PUT-only divergence that looped the child", () => {
+    expect(() => assertWorkerStateRestoreStatus(405)).toThrow(/405 is the pre-#154 PUT-only divergence/);
+  });
+});
+
+describe("BRIDGE_SESSION_CREATE_BODY — the §2 request carries session_context, not the superseded context (#154/#155)", () => {
+  it("sends the context under `session_context` and NOT a top-level `context`", () => {
+    expect(BRIDGE_SESSION_CREATE_BODY).toHaveProperty("session_context");
+    expect(BRIDGE_SESSION_CREATE_BODY).not.toHaveProperty("context");
+  });
+
+  it("carries the worker's observed extras the server accepts and ignores (#154)", () => {
+    expect(BRIDGE_SESSION_CREATE_BODY.session_context).toHaveProperty("sources");
+    expect(BRIDGE_SESSION_CREATE_BODY.session_context).toHaveProperty("outcomes");
+    expect(BRIDGE_SESSION_CREATE_BODY.session_context).toHaveProperty("reuse_outcome_branches");
+    expect(BRIDGE_SESSION_CREATE_BODY).toHaveProperty("environment_id");
+  });
+
+  it("keeps the superseded probe body on the old top-level `context` (the negative probe that must 400)", () => {
+    expect(BRIDGE_SESSION_CREATE_SUPERSEDED_BODY).toHaveProperty("context");
+    expect(BRIDGE_SESSION_CREATE_SUPERSEDED_BODY).not.toHaveProperty("session_context");
   });
 });
