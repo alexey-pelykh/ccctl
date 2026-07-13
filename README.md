@@ -61,6 +61,16 @@ workspace.
 - Node.js **≥ 22**
 - [pnpm](https://pnpm.io/) (repo pins `pnpm@11.2.2` via `packageManager`)
 
+## Configuration
+
+The server reads its runtime configuration from the environment — set these
+before starting it (`ccctl serve`):
+
+| Variable                  | Default    | Purpose                                                                                                                                                                                          |
+| ------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `CCCTL_CLAUDE_BIN`        | `claude`   | Name or path of the Claude Code binary the server launches for a worker session. Override with an absolute path (or an alternate `PATH` name) when the patched binary is not `claude` on `PATH`. |
+| `CCCTL_LOCAL_SERVER_AUTH` | _required_ | The local server's authentication secret — the server refuses to start without it; there is no unauthenticated mode, even on loopback.                                                           |
+
 ## Development
 
 ```bash
