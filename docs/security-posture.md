@@ -82,8 +82,21 @@ server with `tailscale serve` (tailnet-private — never the public `tailscale
 funnel`) and refuses to establish unless the node is an authenticated, connected
 tailnet member, so an unauthorized device can never reach the daemon. _Which_
 authenticated devices may reach it is then governed by the tailnet's own ACL
-policy — operator-owned central state the adapter relies on and deliberately
-never provisions or overwrites.
+policy — operator-owned central state the adapter relies on **by default** and
+never edits in place.
+
+The adapter can **optionally** narrow that policy through the Tailscale API, when
+an API credential is supplied through its injectable seam (see
+[ADR-002](decisions/adr-002-tailscale-acl-provisioning-model.md)). Provisioning
+is **additive and non-destructive**: it appends a single operator-declared scoped
+grant on establish and removes exactly that grant on teardown, preserving every
+operator-authored rule verbatim (a write outside the adapter's own managed grant
+never happens) and rejecting a concurrent operator edit via `If-Match` rather than
+overwriting it. The API credential is **non-persisting** — supplied through the
+seam, sent only as a bearer `Authorization` header, and never stored on the
+tunnel, placed on its outputs, written to session state or a snapshot, or logged.
+Provisioning is off unless explicitly wired, so the default posture above is
+unchanged.
 
 ## Deferred to a later item
 
