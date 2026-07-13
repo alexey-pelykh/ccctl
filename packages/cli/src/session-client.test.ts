@@ -87,3 +87,34 @@ describe("defaultSessionClient.list — real GET /api/sessions wire (UC1 on-ramp
     expect(sessions).toEqual([]);
   });
 });
+
+describe("defaultSessionClient.steer — real POST /api/sessions/{id}/command wire (UC1 completion)", () => {
+  // A successful (202) steer needs a session with a LIVE worker channel, which only the fenced
+  // live-worker oracle stands up (never an in-repo fake) — so the reachable real-wire locks here are
+  // the fail-closed statuses. The unit tests (index.test.ts, fake client) cover the 202 behavior.
+
+  it("maps the real handler's 404 for an unknown session to a clear error", async () => {
+    const server = await startTestServer(fakeLauncher());
+    // No worker has registered, so any id is unknown → the command handler's 404. The real client
+    // maps it to an actionable "no session …" message (which cli.ts turns into a non-zero exit).
+    await expect(
+      defaultSessionClient.steer(server.address, "nope", { subtype: "prompt", payload: { text: "hi" } }),
+    ).rejects.toThrow(/no session nope/);
+  });
+
+  it("hits the daemon's command ROUTE, not a route-miss (a matched route rejects a malformed body 400)", async () => {
+    const server = await startTestServer(fakeLauncher());
+    // Prove the URL the client POSTs to actually resolves to the command handler: a MATCHED route
+    // with a malformed body is a 400 ("malformed command"), whereas a wrong URL would fall through
+    // to the router's "no route" 404. This is what makes the 404 test above a genuine no-session
+    // lock rather than a silently-passing route-miss (both a route-miss and a no-session are 404s,
+    // indistinguishable from the client, which sees only the status).
+    const res = await fetch(`http://${server.address.host}:${server.address.port}/api/sessions/nope/command`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "not json",
+    });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain("malformed command");
+  });
+});

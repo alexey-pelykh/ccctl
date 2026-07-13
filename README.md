@@ -41,8 +41,8 @@ workspace.
 - **`@ccctl/tunnel-adapters`** — a pluggable tunnel-adapter interface with stub
   adapters for Tailscale, Cloudflare, and Headscale behind one interface.
 - **`@ccctl/cli`** — the `ccctl` CLI: `patch` the worker, `serve` the local server,
-  and expose it through a `tunnel`; plus `launch` / `attach` to drive sessions on a
-  running daemon.
+  and expose it through a `tunnel`; plus `launch` / `attach` / `steer` to launch, list,
+  and drive sessions on a running daemon.
 - **`@ccctl/e2e`** — end-to-end test package. The inference-untouched guarantee
   (above) is verified today only by a hermetic skeleton — **necessary but not
   sufficient**; the full-flow release gate

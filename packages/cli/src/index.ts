@@ -21,18 +21,21 @@
  * each guard to spec is tracked separately (the auth credential boundary is #57, the
  * full localhost-bind guarantee is #58).
  *
- * Two more verbs BEGIN the launch/attach UX (#38) — unlike the three above (which stand the
- * local setup up), these are CLIENTS of an already-running daemon's browser-facing session
- * namespace, driving it from the command line the same way the phone does:
+ * Three more verbs are the launch/attach UX (#38 began it, #72 completes it) — unlike the three
+ * above (which stand the local setup up), these are CLIENTS of an already-running daemon's
+ * browser-facing session namespace, driving it from the command line the same way the phone does:
  *
  *   - `ccctl launch` — drive a UC2 "New session" launch (`POST /api/sessions`) on the running
  *     daemon and report how to attach the surface it brought up.
- *   - `ccctl attach` — the UC1 attach on-ramp: list the daemon's running sessions
- *     (`GET /api/sessions`) to pick one to attach to.
+ *   - `ccctl attach` — the UC1 attach flow: with NO id, LIST the daemon's running sessions
+ *     (`GET /api/sessions`) to pick one; with a session ID, SELECT that one and report how to drive
+ *     it — the on-ramp's "select a session to attach to" completion.
+ *   - `ccctl steer` — take over a selected session: push ONE steer verb at it
+ *     (`POST /api/sessions/{id}/command` — send a prompt, approve a pending action, or interrupt),
+ *     the very control path the phone drives.
  *
- * Both go THROUGH the daemon, so a CLI-launched session lands in the same `/api/sessions`
- * list as the phone-driven ones. This is the on-ramp only: completing the attach (selecting a
- * session and taking over its terminal) and the full "New session" UX is #72. This module builds
+ * All go THROUGH the daemon, so a CLI-launched session lands in the same `/api/sessions` list as
+ * the phone-driven ones AND is steerable the same way (the issue's second AC). This module builds
  * the command tree; `cli.ts` is the thin executable that runs it.
  */
 
@@ -48,6 +51,7 @@ import {
 import { DEFAULT_HOST, requireLocalServerAuth, resolveBindHost, type SessionLaunchOptions } from "@ccctl/server";
 import type { TunnelKind } from "@ccctl/tunnel-adapters";
 import { defaultDependencies, type CliDependencies } from "./dependencies.js";
+import type { SteerCommand } from "./session-client.js";
 
 /**
  * Parse a `--port` option into a bound port number, failing closed on anything that
@@ -109,9 +113,9 @@ function requirePermissionMode(value: string): PermissionMode {
 }
 
 /**
- * Render a session's derived {@link SessionActivity} as a one-line phrase for the `attach`
- * on-ramp list. Exhaustive over the union so a new activity kind is a compile error here rather
- * than a silently-dropped state.
+ * Render a session's derived {@link SessionActivity} as a one-line phrase for the `attach` listing
+ * and single-session selection. Exhaustive over the union so a new activity kind is a compile error
+ * here rather than a silently-dropped state.
  */
 function describeActivity(activity: SessionActivity): string {
   switch (activity.kind) {
@@ -122,6 +126,72 @@ function describeActivity(activity: SessionActivity): string {
     case "idle":
       return "idle";
   }
+}
+
+/**
+ * The three steer verbs the daemon maps to worker frames, mirrored from the server's steer contract
+ * (`ui-command.ts`) and the web UI (`@ccctl/web-ui`'s `command.js`): `prompt` sends input as a user
+ * turn, `approve` clears a pending action, `interrupt` redirects the current turn. Held here (not
+ * imported from `@ccctl/core`, which pins only `prompt`) so the CLI and the browser steer one
+ * vocabulary. Each string is ALSO the `ccctl steer` flag name (`--prompt` / `--approve` /
+ * `--interrupt`), so the echoed subtype reads back as the flag the operator typed.
+ */
+const STEER_PROMPT_SUBTYPE = "prompt";
+const STEER_APPROVE_SUBTYPE = "approve";
+const STEER_INTERRUPT_SUBTYPE = "interrupt";
+
+/** The verb flags a `ccctl steer` invocation carries — exactly one selects the steer; see {@link requireSteerCommand}. */
+interface SteerFlags {
+  readonly prompt?: string;
+  readonly approve?: boolean;
+  readonly toolUseId?: string;
+  readonly interrupt?: string;
+}
+
+/**
+ * Narrow a steer's text argument to a non-empty string, failing closed on a blank one BEFORE any
+ * network round-trip — the same fail-fast discipline the other verbs apply (an empty steer is a
+ * daemon `400` anyway). The operator's exact text is preserved (only whitespace-only is rejected),
+ * so leading/trailing spacing they intended in a prompt survives to the worker.
+ */
+function requireSteerText(value: string, flag: string): string {
+  if (value.trim() === "") {
+    throw new Error(`ccctl: ${flag} requires non-empty text`);
+  }
+  return value;
+}
+
+/**
+ * Build the ONE steer a `ccctl steer` invocation carries from its verb flags, or fail closed BEFORE
+ * any network round-trip. EXACTLY one of `--prompt` / `--approve` / `--interrupt` is required — zero
+ * is nothing to steer, two is ambiguous — and `--tool-use-id` only qualifies `--approve` (it names
+ * WHICH pending action to clear). Mirrors the web UI's per-verb command builders, collapsed to the
+ * CLI's single-invocation shape.
+ */
+function requireSteerCommand(flags: SteerFlags): SteerCommand {
+  const verbCount = [flags.prompt !== undefined, flags.approve === true, flags.interrupt !== undefined].filter(
+    Boolean,
+  ).length;
+  if (verbCount === 0) {
+    throw new Error("ccctl: steer requires one of --prompt <text>, --approve, or --interrupt <reason>");
+  }
+  if (verbCount > 1) {
+    throw new Error("ccctl: steer takes exactly one of --prompt, --approve, or --interrupt");
+  }
+  if (flags.toolUseId !== undefined && flags.approve !== true) {
+    throw new Error("ccctl: --tool-use-id is only valid with --approve");
+  }
+  if (flags.prompt !== undefined) {
+    return { subtype: STEER_PROMPT_SUBTYPE, payload: { text: requireSteerText(flags.prompt, "--prompt") } };
+  }
+  if (flags.interrupt !== undefined) {
+    return { subtype: STEER_INTERRUPT_SUBTYPE, payload: { reason: requireSteerText(flags.interrupt, "--interrupt") } };
+  }
+  // `approve` is the only verb with no required argument; `--tool-use-id`, when given, names WHICH
+  // pending action to clear (omitted → the single pending one, matching the web UI's payload-less approve).
+  return flags.toolUseId === undefined
+    ? { subtype: STEER_APPROVE_SUBTYPE }
+    : { subtype: STEER_APPROVE_SUBTYPE, payload: { toolUseId: flags.toolUseId } };
 }
 
 /**
@@ -256,18 +326,38 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       },
     );
 
-  // --- attach: the UC1 attach on-ramp — list a running daemon's sessions ------------
+  // --- attach: the UC1 attach flow — list a running daemon's sessions, or select one ----------
   program
     .command("attach")
-    .description("List a running ccctl daemon's sessions to attach to (the UC1 attach on-ramp)")
+    .description("Attach to a running ccctl daemon's sessions: list them, or select one by id")
+    .argument("[session-id]", "a session id to select (omit to list every session — the attach on-ramp)")
     .option("-p, --port <port>", "loopback port the daemon is on", "4321")
     .option("--host <host>", "loopback host the daemon is on", DEFAULT_HOST)
-    .action(async (options: { port: string; host: string }) => {
+    .action(async (sessionId: string | undefined, options: { port: string; host: string }) => {
       const target: HostEndpoint = { host: resolveBindHost(options.host), port: parsePort(options.port) };
       // The list carries EVERY tracked session, whatever launched it — so a phone-driven session
       // and a `ccctl launch` one enumerate side by side here (the shared `/api/sessions` collection).
       const sessions = await deps.sessionClient.list(target);
       const where = serverUrl(target.host, target.port);
+
+      // With an id: SELECT that one session — the on-ramp's "pick one to attach to" completion.
+      // Resolved from the SAME shared list, so selecting a phone-driven session is identical to
+      // selecting a CLI-launched one; a missing id fails closed rather than steering blind.
+      if (sessionId !== undefined) {
+        const selected = sessions.find((session) => session.id === sessionId);
+        if (selected === undefined) {
+          throw new Error(
+            `ccctl: no session ${sessionId} on ${where} — run \`ccctl attach\` to see the running sessions.`,
+          );
+        }
+        console.log(
+          `ccctl: session ${selected.id} on ${where} — [${selected.status}] ${describeActivity(selected.activity)}`,
+        );
+        console.log(`ccctl: steer it with — ccctl steer ${selected.id} --prompt "…"`);
+        return;
+      }
+
+      // With no id: LIST every session (the attach on-ramp).
       if (sessions.length === 0) {
         console.log(`ccctl: no sessions on ${where} yet — launch one with \`ccctl launch\`.`);
         return;
@@ -277,6 +367,33 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
         console.log(`  ${session.id}  [${session.status}] ${describeActivity(session.activity)}`);
       }
     });
+
+  // --- steer: take over a selected session — push one steer verb at it ----------------
+  program
+    .command("steer")
+    .description("Steer one session on a running daemon: send a prompt, approve, or interrupt")
+    .argument("<session-id>", "the session to steer (from `ccctl attach`)")
+    .option("-p, --port <port>", "loopback port the daemon is on", "4321")
+    .option("--host <host>", "loopback host the daemon is on", DEFAULT_HOST)
+    .option("--prompt <text>", "send input text to the session's current turn")
+    .option("--approve", "approve the session's pending action")
+    .option("--tool-use-id <id>", "which pending tool call to approve (with --approve)")
+    .option("--interrupt <reason>", "redirect the current turn, with a reason")
+    .action(
+      // The verb flags ({@link SteerFlags}) plus the shared daemon-target options.
+      async (sessionId: string, options: SteerFlags & { port: string; host: string }) => {
+        // Resolve the steer verb first (a pure usage error, before any network), then the target —
+        // both fail closed before the round-trip, matching the other verbs' validate-then-act order.
+        const command = requireSteerCommand(options);
+        const target: HostEndpoint = { host: resolveBindHost(options.host), port: parsePort(options.port) };
+
+        const id = await deps.sessionClient.steer(target, sessionId, command);
+        // Echo the wire subtype (which equals the flag the operator typed) and the daemon's minted
+        // correlation id, so a successful steer is confirmed with a handle for the reply on the stream.
+        console.log(`ccctl: steered ${sessionId} on ${serverUrl(target.host, target.port)} (${command.subtype}).`);
+        console.log(`ccctl: the daemon accepted it (correlation ${id}).`);
+      },
+    );
 
   return program;
 }

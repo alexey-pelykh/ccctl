@@ -24,20 +24,26 @@ and expose it via a `tunnel`.
 
 ## Session launch/attach
 
-Two verbs begin the launch/attach UX by driving a **running** daemon's browser-facing
-session namespace (`/api/sessions`) from the command line — the same collection the
-phone drives, so a CLI-launched session lands in the list alongside phone-driven ones:
+Three verbs drive a **running** daemon's browser-facing session namespace (`/api/sessions`)
+from the command line — the same collection the phone drives, so a CLI-launched session lands
+in the list alongside phone-driven ones and is steerable the same way:
 
 - **`ccctl launch`** — launch a new session (UC2) on the daemon (`POST /api/sessions`)
   and report how to attach the surface it brought up. Options target the daemon
   (`--host`, `--port`, default loopback `127.0.0.1:4321`) and shape the session
   (`--cwd`, `--permission-mode`, `--project`, `--initial-prompt`). Against a daemon with
   no launcher wired yet it surfaces the daemon's own `501` as a clear message.
-- **`ccctl attach`** — the UC1 attach on-ramp: list the daemon's running sessions
-  (`GET /api/sessions`) with their status and activity, so you can see what to attach to.
+- **`ccctl attach [session-id]`** — the UC1 attach flow. With no id it **lists** the daemon's
+  running sessions (`GET /api/sessions`) with their status and activity (the on-ramp). With a
+  session id it **selects** that one — resolved from the same shared list — and reports how to
+  steer it.
+- **`ccctl steer <session-id>`** — take over a session and drive it (`POST /api/sessions/{id}/command`),
+  the very control path the phone uses. Exactly one steer verb per invocation:
+  `--prompt <text>` (send input), `--approve` (clear a pending action, optionally `--tool-use-id`),
+  or `--interrupt <reason>` (redirect the current turn). Reports the daemon's minted correlation id.
 
-This is the on-ramp only — completing the attach (selecting a session and taking over
-its terminal) and the full "New session" UX are a later item (#72).
+A launch confirms a terminal came up; the launched worker then registers itself over the bridge
+and joins `ccctl attach` on its own (a later credentialed wave that ships in `ccctl-patch`).
 
 ## Layout
 
