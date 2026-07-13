@@ -7,7 +7,12 @@ import { DEFAULT_HOST, startServer, type CcctlServer } from "@ccctl/server";
 import { ANTHROPIC_INFERENCE_HOST } from "./index.js";
 import { assertInferenceUntouched, InferenceGuaranteeViolation } from "./inference-guarantee.js";
 import { driveOneSessionFlow, waitFor, type OneSessionFlow } from "./one-session-harness.js";
-import { observeInferenceLeg, startInferenceStandIn, type InferenceStandIn } from "./traffic-harness.js";
+import {
+  observeInferenceLeg,
+  probeStandInLiveness,
+  startInferenceStandIn,
+  type InferenceStandIn,
+} from "./traffic-harness.js";
 // The REAL phone client logic — the SSE transcript decode (#15) and the fetch-POST
 // steer builder (#16). Imported and exercised so the flow runs the actual UI
 // decode/build code, never a re-implemented stand-in of it.
@@ -127,6 +132,11 @@ describe("ccctl e2e: one-session flow — register → server → phone view + s
 
       // ...and nothing crossed to the api.anthropic.com stand-in in the whole flow.
       expect(standIn.received).toHaveLength(0);
+      // Liveness canary (#134): the length-0 above is "no flow traffic crossed to the
+      // stand-in", not "this stand-in was never wired" — the SAME instance receives a probe
+      // fired straight at it. Receiver-grounded in its own log.
+      const canary = await probeStandInLiveness(standIn);
+      expect(standIn.received).toEqual([canary]);
     });
 
     it("derives session activity from a PUT worker status and the phone views a status frame as the current turn (#130 + #15)", async () => {
@@ -151,6 +161,11 @@ describe("ccctl e2e: one-session flow — register → server → phone view + s
       expect(processEventData(activityView?.data ?? "")).toMatchObject({ kind: "activity", status: "running" });
 
       expect(standIn.received).toHaveLength(0);
+      // Liveness canary (#134): the length-0 above is "no status/activity traffic crossed
+      // to the stand-in", not "this stand-in was never wired" — the SAME instance receives a
+      // probe fired straight at it. Receiver-grounded in its own log.
+      const canary = await probeStandInLiveness(standIn);
+      expect(standIn.received).toEqual([canary]);
     });
   });
 
@@ -196,6 +211,11 @@ describe("ccctl e2e: one-session flow — register → server → phone view + s
       });
       expect(misrouted.receivedBy).toBe("local-server");
       expect(standIn.received).toHaveLength(0);
+      // Liveness canary (#134): the length-0 above is "the misrouted inference did not reach
+      // the stand-in", not "the stand-in was dead" — the SAME instance receives a probe fired
+      // straight at it. Guards this negative-space assertion the same way.
+      const canary = await probeStandInLiveness(standIn);
+      expect(standIn.received).toEqual([canary]);
       expect(() => assertInferenceUntouched([flow.control, misrouted], EXPECTATION)).toThrow(
         InferenceGuaranteeViolation,
       );

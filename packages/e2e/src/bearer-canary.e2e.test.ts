@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "@ccctl/server";
 import { assertBearerNeverObserved } from "./bearer-canary.js";
 import { driveOneSessionFlow, type OneSessionFlow } from "./one-session-harness.js";
-import { startInferenceStandIn, type InferenceStandIn } from "./traffic-harness.js";
+import { probeStandInLiveness, startInferenceStandIn, type InferenceStandIn } from "./traffic-harness.js";
 
 // Runtime canary for the account-Bearer non-persisting pass-through (issue #60). The
 // account OAuth Bearer rides §1/§2 ONLY and must be validated for receipt then
@@ -130,6 +130,13 @@ describe("ccctl e2e: account Bearer is a non-persisting pass-through — runtime
       expect(logs).toContain(PROBE);
       // ...and nothing crossed to the api.anthropic.com stand-in during the flow.
       expect(standIn.received).toHaveLength(0);
+      // Liveness canary (#134): the length-0 above is "no flow traffic crossed to the
+      // stand-in", not "this stand-in was never wired" — the SAME instance receives a probe
+      // fired straight at it. Receiver-grounded in its own log. Named `livenessCanary` to stay
+      // distinct from the Bearer canary this suite is about; fired after the last read of
+      // `standIn.received` and after the log/snapshot capture, so it perturbs neither.
+      const livenessCanary = await probeStandInLiveness(standIn);
+      expect(standIn.received).toEqual([livenessCanary]);
 
       // The canary: feed the real collected logs + persisted snapshot to the shared
       // verdict — the literal account Bearer is in NEITHER.
