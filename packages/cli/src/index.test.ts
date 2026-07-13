@@ -6,7 +6,9 @@ import type { HostEndpoint } from "@ccctl/core";
 import {
   LOCAL_SERVER_AUTH_ENV,
   type CcctlServer,
+  type ISessionLauncher,
   type LaunchAcceptedWire,
+  type LaunchedSession,
   type SessionLaunchOptions,
   type SessionSummaryWire,
 } from "@ccctl/server";
@@ -57,6 +59,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
   launch: ReturnType<typeof vi.fn>;
   list: ReturnType<typeof vi.fn>;
   steer: ReturnType<typeof vi.fn>;
+  launcher: ISessionLauncher;
 } {
   // A fake bind: echo the requested host, and resolve `--port 0` to a concrete ephemeral
   // port so a test can prove `server.address` (not the requested port) is what's reported.
@@ -96,8 +99,18 @@ function makeDeps(options: FakeDepsOptions = {}): {
       ((_target: HostEndpoint, _sessionId: string, _command: SteerCommand) => Promise.resolve("cmd-corr-1")),
   );
   const sessionClient: SessionClient = { launch, list, steer };
+  // A fake session launcher: the `serve` verb injects it into the daemon (#157); a test asserts the
+  // exact instance is passed to `startServer`, without a real tmux window or a spawned worker.
+  const launcher: ISessionLauncher = {
+    launch: vi.fn((_options: SessionLaunchOptions) =>
+      Promise.resolve({
+        attachment: { attachable: true, hint: "tmux attach -t ccctl:1" },
+        close: () => Promise.resolve(),
+      } satisfies LaunchedSession),
+    ),
+  };
   return {
-    deps: { startServer, adapters, runPatcher, sessionClient },
+    deps: { startServer, adapters, runPatcher, sessionClient, launcher },
     startServer,
     establish,
     runPatcher,
@@ -105,6 +118,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
     launch,
     list,
     steer,
+    launcher,
   };
 }
 
@@ -209,25 +223,34 @@ describe("ccctl serve — starts the daemon (AC2)", () => {
   });
 
   it("starts the daemon on the default loopback host + port and reports the bound address", async () => {
-    const { deps, startServer, establish } = makeDeps();
+    const { deps, startServer, establish, launcher } = makeDeps();
     await buildProgram(deps).parseAsync(["serve"], { from: "user" });
-    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 });
+    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321, launcher });
     expect(establish).not.toHaveBeenCalled();
     expect(loggedText()).toContain("http://127.0.0.1:4321");
   });
 
   it("passes an explicit loopback --host and --port through to the daemon", async () => {
-    const { deps, startServer } = makeDeps();
+    const { deps, startServer, launcher } = makeDeps();
     await buildProgram(deps).parseAsync(["serve", "--host", "127.0.0.1", "--port", "8080"], { from: "user" });
-    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 8080 });
+    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 8080, launcher });
     expect(loggedText()).toContain("http://127.0.0.1:8080");
   });
 
   it("reports the RESOLVED ephemeral port (from server.address), not the requested --port 0", async () => {
-    const { deps, startServer } = makeDeps();
+    const { deps, startServer, launcher } = makeDeps();
     await buildProgram(deps).parseAsync(["serve", "--port", "0"], { from: "user" });
-    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 0 });
+    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 0, launcher });
     expect(loggedText()).toContain("http://127.0.0.1:55555");
+  });
+
+  it("injects the session launcher into the daemon so a New session (UC2) can spawn the patched worker (#157)", async () => {
+    // Without the launcher, `POST /api/sessions` fails closed with a 501; with it, the daemon spawns
+    // the patched `claude`. The `serve` verb MUST forward the injected launcher to `startServer`.
+    const { deps, startServer, launcher } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve"], { from: "user" });
+    expect(startServer).toHaveBeenCalledTimes(1);
+    expect(startServer.mock.calls[0][0]).toHaveProperty("launcher", launcher);
   });
 });
 
@@ -237,9 +260,9 @@ describe("ccctl serve --tunnel — composes daemon + tunnel (AC4)", () => {
   });
 
   it("starts the daemon THEN establishes the tunnel against the bound address, reporting the public host", async () => {
-    const { deps, startServer, establish } = makeDeps();
+    const { deps, startServer, establish, launcher } = makeDeps();
     await buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
-    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 });
+    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321, launcher });
     expect(establish).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 });
     expect(loggedText()).toContain("oracle-node.tailnet.ts.net");
   });
