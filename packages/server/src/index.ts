@@ -269,6 +269,12 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerS
     handleEnvironmentRegister(req, res, state);
     return;
   }
+  // §2 session create is matched EXACTLY (`POST /v1/sessions`); the speculative attach-side
+  // `GET /v1/sessions/{id}` #154 flagged ("Likely also applies…", empty 200 tolerated) is
+  // intentionally NOT routed — an id-suffixed path falls through to the fail-closed 404 below.
+  // Confirmed against the e2e captured-wire golden (bridge-wire-conformance.ts, #131/#155) and
+  // the live-worker oracle (live-worker-oracle.ts): a real worker's attach/restore is the §4/§5
+  // worker channel `GET /v1/code/sessions/{id}/worker`, never a bare session-resource GET (#165).
   if (pathname === SESSIONS_PATH) {
     handleSessionCreate(req, res, state);
     return;
