@@ -12,7 +12,7 @@ import {
 } from "@ccctl/server";
 import type { EstablishedTunnel, Tunnel, TunnelKind } from "@ccctl/tunnel-adapters";
 import type { CliDependencies } from "./dependencies.js";
-import type { SessionClient } from "./session-client.js";
+import type { SessionClient, SteerCommand } from "./session-client.js";
 import { buildProgram } from "./index.js";
 
 // The verbs orchestrate three real capabilities (daemon, tunnels, patcher) behind the
@@ -43,6 +43,8 @@ interface FakeDepsOptions {
   readonly launch?: (target: HostEndpoint, options: SessionLaunchOptions) => Promise<LaunchAcceptedWire>;
   /** Override the session-client `list` (e.g. to reject or seed sessions); defaults to an empty list. */
   readonly list?: (target: HostEndpoint) => Promise<SessionSummaryWire[]>;
+  /** Override the session-client `steer` (e.g. to reject); defaults to an accepted steer returning a correlation id. */
+  readonly steer?: (target: HostEndpoint, sessionId: string, command: SteerCommand) => Promise<string>;
 }
 
 /** Build fake {@link CliDependencies} plus handles to the spies the assertions read. */
@@ -54,6 +56,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
   close: ReturnType<typeof vi.fn>;
   launch: ReturnType<typeof vi.fn>;
   list: ReturnType<typeof vi.fn>;
+  steer: ReturnType<typeof vi.fn>;
 } {
   // A fake bind: echo the requested host, and resolve `--port 0` to a concrete ephemeral
   // port so a test can prove `server.address` (not the requested port) is what's reported.
@@ -86,7 +89,13 @@ function makeDeps(options: FakeDepsOptions = {}): {
         Promise.resolve({ attachable: true, hint: "tmux attach -t ccctl:1" } satisfies LaunchAcceptedWire)),
   );
   const list = vi.fn(options.list ?? ((_target: HostEndpoint) => Promise.resolve([] as SessionSummaryWire[])));
-  const sessionClient: SessionClient = { launch, list };
+  // The `steer` client the `steer` verb drives. Defaults to an accepted steer returning a
+  // daemon-minted correlation id; a test overrides it to reject (404 / 409) or to assert the body sent.
+  const steer = vi.fn(
+    options.steer ??
+      ((_target: HostEndpoint, _sessionId: string, _command: SteerCommand) => Promise.resolve("cmd-corr-1")),
+  );
+  const sessionClient: SessionClient = { launch, list, steer };
   return {
     deps: { startServer, adapters, runPatcher, sessionClient },
     startServer,
@@ -95,6 +104,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
     close,
     launch,
     list,
+    steer,
   };
 }
 
@@ -442,5 +452,173 @@ describe("ccctl attach — the UC1 attach on-ramp lists running sessions (AC1 + 
     await expect(buildProgram(deps).parseAsync(["attach"], { from: "user" })).rejects.toThrow(
       /could not list sessions/,
     );
+  });
+});
+
+describe("ccctl attach <session-id> — selects one session to attach to (UC1 completion)", () => {
+  // Two sessions of DIFFERENT origin sit in the shared list; selecting either is identical, which
+  // is exactly "attached sessions appear alongside phone-driven ones" read from the select side.
+  const seeded = (): SessionSummaryWire[] => [
+    { id: "phone-sess", status: "ready", activity: { kind: "running" } },
+    { id: "cli-sess", status: "busy", activity: { kind: "requires_action", detail: "approve edit" } },
+  ];
+
+  it("selects a named session from the shared list and reports how to steer it", async () => {
+    const { deps } = makeDeps({ list: () => Promise.resolve(seeded()) });
+    await buildProgram(deps).parseAsync(["attach", "cli-sess"], { from: "user" });
+    const text = loggedText();
+    expect(text).toContain("session cli-sess on http://127.0.0.1:4321 — [busy] requires action — approve edit");
+    expect(text).toContain("ccctl steer cli-sess --prompt");
+    // The bare-list rendering ("2 sessions on …") is NOT emitted when one is selected.
+    expect(text).not.toContain("2 sessions on");
+  });
+
+  it("selects a phone-driven session identically (same shared collection)", async () => {
+    const { deps } = makeDeps({ list: () => Promise.resolve(seeded()) });
+    await buildProgram(deps).parseAsync(["attach", "phone-sess"], { from: "user" });
+    expect(loggedText()).toContain("session phone-sess on http://127.0.0.1:4321 — [ready] running");
+  });
+
+  it("fails closed when the id is not among the daemon's sessions (→ non-zero exit)", async () => {
+    const { deps } = makeDeps({ list: () => Promise.resolve(seeded()) });
+    await expect(buildProgram(deps).parseAsync(["attach", "ghost-sess"], { from: "user" })).rejects.toThrow(
+      /no session ghost-sess on http:\/\/127\.0\.0\.1:4321/,
+    );
+  });
+
+  it("resolves the selection against an explicit --host and --port", async () => {
+    const { deps, list } = makeDeps({ list: () => Promise.resolve(seeded()) });
+    await buildProgram(deps).parseAsync(["attach", "cli-sess", "--host", "127.0.0.1", "--port", "9999"], {
+      from: "user",
+    });
+    expect(list).toHaveBeenCalledWith({ host: "127.0.0.1", port: 9999 });
+    expect(loggedText()).toContain("session cli-sess on http://127.0.0.1:9999");
+  });
+});
+
+describe("ccctl steer — drives one session on a running daemon (AC2: steerable)", () => {
+  it("sends a --prompt as a `prompt` steer and reports the daemon's correlation id", async () => {
+    const { deps, steer } = makeDeps({ steer: () => Promise.resolve("corr-42") });
+    await buildProgram(deps).parseAsync(["steer", "sess-1", "--prompt", "ship it"], { from: "user" });
+    expect(steer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 }, "sess-1", {
+      subtype: "prompt",
+      payload: { text: "ship it" },
+    });
+    const text = loggedText();
+    expect(text).toContain("steered sess-1 on http://127.0.0.1:4321 (prompt)");
+    expect(text).toContain("correlation corr-42");
+  });
+
+  it("preserves the operator's exact prompt text (leading/trailing spacing survives)", async () => {
+    const { deps, steer } = makeDeps();
+    await buildProgram(deps).parseAsync(["steer", "sess-1", "--prompt", "  indented\n"], { from: "user" });
+    expect(steer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 }, "sess-1", {
+      subtype: "prompt",
+      payload: { text: "  indented\n" },
+    });
+  });
+
+  it("sends a bare --approve as a payload-less `approve` steer", async () => {
+    const { deps, steer } = makeDeps();
+    await buildProgram(deps).parseAsync(["steer", "sess-1", "--approve"], { from: "user" });
+    expect(steer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 }, "sess-1", { subtype: "approve" });
+  });
+
+  it("carries --tool-use-id on an --approve steer's payload", async () => {
+    const { deps, steer } = makeDeps();
+    await buildProgram(deps).parseAsync(["steer", "sess-1", "--approve", "--tool-use-id", "tool-7"], { from: "user" });
+    expect(steer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 }, "sess-1", {
+      subtype: "approve",
+      payload: { toolUseId: "tool-7" },
+    });
+  });
+
+  it("sends an --interrupt as an `interrupt` steer carrying the reason", async () => {
+    const { deps, steer } = makeDeps();
+    await buildProgram(deps).parseAsync(["steer", "sess-1", "--interrupt", "wrong file"], { from: "user" });
+    expect(steer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 }, "sess-1", {
+      subtype: "interrupt",
+      payload: { reason: "wrong file" },
+    });
+  });
+
+  it("steers against an explicit --host and --port", async () => {
+    const { deps, steer } = makeDeps();
+    await buildProgram(deps).parseAsync(
+      ["steer", "sess-1", "--host", "127.0.0.1", "--port", "9999", "--prompt", "go"],
+      { from: "user" },
+    );
+    expect(steer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 9999 }, "sess-1", {
+      subtype: "prompt",
+      payload: { text: "go" },
+    });
+  });
+
+  it("requires a steer verb — a bare `steer <id>` fails closed BEFORE any network round-trip", async () => {
+    const { deps, steer } = makeDeps();
+    await expect(buildProgram(deps).parseAsync(["steer", "sess-1"], { from: "user" })).rejects.toThrow(
+      /steer requires one of --prompt/,
+    );
+    expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("rejects two steer verbs at once (ambiguous) before any network round-trip", async () => {
+    const { deps, steer } = makeDeps();
+    await expect(
+      buildProgram(deps).parseAsync(["steer", "sess-1", "--prompt", "go", "--approve"], { from: "user" }),
+    ).rejects.toThrow(/exactly one of --prompt, --approve, or --interrupt/);
+    expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("rejects --tool-use-id without --approve", async () => {
+    const { deps, steer } = makeDeps();
+    await expect(
+      buildProgram(deps).parseAsync(["steer", "sess-1", "--prompt", "go", "--tool-use-id", "tool-7"], { from: "user" }),
+    ).rejects.toThrow(/--tool-use-id is only valid with --approve/);
+    expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("rejects a blank --prompt before any network round-trip", async () => {
+    const { deps, steer } = makeDeps();
+    await expect(
+      buildProgram(deps).parseAsync(["steer", "sess-1", "--prompt", "   "], { from: "user" }),
+    ).rejects.toThrow(/--prompt requires non-empty text/);
+    expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("rejects a blank --interrupt before any network round-trip (same non-empty guard)", async () => {
+    const { deps, steer } = makeDeps();
+    await expect(
+      buildProgram(deps).parseAsync(["steer", "sess-1", "--interrupt", "  "], { from: "user" }),
+    ).rejects.toThrow(/--interrupt requires non-empty text/);
+    expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid --port before contacting the daemon", async () => {
+    const { deps, steer } = makeDeps();
+    await expect(
+      buildProgram(deps).parseAsync(["steer", "sess-1", "--prompt", "go", "--port", "not-a-port"], { from: "user" }),
+    ).rejects.toThrow(/invalid port/);
+    expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("refuses a 0.0.0.0 daemon host (never the wildcard)", async () => {
+    const { deps, steer } = makeDeps();
+    await expect(
+      buildProgram(deps).parseAsync(["steer", "sess-1", "--prompt", "go", "--host", "0.0.0.0"], { from: "user" }),
+    ).rejects.toThrow(/refusing to bind 0\.0\.0\.0/);
+    expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("propagates a daemon-side steer rejection (e.g. no live worker) as a rejection (→ non-zero exit)", async () => {
+    const { deps } = makeDeps({
+      steer: () =>
+        Promise.reject(
+          new Error("ccctl: session sess-1 has no live worker yet — it cannot be steered until its worker connects"),
+        ),
+    });
+    await expect(
+      buildProgram(deps).parseAsync(["steer", "sess-1", "--prompt", "go"], { from: "user" }),
+    ).rejects.toThrow(/has no live worker yet/);
   });
 });
