@@ -41,6 +41,20 @@ describe("startServer", () => {
     expect(res.status).toBe(404);
   });
 
+  it("fails closed (404) on the speculative attach-side GET /v1/sessions/{id} (#165)", async () => {
+    // §2 matches `/v1/sessions` EXACTLY (POST create), so an id-suffixed bare-resource GET is
+    // unrouted and falls through to the handler's fail-closed 404. #154 speculated this attach-side
+    // leg "likely also applies" (empty 200 tolerated), extrapolating from the real §4 worker-state
+    // restore `GET /v1/code/sessions/{id}/worker`. Confirmed against the e2e captured-wire golden
+    // (bridge-wire-conformance.ts, #131/#155) and the live-worker oracle (live-worker-oracle.ts,
+    // ORACLE_LEG): a real worker's attach/restore is the §4/§5 worker channel, never a bare
+    // `GET /v1/sessions/{id}` — so the 404 is intentional, not a gap (#165).
+    const server = await startTestServer();
+    const { host, port } = server.address;
+    const res = await fetch(`http://${host}:${port}/v1/sessions/sess-1`, { method: "GET" });
+    expect(res.status).toBe(404);
+  });
+
   it("rejects a second bind on a held port with a branded 'port in use' message, not raw EADDRINUSE (#156)", async () => {
     const first = await startTestServer();
     const heldPort = first.address.port;
