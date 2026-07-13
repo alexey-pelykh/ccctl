@@ -32,14 +32,18 @@ workspace.
 - **`@ccctl/core`** — the hub: session/state model plus the `stream-json`
   control-channel types (`control_request` / `control_response`, NDJSON
   framing). Every other package depends on this.
-- **`@ccctl/server`** — the local server: accepts the patched worker's
-  `stream-json` control channel and relays it to the UI over Server-Sent Events
-  (SSE) + `fetch`.
+- **`@ccctl/server`** — the local server: terminates the patched worker's
+  `stream-json` control channel over the environments-bridge flow
+  (Bearer-authenticated account legs), and exposes a browser-facing session
+  namespace to list, launch (via a tmux launcher), and steer sessions — relaying
+  each session's output to the UI over Server-Sent Events (SSE) + `fetch`.
 - **`@ccctl/web-ui`** — a zero-build static UI (plain HTML + vanilla ES modules,
   no framework, no bundler): `EventSource` for the downstream, `fetch` for the
   upstream.
-- **`@ccctl/tunnel-adapters`** — a pluggable tunnel-adapter interface with stub
-  adapters for Tailscale, Cloudflare, and Headscale behind one interface.
+- **`@ccctl/tunnel-adapters`** — a pluggable tunnel-adapter interface with
+  interchangeable backends: a working Tailscale adapter (tailnet-private
+  `tailscale serve` with mandatory tunnel-auth, plus opt-in ACL provisioning),
+  while Cloudflare and Headscale remain stubs behind the same interface.
 - **`@ccctl/cli`** — the `ccctl` CLI: `patch` the worker, `serve` the local server,
   and expose it through a `tunnel`; plus `launch` / `attach` / `steer` to launch, list,
   and drive sessions on a running daemon.
@@ -67,8 +71,10 @@ pnpm lint        # prettier --check + turbo run lint
 pnpm test        # turbo run test
 ```
 
-This is an early skeleton: packages ship minimal typed stubs, not a working
-implementation.
+The packages are implemented and covered by unit and end-to-end tests. One
+guarantee is still open: the control/inference split is verified today only by a
+hermetic skeleton, so `ccctl` is not yet cleared to run against a live worker or
+real credentials — see [Security posture](docs/security-posture.md).
 
 ## License
 
