@@ -65,6 +65,22 @@ import { readJsonBody, writeError, writeJson } from "./http-response.js";
 const MAX_WORKER_BODY_BYTES = 1024 * 1024;
 
 /**
+ * Default interval (ms) between the per-session downstream **liveness frames** (#166).
+ *
+ * The `--sdk-url` worker's SSE reader enforces a ~45s liveness timeout on its held-open
+ * downstream and counts ONLY real `client_event` frames toward it — a comment-only
+ * keepalive (`:` line) does NOT reset it. So an idle session, whose downstream is otherwise
+ * silent after the opening comment, is guaranteed to hit the timeout and flap
+ * (connect → timeout → reconnect). Emitting a no-op `client_event` every
+ * {@link DEFAULT_WORKER_LIVENESS_INTERVAL_MS} holds the stream open indefinitely.
+ *
+ * 20s sits comfortably below the ~45s window with margin for jitter: even a delayed second
+ * frame (at ~40s) still lands before the timeout, whereas a 25–30s interval leaves a delayed
+ * frame racing the deadline. Overridable per server ({@link ServerConfig.workerLivenessIntervalMs}).
+ */
+export const DEFAULT_WORKER_LIVENESS_INTERVAL_MS = 20_000;
+
+/**
  * The live per-session worker channel: its current epoch, its held-open downstream
  * SSE (or `null` when the worker has not opened / has dropped the stream), and the
  * next downstream `client_event` sequence number.
@@ -76,6 +92,13 @@ export interface WorkerChannelRecord {
   downstream: ServerResponse | null;
   /** The next `sequence_num` / SSE `id` a pushed downstream frame carries (monotonic, starts at 1). */
   nextSeq: number;
+  /**
+   * The armed per-session **liveness interval** (#166) writing a periodic no-op `client_event`
+   * down {@link downstream} to keep it past the worker's ~45s liveness timeout; `null` when no
+   * downstream is held. Cleared on stream close, on supersede (a re-register bumps the epoch),
+   * and on shutdown — so no frame is ever written to a reaped stream and no interval dangles.
+   */
+  livenessTimer: ReturnType<typeof setInterval> | null;
 }
 
 /** The per-server state the worker channel reads and updates. */
@@ -84,6 +107,13 @@ export interface WorkerChannelState {
   readonly sessions: Map<string, Session>;
   /** The live per-session worker channel, keyed by session id (epoch + downstream + seq). */
   readonly workerChannels: Map<string, WorkerChannelRecord>;
+  /**
+   * Interval (ms) between per-session downstream liveness frames (#166). Resolved once at
+   * server start ({@link ServerConfig.workerLivenessIntervalMs} ??
+   * {@link DEFAULT_WORKER_LIVENESS_INTERVAL_MS}); a test passes a short value to exercise the
+   * timer deterministically.
+   */
+  readonly workerLivenessIntervalMs: number;
   /**
    * The per-session UI Server-Sent Events relays. Every payload read off a session's
    * upstream `worker/events` leg (§5) is fanned out to the UI clients subscribed to THAT
@@ -175,13 +205,19 @@ export function handleWorkerRegister(
   }
   req.resume(); // drain the ignorable `{}` body so the socket does not stall.
   const prev = state.workerChannels.get(sessionId);
-  // A re-register supersedes the prior epoch: end the stale downstream so the old
-  // worker's held stream is not left dangling, and bump the epoch.
-  if (prev?.downstream !== null && prev?.downstream !== undefined) {
-    prev.downstream.end();
+  // A re-register supersedes the prior epoch: synchronously end the stale downstream and clear its
+  // liveness interval (`endDownstream` — no dangling timer, no frame written to a reaped stream,
+  // #166) so the old worker's held stream is not left dangling, then bump the epoch.
+  if (prev !== undefined) {
+    endDownstream(prev);
   }
   const epoch = (prev?.epoch ?? 0) + 1;
-  state.workerChannels.set(sessionId, { epoch, downstream: null, nextSeq: prev?.nextSeq ?? 1 });
+  state.workerChannels.set(sessionId, {
+    epoch,
+    downstream: null,
+    nextSeq: prev?.nextSeq ?? 1,
+    livenessTimer: null,
+  });
   writeJson(res, 200, { worker_epoch: epoch });
 }
 
@@ -219,14 +255,35 @@ export function handleWorkerEventsStream(
   });
   // Open with an SSE comment so headers flush immediately and the worker's stream
   // settles before the first pushed frame (a comment is ignored by an SSE reader).
+  // A second open on the SAME record (no intervening re-register) supersedes the prior held
+  // stream: end it and clear its still-armed liveness interval (`endDownstream`) before this one
+  // takes the slot — otherwise that timer is orphaned (a later `clearLivenessTimer` only ever sees
+  // the newest `record.livenessTimer`) and dangles until the first response closes. The normal
+  // worker holds exactly ONE downstream per registration, so this only fires on a
+  // duplicate/misbehaving open; routing it through `endDownstream` keeps "no dangling timer" total.
+  endDownstream(record);
   res.write(": ccctl worker stream\n\n");
   record.downstream = res;
+  // Arm the per-session liveness interval (#166): a no-op `client_event` every
+  // `workerLivenessIntervalMs` keeps THIS held-open downstream past the worker's ~45s
+  // liveness timeout — a silent idle downstream would otherwise be reaped by the worker and
+  // flap. `.unref()` so a lingering interval alone never blocks process exit; it is also
+  // cleared on close (below), on supersede (`handleWorkerRegister`), and on shutdown
+  // (`closeWorkerChannels`).
+  const timer = setInterval(() => {
+    writeLivenessFrame(record, res);
+  }, state.workerLivenessIntervalMs);
+  timer.unref();
+  record.livenessTimer = timer;
   // Reap the downstream when the worker disconnects, so a closed stream is never a
   // dangling write target — but only if it still points at THIS response, so a late
-  // close of a superseded stream cannot evict a reconnect's live downstream.
+  // close of a superseded stream cannot evict a reconnect's live downstream. Clearing THIS
+  // response's interval is unconditional (it belongs to this stream regardless).
   res.on("close", () => {
+    clearInterval(timer);
     if (record.downstream === res) {
       record.downstream = null;
+      record.livenessTimer = null;
     }
   });
 }
@@ -419,24 +476,94 @@ export function hasLiveWorkerChannel(state: WorkerChannelState, sessionId: strin
  */
 export function closeWorkerChannels(state: WorkerChannelState): void {
   for (const record of state.workerChannels.values()) {
-    if (record.downstream !== null) {
-      record.downstream.end();
-      record.downstream = null;
-    }
+    endDownstream(record);
+    record.downstream = null;
   }
 }
 
 // --- internals ---
 
-/** One downstream `client_event` frame per §4/§5: event name pinned, `data` the demux envelope. */
+/**
+ * The inert payload of a **liveness frame** (#166) — a well-formed `client_event` the worker
+ * counts toward downstream liveness (it is the SSE event NAME, `client_event`, that resets the
+ * worker's ~45s timeout) yet demuxes to nothing: `type` is NOT one of the worker's demux
+ * discriminants (`user` / `control_request` / `control_response`), so no turn is injected and no
+ * control action runs. Being a DOWNSTREAM push it also never rides the upstream `worker/events`
+ * transcript leg, so nothing is surfaced to the UI and `worker_status` is untouched — the frame
+ * is a no-op beyond keeping the stream alive.
+ *
+ * The namespaced `type` avoids collision with any real worker payload. Worker-side inertness is
+ * proven end-to-end against a real worker by the #167 e2e follow-up; here it is a no-op by
+ * construction on the server side (asserted in worker-channel.test.ts).
+ */
+const LIVENESS_PAYLOAD: JsonValue = { type: "ccctl_liveness" };
+
+/**
+ * Write one `client_event` frame down a record's live downstream per §4/§5 — event name pinned,
+ * `data` the demux envelope — consuming a monotonic `sequence_num` so the worker sees a gap-free
+ * stream. A `null` downstream is a silent no-op; each caller gates that per its own contract
+ * ({@link pushClientEvent} throws first; {@link writeLivenessFrame} guards first).
+ */
+function writeClientEventFrame(record: WorkerChannelRecord, payload: JsonValue): void {
+  const { downstream } = record;
+  if (downstream === null) {
+    return;
+  }
+  const seq = record.nextSeq++;
+  const data = JSON.stringify({ sequence_num: seq, event_id: randomUUID(), event_type: "message", payload });
+  downstream.write(`event: client_event\nid: ${seq}\ndata: ${data}\n\n`);
+}
+
+/**
+ * Push one `client_event` down the session's held-open downstream (turn injection / steer). Fails
+ * closed (throws) when the session has no live downstream — the UI-facing callers surface that.
+ */
 function pushClientEvent(state: WorkerChannelState, sessionId: string, payload: JsonValue): void {
   const record = state.workerChannels.get(sessionId);
   if (record === undefined || record.downstream === null) {
     throw new Error(`ccctl: no live worker channel for session ${sessionId}`);
   }
-  const seq = record.nextSeq++;
-  const data = JSON.stringify({ sequence_num: seq, event_id: randomUUID(), event_type: "message", payload });
-  record.downstream.write(`event: client_event\nid: ${seq}\ndata: ${data}\n\n`);
+  writeClientEventFrame(record, payload);
+}
+
+/**
+ * Write one no-op {@link LIVENESS_PAYLOAD} `client_event` (#166) — but ONLY if `res` is still the
+ * record's live, writable downstream. Guards (never throws) so a fired-but-stale interval can
+ * never write to a reaped/ended stream; unlike {@link pushClientEvent} an absent/mismatched
+ * downstream is a silent no-op, not an error.
+ */
+function writeLivenessFrame(record: WorkerChannelRecord, res: ServerResponse): void {
+  if (record.downstream !== res || res.writableEnded) {
+    return;
+  }
+  writeClientEventFrame(record, LIVENESS_PAYLOAD);
+}
+
+/**
+ * Clear a record's armed liveness interval, if any, and null the field. Idempotent — safe on a
+ * record whose timer is already null or already cleared (supersede + a later stream-close both
+ * reach it).
+ */
+function clearLivenessTimer(record: WorkerChannelRecord): void {
+  if (record.livenessTimer !== null) {
+    clearInterval(record.livenessTimer);
+    record.livenessTimer = null;
+  }
+}
+
+/**
+ * End a record's held-open downstream and clear its armed liveness timer (#166) — the single
+ * teardown every downstream-ending path routes through: a supersede (a re-register in
+ * {@link handleWorkerRegister}, a duplicate open in {@link handleWorkerEventsStream}) and shutdown
+ * ({@link closeWorkerChannels}). Ending the stream and clearing its timer are kept inseparable here
+ * so no new downstream inherits a stale interval and no timer is left to dangle. Leaves
+ * `record.downstream` set for the caller to null or reassign.
+ */
+function endDownstream(record: WorkerChannelRecord): void {
+  clearLivenessTimer(record);
+  if (record.downstream !== null) {
+    record.downstream.end();
+  }
 }
 
 /**

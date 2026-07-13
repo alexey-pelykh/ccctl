@@ -14,6 +14,7 @@ import {
   workerRegisterPath,
 } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
+import { DEFAULT_WORKER_LIVENESS_INTERVAL_MS } from "./worker-channel.js";
 
 const ACCOUNT_BEARER = "oauth-account-secret-worker-abc123";
 
@@ -487,5 +488,213 @@ describe("worker liveness — server.hasLiveWorker reflects a held-open downstre
     expect(server.hasLiveWorker(sessionId)).toBe(true);
     // Corroboration: the injectTurn precondition hasLiveWorker gates is now met.
     expect(() => server.injectTurn(sessionId, "go")).not.toThrow();
+  });
+});
+
+// --- #166: downstream liveness frames ---
+
+/** Start a server whose #166 liveness interval is SHORT, so the timer fires within a test window. */
+async function startLivenessServer(workerLivenessIntervalMs: number): Promise<CcctlServer> {
+  const server = await startServer({ port: 0, host: DEFAULT_HOST, workerLivenessIntervalMs });
+  started.push(server);
+  return server;
+}
+
+/** One UI-transcript SSE event read off `GET /api/sessions/{id}/events`. */
+interface UiSseEvent {
+  readonly id: string | undefined;
+  readonly data: string;
+}
+
+/** Parse one UI-transcript SSE block into `{ id, data }` (raw string `data`), or null for a comment
+ *  — the string-`data` sibling of `parseWorkerSseBlock`; these frames exist only to prove none arrive. */
+function parseUiSseBlock(block: string): UiSseEvent | null {
+  let id: string | undefined;
+  const dataLines: string[] = [];
+  for (const line of block.split("\n")) {
+    if (line.startsWith(":")) {
+      continue;
+    }
+    if (line.startsWith("id:")) {
+      id = line.slice(3).trim();
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).replace(/^ /, ""));
+    }
+  }
+  return dataLines.length === 0 ? null : { id, data: dataLines.join("\n") };
+}
+
+/**
+ * Subscribe a UI client to a session's transcript stream (`GET /api/sessions/{id}/events`) and
+ * collect its data events — used to prove a downstream liveness frame surfaces NOTHING to the UI
+ * (the transcript is fed only by the upstream `worker/events` leg).
+ */
+function openUiEventStream(server: CcctlServer, sessionId: string): Promise<{ received(): UiSseEvent[] }> {
+  const { host, port } = server.address;
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host,
+        port,
+        path: `/api/sessions/${sessionId}/events`,
+        method: "GET",
+        headers: { Accept: "text/event-stream" },
+      },
+      (res: IncomingMessage) => {
+        streams.push(res);
+        res.setEncoding("utf8");
+        res.on("error", () => {}); // swallow a reset when the server ends the stream on shutdown.
+        const events: UiSseEvent[] = [];
+        let buffer = "";
+        res.on("data", (chunk: string) => {
+          buffer += chunk;
+          let boundary = buffer.indexOf("\n\n");
+          while (boundary !== -1) {
+            const parsed = parseUiSseBlock(buffer.slice(0, boundary));
+            if (parsed !== null) {
+              events.push(parsed);
+            }
+            buffer = buffer.slice(boundary + 2);
+            boundary = buffer.indexOf("\n\n");
+          }
+        });
+        resolve({ received: () => events });
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/** The `payload.type` of a received downstream frame, or `undefined` if it has none. */
+function framePayloadType(frame: ClientEventFrame): unknown {
+  return (frame.data.payload as { type?: unknown }).type;
+}
+
+describe("§4 worker downstream liveness — periodic no-op client_event frames hold an idle stream open (#166)", () => {
+  const INTERVAL_MS = 25;
+
+  it("keeps a held-open downstream alive with periodic `client_event` liveness frames at the configured interval (AC2)", async () => {
+    const server = await startLivenessServer(INTERVAL_MS);
+    const sessionId = await registerSession(server);
+    await registerWorker(server, sessionId);
+    const stream = await openWorkerStream(server, sessionId);
+
+    // Two+ frames prove PERIODIC emission (not a single opening push); the worker resets its
+    // ~45s liveness timeout on each `client_event` it reads.
+    await waitFor(() => stream.received().length >= 2);
+    const frames = stream.received();
+    for (const frame of frames) {
+      expect(frame.event).toBe("client_event"); // the event NAME the worker counts toward liveness.
+      expect(frame.data.event_type).toBe("message"); // identical envelope to a turn frame.
+      expect(typeof frame.data.sequence_num).toBe("number");
+    }
+    // Monotonic, gap-free, unique sequence numbers — the worker sees an ordered stream.
+    const seqs = frames.map((frame) => frame.data.sequence_num as number);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    expect(new Set(seqs).size).toBe(seqs.length);
+  });
+
+  it("the liveness frame is a proven no-op: not a user turn, nothing surfaced to the UI transcript, worker_status unchanged (AC3)", async () => {
+    const server = await startLivenessServer(INTERVAL_MS);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    // Idle first — the liveness frames must NOT move the session off idle.
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+    const ui = await openUiEventStream(server, sessionId);
+    const stream = await openWorkerStream(server, sessionId);
+
+    await waitFor(() => stream.received().length >= 2);
+
+    for (const frame of stream.received()) {
+      expect(framePayloadType(frame)).not.toBe("user"); // no turn injected.
+      expect(framePayloadType(frame)).toBe("ccctl_liveness"); // the inert no-op payload.
+    }
+    // The transcript is fed ONLY by the upstream worker/events leg — a downstream liveness push
+    // never reaches it, so the subscribed UI client sees nothing.
+    expect(ui.received()).toEqual([]);
+    // Derived activity (from worker_status) is untouched — still idle.
+    expect(server.sessions.get(sessionId)?.activity).toEqual({ kind: "idle" });
+  });
+
+  it("does NOT disturb turn injection down the same client_event channel — the turn still lands as a `{ type: 'user' }` frame (AC5)", async () => {
+    const server = await startLivenessServer(INTERVAL_MS);
+    const sessionId = await registerSession(server);
+    await registerWorker(server, sessionId);
+    const stream = await openWorkerStream(server, sessionId);
+
+    server.injectTurn(sessionId, "run the migration");
+    // The user turn lands, interleaved with liveness frames but present and well-formed.
+    await waitFor(() => stream.received().some((frame) => framePayloadType(frame) === "user"));
+    const userFrame = stream.received().find((frame) => framePayloadType(frame) === "user");
+    expect(userFrame?.event).toBe("client_event");
+    const payload = userFrame?.data.payload as { message?: { content?: { text?: string }[] } };
+    expect(payload?.message?.content?.[0]?.text).toBe("run the migration");
+  });
+
+  it("clears the per-session timer when the downstream closes — the reap nulls the live channel and the server stays healthy (AC4)", async () => {
+    const server = await startLivenessServer(INTERVAL_MS);
+    const sessionId = await registerSession(server);
+    await registerWorker(server, sessionId);
+    const stream = await openWorkerStream(server, sessionId);
+    await waitFor(() => stream.received().length >= 1);
+    expect(server.hasLiveWorker(sessionId)).toBe(true);
+
+    // The worker disconnects: the close handler clears the interval and reaps the downstream.
+    streams.pop()?.destroy();
+    await waitFor(() => server.hasLiveWorker(sessionId) === false);
+    // The server stays healthy after the reap — a dangling interval writing to a dead stream
+    // would otherwise throw; a fresh register still works.
+    const epoch2 = await registerWorker(server, sessionId);
+    expect(epoch2).toBeGreaterThan(0);
+  });
+
+  it("supersede (re-register) clears the stale timer and ends its stream — no frames to a reaped stream, a fresh downstream re-arms (AC4)", async () => {
+    const server = await startLivenessServer(INTERVAL_MS);
+    const sessionId = await registerSession(server);
+    await registerWorker(server, sessionId);
+    const stale = await openWorkerStream(server, sessionId);
+    await waitFor(() => stale.received().length >= 1);
+
+    // Re-register bumps the epoch and supersedes: the stale downstream is ended and its timer
+    // cleared synchronously.
+    await registerWorker(server, sessionId);
+    const frozen = stale.received().length;
+    // Give a leaked interval several chances to fire against the reaped stream; it must not.
+    await new Promise((resolve) => setTimeout(resolve, INTERVAL_MS * 4));
+    expect(stale.received().length).toBe(frozen); // no dangling timer wrote to the reaped stream.
+
+    // A fresh downstream on the new epoch re-arms its own liveness timer.
+    const fresh = await openWorkerStream(server, sessionId);
+    await waitFor(() => fresh.received().length >= 2);
+    expect(fresh.received().every((frame) => frame.event === "client_event")).toBe(true);
+  });
+
+  it("supersede while the stale stream stays open still ends it and stops its liveness frames (AC4)", async () => {
+    // A duplicate/late open on the SAME record must not orphan a liveness interval: a second
+    // `events/stream` on the same epoch supersedes the first, ending it and clearing its timer.
+    const server = await startLivenessServer(INTERVAL_MS);
+    const sessionId = await registerSession(server);
+    await registerWorker(server, sessionId);
+    const first = await openWorkerStream(server, sessionId);
+    await waitFor(() => first.received().length >= 1);
+
+    // Re-open on the same session/epoch (no re-register): the first stream is superseded.
+    const second = await openWorkerStream(server, sessionId);
+    const firstFrozen = first.received().length;
+    await new Promise((resolve) => setTimeout(resolve, INTERVAL_MS * 4));
+    expect(first.received().length).toBe(firstFrozen); // the first stream's timer was cleared, not orphaned.
+
+    // The second (current) stream carries the live liveness timer.
+    await waitFor(() => second.received().length >= 2);
+    expect(second.received().every((frame) => frame.event === "client_event")).toBe(true);
+    expect(server.hasLiveWorker(sessionId)).toBe(true);
+  });
+
+  it("defaults the liveness interval comfortably below the worker's ~45s timeout (AC2)", () => {
+    // The default must sit in the AC's stated 20–30s band — below the worker's ~45s liveness
+    // window with margin for jitter — so an idle session holds without a hand-tuned config.
+    expect(DEFAULT_WORKER_LIVENESS_INTERVAL_MS).toBeGreaterThanOrEqual(20_000);
+    expect(DEFAULT_WORKER_LIVENESS_INTERVAL_MS).toBeLessThanOrEqual(30_000);
   });
 });
