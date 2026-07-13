@@ -40,4 +40,16 @@ describe("startServer", () => {
     const res = await fetch(`http://${host}:${port}/v1/nope`, { method: "POST" });
     expect(res.status).toBe(404);
   });
+
+  it("rejects a second bind on a held port with a branded 'port in use' message, not raw EADDRINUSE (#156)", async () => {
+    const first = await startTestServer();
+    const heldPort = first.address.port;
+
+    // A second serve on the same, now-held port must fail — with the branded,
+    // actionable ccctl guardrail the CLI surfaces (cli.ts prints error.message and
+    // exits non-zero), never the raw Node "listen EADDRINUSE…" string or a stack.
+    const rejection = startServer({ port: heldPort, host: DEFAULT_HOST });
+    await expect(rejection).rejects.toThrow(new RegExp(`^ccctl: port ${heldPort} is already in use — .*pass --port`));
+    await expect(rejection).rejects.not.toThrow(/EADDRINUSE/);
+  });
 });

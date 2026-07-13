@@ -90,3 +90,35 @@ export function resolveBindHost(host: string = DEFAULT_HOST): string {
   }
   return host;
 }
+
+/**
+ * The Node `listen()` error code for "address already in use". Named so the guard
+ * below and its tests reference the one literal instead of transcribing it.
+ */
+export const ADDRESS_IN_USE_CODE = "EADDRINUSE";
+
+/**
+ * Rebrand a `listen()` failure into an actionable, branded error. When the port is
+ * already bound ({@link ADDRESS_IN_USE_CODE}) the raw Node message ("listen
+ * EADDRINUSE: address already in use 127.0.0.1:4321") is replaced with a branded
+ * `ccctl:` line that names the port and the fix — a second `ccctl serve` on a
+ * held port should read as a guardrail, not a stack-adjacent Node diagnostic
+ * (#156). Every other listen error passes through unchanged so its own diagnostics
+ * survive. Pure and takes the port explicitly so the branding is unit-testable
+ * without binding a socket, exactly like the guards above.
+ *
+ * Matches their voice ({@link resolveBindHost} / {@link requireLocalServerAuth}):
+ * a `ccctl:` prefix, the cause, then what to do. The daemon
+ * ({@link https://ccctl | @ccctl/cli}'s `serve`) already prints `error.message`
+ * (never the stack) and exits non-zero, so a branded message here is the whole
+ * user-visible fix.
+ */
+export function brandListenError(error: NodeJS.ErrnoException, port: number): Error {
+  if (error.code === ADDRESS_IN_USE_CODE) {
+    return new Error(
+      `ccctl: port ${port} is already in use — another 'ccctl serve' may be running; ` +
+        `stop it or pass --port <port>.`,
+    );
+  }
+  return error;
+}

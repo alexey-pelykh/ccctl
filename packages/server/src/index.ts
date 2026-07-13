@@ -80,6 +80,7 @@ import {
   type EnvironmentRecord,
 } from "./environments-bridge.js";
 import {
+  brandListenError,
   DEFAULT_HOST,
   LOCAL_SERVER_AUTH_ENV,
   requireLocalServerAuth,
@@ -372,7 +373,11 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
 
   return new Promise<CcctlServer>((resolve, reject) => {
     const onListenError = (error: Error): void => {
-      reject(error);
+      // Rebrand a "port already in use" failure into an actionable ccctl: guardrail
+      // message (#156); any other listen error passes through unchanged. The CLI
+      // prints error.message (never the stack) and exits non-zero, so branding here
+      // is the whole user-visible fix.
+      reject(brandListenError(error, config.port));
     };
     httpServer.once("error", onListenError);
     httpServer.listen(config.port, host, () => {
