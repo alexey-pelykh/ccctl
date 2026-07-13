@@ -16,9 +16,17 @@
  */
 
 import { spawn } from "node:child_process";
-import { startServer, type CcctlServer, type ServerConfig } from "@ccctl/server";
+import {
+  createFallbackSessionLauncher,
+  createTmuxSessionLauncher,
+  startServer,
+  type CcctlServer,
+  type ISessionLauncher,
+  type ServerConfig,
+} from "@ccctl/server";
 import { ADAPTERS, type Tunnel, type TunnelKind } from "@ccctl/tunnel-adapters";
 import { defaultSessionClient, type SessionClient } from "./session-client.js";
+import { defaultWorkerCommand } from "./worker-command.js";
 
 /** The command-line name of the external patcher the `patch` verb delegates to. */
 export const PATCHER_BIN = "ccctl-patch";
@@ -41,6 +49,15 @@ export interface CliDependencies {
    * with a fake (no real socket, no running daemon), the same as the three seams above.
    */
   readonly sessionClient: SessionClient;
+  /**
+   * The session launcher the `serve` verb injects into the daemon (#157 wires production;
+   * #31 shaped the port) — the {@link https://ccctl | ISessionLauncher} a `POST /api/sessions`
+   * "New session" request runs to bring up a headful terminal running the PATCHED `claude`.
+   * {@link defaultDependencies} composes the tmux backend (#29) with the production
+   * `remote-control` worker-argv builder ({@link defaultWorkerCommand}); a test injects a fake
+   * so `serve` is exercised without a real tmux or a spawned worker, the same as the seams above.
+   */
+  readonly launcher: ISessionLauncher;
 }
 
 /**
@@ -82,10 +99,17 @@ export function defaultRunPatcher(args: readonly string[]): Promise<void> {
   });
 }
 
-/** The production seams: the real daemon, the real tunnel adapters, the real patcher delegation, and the real session client. */
+/** The production seams: the real daemon, the real tunnel adapters, the real patcher delegation, the real session client, and the real session launcher. */
 export const defaultDependencies: CliDependencies = {
   startServer,
   adapters: ADAPTERS,
   runPatcher: defaultRunPatcher,
   sessionClient: defaultSessionClient,
+  // Compose the tmux backend (#29) behind the fallback launcher composite (#31) — the documented
+  // composition-root shape, forward-compatible with the owned-pty fallback (#30) when it lands —
+  // driving the production `remote-control` worker-argv builder (#157) on the CONFIGURED binary
+  // (CCCTL_CLAUDE_BIN, default `claude`). Absent tmux, a launch fails closed daemon-side; and the
+  // CONFIGURED binary MUST be the PATCHED `claude` — an unpatched one reaches the real bridge, since
+  // local-server registration is its baked-in `--sdk-url` wiring, not this argv (see `worker-command.ts`).
+  launcher: createFallbackSessionLauncher([createTmuxSessionLauncher({ workerCommand: defaultWorkerCommand })]),
 };

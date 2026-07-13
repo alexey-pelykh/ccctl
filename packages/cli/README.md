@@ -15,7 +15,9 @@ Three verbs stand up the local setup:
   `--tunnel <kind>` additionally exposes it through a tunnel in one step. Enforces
   the baseline startup guards from `@ccctl/server` before binding
   (refuse-start-without-auth + localhost-bind: no configured local-server auth exits
-  non-zero, and a `0.0.0.0` bind is refused).
+  non-zero, and a `0.0.0.0` bind is refused). Wires the session launcher a `ccctl launch`
+  runs, so a "New session" spawns the **patched** `claude` worker; the binary defaults to
+  `claude` on `PATH` and is pinned to an absolute path via `CCCTL_CLAUDE_BIN`.
 - **`ccctl tunnel <kind>`** — establish a [`@ccctl/tunnel-adapters`](../tunnel-adapters)
   tunnel exposing an already-running loopback server.
 
@@ -31,8 +33,11 @@ in the list alongside phone-driven ones and is steerable the same way:
 - **`ccctl launch`** — launch a new session (UC2) on the daemon (`POST /api/sessions`)
   and report how to attach the surface it brought up. Options target the daemon
   (`--host`, `--port`, default loopback `127.0.0.1:4321`) and shape the session
-  (`--cwd`, `--permission-mode`, `--project`, `--initial-prompt`). Against a daemon with
-  no launcher wired yet it surfaces the daemon's own `501` as a clear message.
+  (`--cwd`, `--permission-mode`, `--project`, `--initial-prompt`). The daemon spawns the
+  configured patched `claude` as `claude remote-control --name <name> --permission-mode
+<mode> --spawn=same-dir`, so the worker registers against the local server rather than
+  the real bridge. A daemon configured without a launcher surfaces its own `501` as a
+  clear message.
 - **`ccctl attach [session-id]`** — the UC1 attach flow. With no id it **lists** the daemon's
   running sessions (`GET /api/sessions`) with their status and activity (the on-ramp). With a
   session id it **selects** that one — resolved from the same shared list — and reports how to
@@ -49,8 +54,9 @@ and joins `ccctl attach` on its own (a later credentialed wave that ships in `cc
 
 Command parsing uses [commander](https://github.com/tj/commander.js); `src/cli.ts` is the
 thin executable entry (shebang + argv parse), `src/index.ts` builds the command tree,
-`src/dependencies.ts` wires the real daemon / tunnel / patcher / session-client seams
-(injectable so the verbs are unit-testable without binding a socket or spawning a
-process), and `src/session-client.ts` is the real `fetch`-based `/api/sessions` client the
-launch/attach verbs drive. Depends on [`@ccctl/core`](../core),
+`src/dependencies.ts` wires the real daemon / tunnel / patcher / session-client / launcher
+seams (injectable so the verbs are unit-testable without binding a socket or spawning a
+process), `src/worker-command.ts` builds the patched worker's `remote-control` argv and
+binds the patched-binary path (`CCCTL_CLAUDE_BIN`), and `src/session-client.ts` is the real
+`fetch`-based `/api/sessions` client the launch/attach verbs drive. Depends on [`@ccctl/core`](../core),
 [`@ccctl/server`](../server), and [`@ccctl/tunnel-adapters`](../tunnel-adapters).

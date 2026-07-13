@@ -243,7 +243,10 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       const kind = options.tunnel === undefined ? undefined : requireTunnelKind(deps.adapters, options.tunnel);
       const port = parsePort(options.port);
 
-      const server = await deps.startServer({ host, port });
+      // Inject the session launcher so a `POST /api/sessions` "New session" (UC2) actually spawns
+      // the PATCHED `claude` worker (#157) — without it the daemon tracks sessions but fails a launch
+      // closed with a 501. The launcher is a seam so a test drives `serve` without a real tmux/worker.
+      const server = await deps.startServer({ host, port, launcher: deps.launcher });
       // Report the address actually bound (`server.address` carries the resolved port,
       // which matters when `--port 0` selects an ephemeral one).
       console.log(`ccctl: serving on ${serverUrl(server.address.host, server.address.port)}`);
