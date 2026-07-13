@@ -29,8 +29,9 @@
  * ingress token the server minted into the work-secret, NEVER the account Bearer.
  *
  * **Browser-facing session namespace (#13, session-addressed by #20).** The UI transport
- * is per session: `GET /api/sessions` lists the tracked sessions; `GET
- * /api/sessions/{id}/events` subscribes to one session's Server-Sent Events stream (the
+ * is per session: `GET /api/sessions` lists the tracked sessions and `POST /api/sessions`
+ * LAUNCHES a fresh headful session via the injected launcher (#31 — `ui-session-launch.ts`);
+ * `GET /api/sessions/{id}/events` subscribes to one session's Server-Sent Events stream (the
  * worker channel fans that session's upstream `worker/events` payloads (§5) out to ONLY
  * its subscribers); and `POST /api/sessions/{id}/command` steers that one session (the
  * server pushes it worker-ward as a `client_event` on the addressed session's downstream;
@@ -62,6 +63,12 @@ import {
 } from "./event-stream.js";
 import { handleUiCommand } from "./ui-command.js";
 import { handleSessionsList, matchUiSessionRoute } from "./ui-sessions.js";
+import {
+  closeLaunchedSessions,
+  handleSessionLaunch,
+  launchSession as launchTrackedSession,
+} from "./ui-session-launch.js";
+import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
 import { writeError } from "./http-response.js";
 import {
   DEFAULT_WORK_POLL_TIMEOUT_MS,
@@ -121,6 +128,13 @@ export {
   type TmuxSessionLauncherConfig,
 } from "./session-launcher-tmux.js";
 
+// Re-export the fallback launcher composite (#31) on the public surface. The daemon composes
+// the primary tmux backend (#29) with any fallback (#30) behind ONE ISessionLauncher port via
+// this, then injects the result as ServerConfig.launcher — so a "New session" request lands on
+// whichever backend is available ("via the primary or fallback backend"). Defined in
+// session-launcher-fallback.ts.
+export { createFallbackSessionLauncher } from "./session-launcher-fallback.js";
+
 /** Configuration for a ccctl server instance. */
 export interface ServerConfig {
   /** Loopback port the local HTTP server binds to. `0` selects an ephemeral port. */
@@ -133,6 +147,14 @@ export interface ServerConfig {
    * a deterministic timeout.
    */
   workPollTimeoutMs?: number;
+  /**
+   * The session launcher a `POST /api/sessions` "New session" request runs (#31) to bring up a
+   * headful, locally-attachable terminal running the patched `claude`. An injected
+   * {@link ISessionLauncher} port — the daemon composes the primary tmux backend (#29) with any
+   * fallback (#30) behind it (see `createFallbackSessionLauncher`). Absent → the server tracks
+   * and relays sessions but cannot launch one; `POST /api/sessions` fails closed with a 501.
+   */
+  launcher?: ISessionLauncher;
 }
 
 /** A running ccctl server: the relay between the environments-bridge worker and the UI. */
@@ -162,6 +184,15 @@ export interface CcctlServer {
    * whose worker has not opened (or has closed) its downstream.
    */
   hasLiveWorker(sessionId: string): boolean;
+  /**
+   * Launch a fresh headful session (#31) via the configured {@link ServerConfig.launcher} and
+   * track its terminal handle for shutdown teardown — the programmatic form of a
+   * `POST /api/sessions` "New session" request. Resolves with the {@link LaunchedSession}
+   * ({@link TerminalAttachment} + `close`). Rejects if no launcher is configured, or if every
+   * launcher backend could bring up no surface. The launched worker registers itself over the
+   * bridge (§2) and then appears in {@link CcctlServer.sessions} on its own.
+   */
+  launchSession(options: SessionLaunchOptions): Promise<LaunchedSession>;
   /** Stop accepting connections and release the port. */
   close(): Promise<void>;
 }
@@ -175,6 +206,10 @@ interface ServerState {
   readonly workerChannels: Map<string, WorkerChannelRecord>;
   /** The per-session UI Server-Sent Events relays — each session its own subscribers + replay buffer. */
   readonly eventRelays: SessionEventRelays;
+  /** The injected session launcher (#31), or `undefined` when this server was configured without one. */
+  readonly launcher: ISessionLauncher | undefined;
+  /** Handles to the terminals this server launched (#31), tracked so shutdown tears them down. */
+  readonly launchedSessions: Set<LaunchedSession>;
   /** Long-poll hold (ms) for an empty `…/work/poll`. */
   readonly workPollTimeoutMs: number;
   /** Provisional at construction; finalized with the resolved port once bound. */
@@ -195,7 +230,13 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerS
   if (uiSession !== null) {
     switch (uiSession.kind) {
       case "list":
-        handleSessionsList(req, res, state);
+        // The `/api/sessions` collection: POST LAUNCHES a new session (#31), GET LISTS them.
+        // Each handler owns its own method guard (a non-GET falls through to the list's 405).
+        if (req.method === "POST") {
+          handleSessionLaunch(req, res, state);
+        } else {
+          handleSessionsList(req, res, state);
+        }
         return;
       case "events":
         handleEventStream(req, res, state, uiSession.sessionId);
@@ -256,6 +297,9 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
     hasLiveWorker(sessionId: string): boolean {
       return hasLiveWorkerChannel(state, sessionId);
     },
+    launchSession(options: SessionLaunchOptions): Promise<LaunchedSession> {
+      return launchTrackedSession(state, options);
+    },
     close(): Promise<void> {
       return new Promise<void>((resolve, reject) => {
         httpServer.close((error) => {
@@ -277,6 +321,9 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
         // `closeIdleConnections()` below would leave it and `close()` would hang waiting on it.
         closeEventStreams(state.eventRelays);
         closeWorkerChannels(state);
+        // Tear down every terminal this server launched (#31) — a tmux window kept open past
+        // shutdown would leak; each close() is idempotent and swallows its own errors.
+        closeLaunchedSessions(state);
         // Release idle keep-alive HTTP sockets so a quiescent server closes promptly
         // instead of waiting on pooled client connections.
         httpServer.closeIdleConnections();
@@ -297,6 +344,8 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     environments: new Map<string, EnvironmentRecord>(),
     workerChannels: new Map<string, WorkerChannelRecord>(),
     eventRelays: createSessionEventRelays(),
+    launcher: config.launcher,
+    launchedSessions: new Set<LaunchedSession>(),
     workPollTimeoutMs: config.workPollTimeoutMs ?? DEFAULT_WORK_POLL_TIMEOUT_MS,
     address: { host, port: config.port },
   };
