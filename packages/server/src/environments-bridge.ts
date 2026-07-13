@@ -3,7 +3,7 @@
 
 /**
  * The environments-bridge flow — the server side (bridge-protocol §1/§2/§3),
- * conformed to the current worker's observed wire (issue #130).
+ * conformed to the current worker's observed wire (issues #130, #154).
  *
  * `@ccctl/server` terminates the Claude Code `--sdk-url` control transport. This
  * module owns three of its legs (§4/§5, the per-session HTTP+SSE worker channel, is
@@ -20,8 +20,10 @@
  *       is NO `ws_url` (the SSE control path never reads one).
  *   §3. **Work delivery** — `GET …/work/poll` ({@link handleWorkPoll}), long-polled
  *       and carrying NO credential. It answers a SINGLE {@link WorkItem} (or an empty
- *       body — "no work"), never a `{ work: [...] }` envelope, under a reclaim model
- *       (no ack/stop).
+ *       body — "no work"), never a `{ work: [...] }` envelope. Delivery is at-most-once
+ *       (the poll dequeues); there is no ack-driven redelivery. After delivery the
+ *       worker drives the item's lifecycle with `POST …/work/{workId}/{ack,heartbeat,stop}`
+ *       ({@link handleWorkLifecycle}), which the server acknowledges `200` (issue #154).
  *
  * **Two-credential boundary (HARD, #130).** The account OAuth Bearer rides §1/§2
  * ONLY. It is a strict NON-PERSISTING pass-through: validated for RECEIPT via
@@ -93,7 +95,12 @@ export interface EnvironmentRecord {
   readonly id: string;
   /** The concurrent-session cap the environment declared at register. */
   readonly maxSessions: number;
-  /** Work awaiting delivery, FIFO. A poll takes ONE item; there is no ack (reclaim model). */
+  /**
+   * Work awaiting delivery, FIFO. A poll takes ONE item (delivery is at-most-once —
+   * the poll dequeues, no ack-driven redelivery). The worker's subsequent
+   * `…/work/{workId}/{ack,heartbeat,stop}` are acknowledged (200) but carry no
+   * queue-state change at this slice — the item was already dequeued at poll (#154).
+   */
   readonly queue: WorkItem[];
   /** Poll responses held open awaiting work (at most one per worker at this slice). */
   readonly waiters: Set<PollWaiter>;
@@ -119,7 +126,9 @@ export interface BridgeState {
  * Handle `POST /v1/environments/bridge` (§1). Requires the account Bearer (present →
  * validated for receipt, then dropped; never persisted), parses the body fail-closed
  * (new `machine_name` / nullable `git_repo_url` / `metadata` shape), mints an
- * environment id, records the environment, and answers `201` with `{ environment_id }`.
+ * environment id, records the environment, and answers `200` with `{ environment_id }`.
+ * The status is `200`, NOT `201`: the observed worker rejects a non-200 register
+ * (`Registration: Failed with status 201`), so a `201` fails its handshake (issue #154).
  */
 export function handleEnvironmentRegister(req: IncomingMessage, res: ServerResponse, state: BridgeState): void {
   if (req.method !== "POST") {
@@ -151,7 +160,8 @@ export function handleEnvironmentRegister(req: IncomingMessage, res: ServerRespo
       queue: [],
       waiters: new Set<PollWaiter>(),
     });
-    writeJson(res, 201, toEnvironmentRegisterResponseWire(id));
+    // 200, not 201: the observed worker rejects a non-200 register response (#154).
+    writeJson(res, 200, toEnvironmentRegisterResponseWire(id));
   });
 }
 
@@ -180,7 +190,7 @@ export function handleSessionCreate(req: IncomingMessage, res: ServerResponse, s
     }
     const body = parseSessionCreateBody(result.value);
     if (body === null) {
-      writeError(res, 400, "ccctl: malformed session-create body (bad context/source/permission_mode)");
+      writeError(res, 400, "ccctl: malformed session-create body (bad session_context/source/permission_mode)");
       return;
     }
     const sessionId = randomUUID();
@@ -276,6 +286,46 @@ export function handleWorkPoll(
 }
 
 /**
+ * Handle `POST /v1/environments/{env}/work/{workId}/{ack,heartbeat,stop}` (§3
+ * work-item lifecycle, issue #154). After the poll (§3) delivers the session work
+ * item, the worker drives its lifecycle with three sibling verbs; before this leg was
+ * routed they all 404'd (only `…/work/poll` matched), which the worker surfaces as its
+ * generic "Remote Control may not be available for this organization" text — a routing
+ * gap, NOT an entitlement problem. Each verb is acknowledged `200`:
+ *
+ *   - `ack` — the worker confirms receipt of the delivered item. Delivery already
+ *     dequeued it (at-most-once poll, {@link EnvironmentRecord.queue}), so there is
+ *     nothing to re-dequeue here — the ack is a protocol confirmation.
+ *   - `heartbeat` — per-item liveness; a bare `200`.
+ *   - `stop` — the worker is terminating the session's child; the server acknowledges.
+ *     The child teardown is worker-driven, so there is no server-side effect at this
+ *     slice beyond the `200`.
+ *
+ * Carries NO credential, like the §3 poll it follows. Fails closed `405` (wrong
+ * method) / `404` (unknown environment); the `workId` is not validated against
+ * delivered items (none are tracked post-delivery under the reclaim model). The body,
+ * if any, is drained and ignored.
+ */
+export function handleWorkLifecycle(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: BridgeState,
+  route: WorkLifecycleRoute,
+): void {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on the work-${route.verb} path`);
+    return;
+  }
+  if (!state.environments.has(route.environmentId)) {
+    writeError(res, 404, `ccctl: no environment ${route.environmentId}`);
+    return;
+  }
+  req.resume(); // drain the (ignorable) body so the socket does not stall.
+  writeJson(res, 200, {});
+}
+
+/**
  * Settle every held work-poll with an empty body — invoked on server shutdown. A
  * long-poll held open is an in-flight request that `httpServer.close()` waits on and
  * an armed timer that keeps the event loop alive, so without this a graceful shutdown
@@ -333,6 +383,50 @@ export function matchWorkPollPath(pathname: string): string | null {
   }
   const environmentId = segments[3];
   return environmentId === undefined || environmentId === "" ? null : environmentId;
+}
+
+/** One of the three §3 work-item lifecycle verbs a worker POSTs after delivery (#154). */
+export type WorkLifecycleVerb = "ack" | "heartbeat" | "stop";
+
+/** A matched §3 work-item lifecycle route: the environment, the delivered item's id, and the verb. */
+export interface WorkLifecycleRoute {
+  readonly environmentId: string;
+  readonly workId: string;
+  readonly verb: WorkLifecycleVerb;
+}
+
+/**
+ * Match a `POST` path against the §3 work-item lifecycle routes —
+ * `/v1/environments/{env}/work/{workId}/{ack,heartbeat,stop}` — returning the
+ * environment id, work id, and verb, or `null` when it is not one (issue #154).
+ * Anchored on the pinned {@link BRIDGE_PROTOCOL_API_VERSION}, so a version-drifted
+ * path 404s rather than being served — fail closed on drift. Distinct from
+ * {@link matchWorkPollPath} by shape: the poll is 6 segments (`…/work/poll`), a
+ * lifecycle path is 7 (`…/work/{workId}/{verb}`), so the two never collide. Both ids
+ * are server-minted UUIDs (no embedded `/`), so segment splitting is exact.
+ */
+export function matchWorkLifecyclePath(pathname: string): WorkLifecycleRoute | null {
+  const segments = pathname.split("/");
+  // Expect exactly ["", "v1", "environments", {env}, "work", {workId}, {verb}].
+  if (
+    segments.length !== 7 ||
+    segments[0] !== "" ||
+    segments[1] !== BRIDGE_PROTOCOL_API_VERSION ||
+    segments[2] !== "environments" ||
+    segments[4] !== "work"
+  ) {
+    return null;
+  }
+  const environmentId = segments[3];
+  const workId = segments[5];
+  const verb = segments[6];
+  if (environmentId === undefined || environmentId === "" || workId === undefined || workId === "") {
+    return null;
+  }
+  if (verb !== "ack" && verb !== "heartbeat" && verb !== "stop") {
+    return null;
+  }
+  return { environmentId, workId, verb };
 }
 
 // --- internals ---

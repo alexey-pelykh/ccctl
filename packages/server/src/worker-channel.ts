@@ -23,7 +23,9 @@
  *   - `PUT …/worker` `{ worker_status, worker_epoch, external_metadata }` → the status
  *     gate ({@link handleWorkerStatus}); `idle` means "ready for a turn". It MUST `200`
  *     or the worker exits. The server derives the session's `activity` from it
- *     ({@link applyWorkerStatus}).
+ *     ({@link applyWorkerStatus}). `GET …/worker` on the SAME bare path is the child's
+ *     worker-state restore ({@link handleWorkerStateRestore}) — an empty `200` (issue
+ *     #154); the path is method-multiplexed (GET restore / PUT status).
  *   - `POST …/worker/heartbeat` → liveness ({@link handleWorkerHeartbeat},
  *     {@link recordHeartbeat}); `POST …/worker/events/delivery`
  *     `{ worker_epoch, updates: [{ event_id, status }] }` → the worker's per-event
@@ -102,7 +104,7 @@ export type WorkerRoute =
   | { readonly leg: "status"; readonly sessionId: string };
 
 /**
- * Match a path against the §4/§5 worker-channel legs — `…/worker` (PUT status),
+ * Match a path against the §4/§5 worker-channel legs — `…/worker` (GET restore / PUT status),
  * `…/worker/register`, `…/worker/events/stream`, `…/worker/events`,
  * `…/worker/events/delivery`, `…/worker/heartbeat` — extracting the session id, or
  * `null` when it is not a worker-channel path. Anchored on the pinned
@@ -286,6 +288,37 @@ export function handleWorkerStatus(
     }
     writeJson(res, 200, {});
   });
+}
+
+/**
+ * `GET …/worker` (§4 worker-state restore, issue #154). The bare `…/worker` path is
+ * method-multiplexed: `PUT` is the status gate ({@link handleWorkerStatus}); `GET` —
+ * the child's worker-state restore — previously 405'd (the path was PUT-only) and the
+ * child retried in a loop. It answers an empty `200`: `{ worker: null }` when the
+ * server holds no restorable worker state (its steady state at this slice —
+ * `external_metadata` / `internal_metadata` are read off the `PUT` status body but not
+ * persisted, so there is nothing to restore), or, once such state IS tracked,
+ * `{ worker: { external_metadata, internal_metadata } }`. Fails closed `404` for an
+ * unknown session, `405` for a non-GET (defensive — the router sends GET here).
+ */
+export function handleWorkerStateRestore(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: WorkerChannelState,
+  sessionId: string,
+): void {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on the worker-state-restore path`);
+    return;
+  }
+  if (!state.sessions.has(sessionId)) {
+    writeError(res, 404, `ccctl: no session ${sessionId}`);
+    return;
+  }
+  // No restorable worker state is persisted at this slice, so this is always the empty
+  // `{ worker: null }` form — the "nothing to restore" envelope the worker tolerates.
+  writeJson(res, 200, { worker: null });
 }
 
 /**

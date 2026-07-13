@@ -46,7 +46,7 @@ async function registerSession(server: CcctlServer): Promise<string> {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${ACCOUNT_BEARER}` },
     body: JSON.stringify({
-      context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
+      session_context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
       source: "ui",
       permission_mode: "default",
     }),
@@ -258,6 +258,49 @@ describe("§4 worker status gate — PUT /v1/code/sessions/{id}/worker", () => {
     expect((await putStatus(server, sessionId, fresh, "on-fire")).status).toBe(400);
     // Unknown session.
     expect((await putStatus(server, "no-such-session", fresh, "idle")).status).toBe(404);
+  });
+});
+
+describe("§4 worker-state restore — GET /v1/code/sessions/{id}/worker (method-multiplexed with PUT, #154)", () => {
+  /** GET the bare `…/worker` path — the worker-state restore leg. */
+  function getWorkerState(server: CcctlServer, sessionId: string): Promise<Response> {
+    return fetch(`${base(server)}${workerChannelPath(sessionId)}`, { method: "GET" });
+  }
+
+  it("answers an empty 200 `{ worker: null }` — the child's state restore, no longer a 405 retry", async () => {
+    // Regression: GET on the bare `…/worker` path used to 405 (PUT-only), which the
+    // child retried in a loop; it now restores empty worker state with a 200 (#154).
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const res = await getWorkerState(server, sessionId);
+    expect(res.status).toBe(200);
+    expect(res.status).not.toBe(405);
+    expect(await res.json()).toEqual({ worker: null });
+  });
+
+  it("restores empty even before the worker registers — the leg is epoch-independent", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    // No worker/register first: there is no persisted state to restore yet, so an empty 200.
+    const res = await getWorkerState(server, sessionId);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ worker: null });
+  });
+
+  it("fails closed on an unknown session (404)", async () => {
+    const server = await startTestServer();
+    expect((await getWorkerState(server, "no-such-session")).status).toBe(404);
+  });
+
+  it("multiplexes with PUT on the identical bare path — GET restores, PUT still gates status (200)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    // Both methods hit `…/worker`: GET → restore, PUT → status gate. Adding GET must not
+    // have broken the PUT status gate.
+    expect((await getWorkerState(server, sessionId)).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("idle");
   });
 });
 

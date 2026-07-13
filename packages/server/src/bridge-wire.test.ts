@@ -79,13 +79,15 @@ describe("toEnvironmentRegisterResponseWire (§1 response, core → snake_case)"
 });
 
 describe("parseSessionCreateBody (§2 request, snake_case → core, fail closed)", () => {
+  // The context is carried under `session_context` — the field the observed worker
+  // actually sends (issue #154); the mapper still projects it to core's internal `context`.
   const wire = {
-    context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
+    session_context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
     source: "ui",
     permission_mode: "default",
   };
 
-  it("maps a well-formed body to core's camelCase shape (permission_mode → permissionMode)", () => {
+  it("maps a well-formed body to core's camelCase shape (session_context → context, permission_mode → permissionMode)", () => {
     expect(parseSessionCreateBody(wire)).toEqual({
       context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
       source: "ui",
@@ -99,13 +101,35 @@ describe("parseSessionCreateBody (§2 request, snake_case → core, fail closed)
     }
   });
 
-  it("ignores extra fields (session metadata / tags the worker may carry, #130)", () => {
-    const withExtras = { ...wire, tags: ["x"], metadata: { a: 1 } };
-    expect(parseSessionCreateBody(withExtras)).toEqual({
+  it("reads session_context and IGNORES the worker's extra keys — sources / outcomes / reuse_outcome_branches inside it, and a top-level environment_id (#154)", () => {
+    const observed = {
+      session_context: {
+        model: "claude-opus-4-8",
+        cwd: "/home/dev/proj",
+        sources: [{ kind: "git", url: "https://example.test/repo.git" }],
+        outcomes: ["merge"],
+        reuse_outcome_branches: true,
+      },
+      environment_id: "env-abc",
+      source: "ui",
+      permission_mode: "default",
+    };
+    // Only model + cwd are load-bearing; every extra key is accepted and dropped.
+    expect(parseSessionCreateBody(observed)).toEqual({
       context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
       source: "ui",
       permissionMode: "default",
     });
+  });
+
+  it("fails closed on the SUPERSEDED `context` field — the worker sends `session_context` now (#154)", () => {
+    // A body carrying the old top-level `context` but no `session_context` is drift → null.
+    const superseded = {
+      context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
+      source: "ui",
+      permission_mode: "default",
+    };
+    expect(parseSessionCreateBody(superseded)).toBeNull();
   });
 
   it("fails closed on an unknown permission_mode (drift)", () => {
@@ -113,12 +137,12 @@ describe("parseSessionCreateBody (§2 request, snake_case → core, fail closed)
     expect(parseSessionCreateBody({ ...wire, permission_mode: undefined })).toBeNull();
   });
 
-  it("fails closed on a missing/blank source or a malformed context", () => {
+  it("fails closed on a missing/blank source or a malformed session_context", () => {
     expect(parseSessionCreateBody({ ...wire, source: "" })).toBeNull();
     expect(parseSessionCreateBody({ ...wire, source: 1 })).toBeNull();
-    expect(parseSessionCreateBody({ ...wire, context: null })).toBeNull();
-    expect(parseSessionCreateBody({ ...wire, context: { model: "m" } })).toBeNull();
-    expect(parseSessionCreateBody({ ...wire, context: { model: "", cwd: "/x" } })).toBeNull();
+    expect(parseSessionCreateBody({ ...wire, session_context: null })).toBeNull();
+    expect(parseSessionCreateBody({ ...wire, session_context: { model: "m" } })).toBeNull();
+    expect(parseSessionCreateBody({ ...wire, session_context: { model: "", cwd: "/x" } })).toBeNull();
   });
 
   it("fails closed on a non-object", () => {

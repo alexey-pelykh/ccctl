@@ -14,13 +14,16 @@
  *     {@link Session}, AUTO-ENQUEUES its `session` work item (with a locally-minted
  *     work-secret) for the worker to poll, and returns `{ session_id }` (no `ws_url`).
  *   - §3 **Work delivery** — `GET /v1/environments/{env}/work/poll`, long-polled and
- *     carrying NO credential, delivering a SINGLE work item (or an empty body).
+ *     carrying NO credential, delivering a SINGLE work item (or an empty body). After
+ *     delivery the worker drives the item's lifecycle with
+ *     `POST …/work/{workId}/{ack,heartbeat,stop}`, each acknowledged 200 (#154).
  *     §1–§3 live in `environments-bridge.ts`.
  *   - §4/§5 **Per-session worker channel** — HTTP + Server-Sent Events, rooted at
  *     `/v1/code/sessions/{id}/worker` ({@link matchWorkerRoute}): `register` mints a
  *     `worker_epoch`, a held-open `events/stream` is the server→worker downstream,
- *     `events` is the batched upstream (where turn output returns), `PUT worker` is the
- *     status gate, plus `heartbeat` + `events/delivery`. Handled in `worker-channel.ts`.
+ *     `events` is the batched upstream (where turn output returns), the bare
+ *     `…/worker` path is method-multiplexed (`GET` worker-state restore / `PUT` status
+ *     gate, #154), plus `heartbeat` + `events/delivery`. Handled in `worker-channel.ts`.
  *
  * **Two-credential boundary (HARD, #130).** The account OAuth Bearer rides §1/§2 ONLY
  * and is a strict NON-PERSISTING pass-through — validated for receipt and dropped,
@@ -49,6 +52,7 @@ import {
   handleWorkerEventsStream,
   handleWorkerHeartbeat,
   handleWorkerRegister,
+  handleWorkerStateRestore,
   handleWorkerStatus,
   hasLiveWorkerChannel,
   injectUserTurn,
@@ -74,7 +78,9 @@ import {
   DEFAULT_WORK_POLL_TIMEOUT_MS,
   handleEnvironmentRegister,
   handleSessionCreate,
+  handleWorkLifecycle,
   handleWorkPoll,
+  matchWorkLifecyclePath,
   matchWorkPollPath,
   settlePendingPolls,
   type EnvironmentRecord,
@@ -231,9 +237,11 @@ interface ServerState {
  * Route one HTTP request. The browser-facing session namespace is matched first
  * (`GET /api/sessions` list, `GET /api/sessions/{id}/events` view, `POST
  * /api/sessions/{id}/command` steer — all session-addressed, #20), then the
- * environments-bridge legs (§1 environment register, §2 session create, §3 work poll)
- * and the §4/§5 per-session worker channel. Anything else falls through to a fail-closed
- * 404.
+ * environments-bridge legs (§1 environment register, §2 session create, §3 work poll
+ * and the `…/work/{workId}/{ack,heartbeat,stop}` lifecycle verbs, #154) and the §4/§5
+ * per-session worker channel (whose bare `…/worker` path is method-multiplexed —
+ * GET worker-state restore / PUT status gate, #154). Anything else falls through to a
+ * fail-closed 404.
  */
 function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerState): void {
   const { pathname } = new URL(req.url ?? "/", "http://localhost");
@@ -270,6 +278,11 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerS
     handleWorkPoll(req, res, state, workEnvironmentId);
     return;
   }
+  const workLifecycle = matchWorkLifecyclePath(pathname);
+  if (workLifecycle !== null) {
+    handleWorkLifecycle(req, res, state, workLifecycle);
+    return;
+  }
   const worker = matchWorkerRoute(pathname);
   if (worker !== null) {
     switch (worker.leg) {
@@ -289,7 +302,13 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerS
         handleWorkerHeartbeat(req, res, state, worker.sessionId);
         return;
       case "status":
-        handleWorkerStatus(req, res, state, worker.sessionId);
+        // The bare `…/worker` path is method-multiplexed (#154): GET restores worker
+        // state (empty 200), PUT is the status gate. Each handler owns its own guard.
+        if (req.method === "GET") {
+          handleWorkerStateRestore(req, res, state, worker.sessionId);
+        } else {
+          handleWorkerStatus(req, res, state, worker.sessionId);
+        }
         return;
     }
   }
