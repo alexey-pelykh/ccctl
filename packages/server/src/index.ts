@@ -105,6 +105,22 @@ export type {
   TerminalAttachment,
 } from "./session-launcher.js";
 
+// Re-export the tmux launcher backend (#29) on the public surface — the PRIMARY
+// ISessionLauncher backend: a `tmux new-window` surface an operator can `tmux attach` from a
+// desk terminal and drive by hand. The daemon selects it as primary and falls back to the
+// owned-pty backend (#30) when tmux is absent (a rejected `launch`). Unlike the type-only port
+// above, this ships runtime (the factory), so it is a value export alongside its config types.
+// Defined in session-launcher-tmux.ts.
+export {
+  createTmuxSessionLauncher,
+  DEFAULT_TMUX_BIN,
+  DEFAULT_TMUX_SESSION_NAME,
+  DEFAULT_WORKER_WINDOW_NAME,
+  type TmuxRunner,
+  type WorkerCommandFactory,
+  type TmuxSessionLauncherConfig,
+} from "./session-launcher-tmux.js";
+
 /** Configuration for a ccctl server instance. */
 export interface ServerConfig {
   /** Loopback port the local HTTP server binds to. `0` selects an ephemeral port. */
