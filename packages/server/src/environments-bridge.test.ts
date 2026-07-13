@@ -49,7 +49,7 @@ const REGISTER_BODY = {
 };
 
 const SESSION_BODY = {
-  context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
+  session_context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
   source: "ui",
   permission_mode: "default",
 };
@@ -77,10 +77,10 @@ function createSession(server: CcctlServer, options: AuthBody = {}): Promise<Res
   return post(`${base(server)}${SESSIONS_PATH}`, { authorization, body });
 }
 
-/** Register an environment and return its id (the happy path — no work-poll token, #130). */
+/** Register an environment and return its id (the happy path — 200, no work-poll token, #130/#154). */
 async function registeredEnvironment(server: CcctlServer): Promise<string> {
   const res = await registerEnvironment(server);
-  expect(res.status).toBe(201);
+  expect(res.status).toBe(200);
   return ((await res.json()) as { environment_id: string }).environment_id;
 }
 
@@ -115,7 +115,7 @@ describe("§1 environment register — POST /v1/environments/bridge", () => {
   it("mints an environment id and records the environment — no work-poll token (#130)", async () => {
     const server = await startTestServer();
     const res = await registerEnvironment(server);
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(200);
     const wire = (await res.json()) as Record<string, unknown>;
     expect(Object.keys(wire)).toEqual(["environment_id"]);
     expect(typeof wire.environment_id).toBe("string");
@@ -123,6 +123,15 @@ describe("§1 environment register — POST /v1/environments/bridge", () => {
     expect(server.environments.has(wire.environment_id as string)).toBe(true);
     // There is no scoped work-poll token on the response any more.
     expect(wire).not.toHaveProperty("work_poll_token");
+  });
+
+  it("answers 200, NOT 201 — the observed worker rejects a non-200 register (#154)", async () => {
+    // Regression: `handleEnvironmentRegister` used to answer 201, which the worker
+    // rejects as `Registration: Failed with status 201`, breaking its handshake.
+    const server = await startTestServer();
+    const res = await registerEnvironment(server);
+    expect(res.status).toBe(200);
+    expect(res.status).not.toBe(201);
   });
 
   it("receives the account Bearer but never persists or echoes it", async () => {
@@ -286,5 +295,60 @@ describe("§3 work poll — GET /v1/environments/{env}/work/poll (uncredentialed
     const environmentId = await registeredEnvironment(server);
     const res = await fetch(`${base(server)}${environmentWorkPollPath(environmentId)}`, { method: "POST" });
     expect(res.status).toBe(405);
+  });
+});
+
+describe("§3 work-item lifecycle — POST /v1/environments/{env}/work/{workId}/{ack,heartbeat,stop} (#154)", () => {
+  /** Build a work-item lifecycle URL for an environment + work id + verb. */
+  function lifecycleUrl(server: CcctlServer, environmentId: string, workId: string, verb: string): string {
+    return `${base(server)}/v1/environments/${environmentId}/work/${workId}/${verb}`;
+  }
+
+  it("acknowledges the delivered item's ack, heartbeat, and stop with 200 (no more 404)", async () => {
+    const server = await startTestServer();
+    const environmentId = await registeredEnvironment(server);
+    await createdSession(server); // §2→§3 auto-enqueue
+    // Poll to learn the real delivered work id, then drive each of its lifecycle verbs.
+    const item = workItemFromValue(await (await poll(server, environmentId)).json());
+    expect(item).not.toBeNull();
+    const workId = item?.id ?? "";
+    for (const verb of ["ack", "heartbeat", "stop"]) {
+      const res = await post(lifecycleUrl(server, environmentId, workId, verb), { authorization: null });
+      expect(res.status).toBe(200);
+    }
+  });
+
+  it("carries NO credential and does not track work ids post-delivery — a fresh id is acked too", async () => {
+    const server = await startTestServer();
+    const environmentId = await registeredEnvironment(server);
+    // A never-polled work id is accepted (delivery already dequeued; the reclaim model
+    // tracks no in-flight item), and no Authorization header is required (like the §3 poll).
+    for (const verb of ["ack", "heartbeat", "stop"]) {
+      const res = await post(lifecycleUrl(server, environmentId, "work-xyz", verb), { authorization: null });
+      expect(res.status).toBe(200);
+    }
+  });
+
+  it("fails closed on an unknown environment (404) and the wrong method (405)", async () => {
+    const server = await startTestServer();
+    const environmentId = await registeredEnvironment(server);
+    // Unknown environment → 404 (fail closed, like the poll).
+    expect((await post(lifecycleUrl(server, "no-such-env", "w-1", "ack"), { authorization: null })).status).toBe(404);
+    // Wrong method (GET) on each lifecycle path → 405.
+    for (const verb of ["ack", "heartbeat", "stop"]) {
+      const res = await fetch(lifecycleUrl(server, environmentId, "w-1", verb), { method: "GET" });
+      expect(res.status).toBe(405);
+    }
+  });
+
+  it("does not shadow the §3 work-poll path — poll (6 segments) still delivers, lifecycle (7) is separate", async () => {
+    const server = await startTestServer();
+    const environmentId = await registeredEnvironment(server);
+    const sessionId = await createdSession(server);
+    const item = workItemFromValue(await (await poll(server, environmentId)).json());
+    expect(item?.data).toEqual({ type: "session", id: sessionId });
+    // An unknown verb under the 7-segment shape is not a lifecycle route → no route → 404.
+    const unknownVerb = await fetch(lifecycleUrl(server, environmentId, item?.id ?? "w", "resume"), { method: "POST" });
+    expect(unknownVerb.status).toBe(404);
   });
 });

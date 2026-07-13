@@ -105,11 +105,15 @@ export function toEnvironmentRegisterResponseWire(environmentId: string): Enviro
  * The snake_case `POST /v1/sessions` request body — the session context (model +
  * cwd), the source that initiated it, and the permission mode. Maps to core's
  * camelCase {@link SessionCreateRequestBody} (`permission_mode` → `permissionMode`).
- * The observed worker may carry extra fields (session metadata / tags); they are
- * accepted and ignored (extra JSON keys are simply not read).
+ *
+ * The context is carried under **`session_context`** — the field name the observed
+ * worker actually sends (issue #154). The worker also carries extra keys the server
+ * neither needs nor stores: `sources` / `outcomes` / `reuse_outcome_branches` inside
+ * `session_context`, and a top-level `environment_id`. They are accepted and ignored
+ * (extra JSON keys are simply not read) — only `model` + `cwd` are load-bearing here.
  */
 export interface SessionCreateRequestWire {
-  readonly context: { readonly model: string; readonly cwd: string };
+  readonly session_context: { readonly model: string; readonly cwd: string };
   readonly source: string;
   readonly permission_mode: string;
 }
@@ -117,23 +121,24 @@ export interface SessionCreateRequestWire {
 /**
  * Parse a decoded `POST /v1/sessions` body (snake_case) into core's
  * {@link SessionCreateRequestBody}, or `null` when it is not a well-formed one.
- * Fail-closed: a non-object, a missing/mistyped `context.model` / `context.cwd` /
- * `source`, or a `permission_mode` that is not one of the pinned
- * {@link isPermissionMode} values (drift) all yield `null`. Extra fields (session
- * metadata / tags the worker may send) are ignored, not rejected.
+ * Fail-closed: a non-object, a missing/mistyped `session_context.model` /
+ * `session_context.cwd` / `source`, or a `permission_mode` that is not one of the
+ * pinned {@link isPermissionMode} values (drift) all yield `null`. Extra fields — the
+ * worker's `sources` / `outcomes` / `reuse_outcome_branches` (inside `session_context`)
+ * and top-level `environment_id` (issue #154) — are ignored, not rejected.
  */
 export function parseSessionCreateBody(value: unknown): SessionCreateRequestBody | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
   }
-  const { context, source, permission_mode } = value as Record<string, unknown>;
+  const { session_context, source, permission_mode } = value as Record<string, unknown>;
   if (typeof source !== "string" || source === "" || !isPermissionMode(permission_mode)) {
     return null;
   }
-  if (typeof context !== "object" || context === null || Array.isArray(context)) {
+  if (typeof session_context !== "object" || session_context === null || Array.isArray(session_context)) {
     return null;
   }
-  const { model, cwd } = context as Record<string, unknown>;
+  const { model, cwd } = session_context as Record<string, unknown>;
   if (typeof model !== "string" || model === "" || typeof cwd !== "string" || cwd === "") {
     return null;
   }

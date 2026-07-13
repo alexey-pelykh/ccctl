@@ -33,7 +33,7 @@ async function createSession(server: CcctlServer): Promise<string> {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${ACCOUNT_BEARER}` },
     body: JSON.stringify({
-      context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
+      session_context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
       source: "ui",
       permission_mode: "default",
     }),
