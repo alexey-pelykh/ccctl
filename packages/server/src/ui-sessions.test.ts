@@ -120,9 +120,12 @@ describe("GET /api/sessions — session list (#20)", () => {
     expect(quietSummary?.activity).toEqual({ kind: "idle" });
   });
 
-  it("rejects a non-GET method on /api/sessions (405)", async () => {
+  it("rejects an unsupported method on /api/sessions (405)", async () => {
+    // GET lists and POST launches (#31); a method the collection serves neither with falls
+    // through to the list handler's fail-closed 405. (POST-specific launch routing is covered
+    // in ui-session-launch.test.ts.)
     const server = await startTestServer();
-    const res = await fetch(`${base(server)}/api/sessions`, { method: "POST" });
+    const res = await fetch(`${base(server)}/api/sessions`, { method: "PUT" });
     expect(res.status).toBe(405);
     expect(res.headers.get("allow")).toBe("GET");
   });
