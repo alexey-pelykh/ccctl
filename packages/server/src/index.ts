@@ -47,6 +47,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { ENVIRONMENTS_BRIDGE_PATH, SESSIONS_PATH, type HostEndpoint, type Session } from "@ccctl/core";
 import {
   closeWorkerChannels,
+  DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
   handleWorkerDelivery,
   handleWorkerEvents,
   handleWorkerEventsStream,
@@ -165,6 +166,13 @@ export interface ServerConfig {
    */
   workPollTimeoutMs?: number;
   /**
+   * Interval (ms) between the per-session downstream **liveness frames** (#166) that hold an
+   * idle worker's held-open SSE past its ~45s liveness timeout. Defaults to
+   * {@link DEFAULT_WORKER_LIVENESS_INTERVAL_MS} (20s, comfortably below the timeout); a test
+   * passes a short value to exercise the timer deterministically.
+   */
+  workerLivenessIntervalMs?: number;
+  /**
    * The session launcher a `POST /api/sessions` "New session" request runs (#31) to bring up a
    * headful, locally-attachable terminal running the patched `claude`. An injected
    * {@link ISessionLauncher} port — the daemon composes the primary tmux backend (#29) with any
@@ -229,6 +237,8 @@ interface ServerState {
   readonly launchedSessions: Set<LaunchedSession>;
   /** Long-poll hold (ms) for an empty `…/work/poll`. */
   readonly workPollTimeoutMs: number;
+  /** Interval (ms) between per-session downstream liveness frames (§4/§5, #166). */
+  readonly workerLivenessIntervalMs: number;
   /** Provisional at construction; finalized with the resolved port once bound. */
   address: HostEndpoint;
 }
@@ -383,6 +393,7 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     launcher: config.launcher,
     launchedSessions: new Set<LaunchedSession>(),
     workPollTimeoutMs: config.workPollTimeoutMs ?? DEFAULT_WORK_POLL_TIMEOUT_MS,
+    workerLivenessIntervalMs: config.workerLivenessIntervalMs ?? DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
     address: { host, port: config.port },
   };
 
