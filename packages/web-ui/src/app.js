@@ -19,15 +19,19 @@
  *
  * This shell is deliberately thin: every decode/classify/format decision lives
  * in the DOM-free `./transcript.js` (unit-tested), every verb→frame decision
- * in the DOM-free `./command.js` (unit-tested), and every list diff / label /
- * selection decision in the DOM-free `./sessions.js` (unit-tested). Here we only
- * wire DOM controls to those builders and apply their results to the page. Each
- * poll updates the picker IN PLACE (only the rows that changed) so it stays live
- * without flicker; selecting a session (re)opens its stream and clears the prior
- * session's transcript; a `worker_status` frame updates the CURRENT-TURN indicator
- * in place; every other control event is appended to the TRANSCRIPT; an undecodable
- * line is surfaced verbatim rather than dropped; and an accepted steer is echoed
- * into the transcript (marked outbound) so it is reflected in the viewed session.
+ * in the DOM-free `./command.js` (unit-tested), every list diff / label /
+ * selection decision in the DOM-free `./sessions.js` (unit-tested), and the
+ * connection-health verdict in the DOM-free `./connection.js` (unit-tested).
+ * Here we only wire DOM controls to those builders and apply their results to
+ * the page. Each poll updates the picker IN PLACE (only the rows that changed)
+ * so it stays live without flicker; the always-visible connection-health
+ * indicator reflects the two TRANSPORT legs — the poll (fetch) heartbeat and the
+ * selected session's SSE stream — as live / reconnecting / offline (#75), never a
+ * session's worker status; selecting a session (re)opens its stream and clears the
+ * prior session's transcript; a `worker_status` frame updates the CURRENT-TURN
+ * indicator in place; every other control event is appended to the TRANSCRIPT; an
+ * undecodable line is surfaced verbatim rather than dropped; and an accepted steer
+ * is echoed into the transcript (marked outbound) so it is reflected in the viewed session.
  */
 
 import { processEventData } from "./transcript.js";
@@ -41,8 +45,10 @@ import {
   describeCommand,
 } from "./command.js";
 import { diffSessionList, nextSelection, notificationsDegraded } from "./sessions.js";
+import { connectionHealth } from "./connection.js";
 import { applyPairingToken, authHeader } from "./pairing.js";
 
+const connectionEl = document.getElementById("connection");
 const statusEl = document.getElementById("status");
 const activityEl = document.getElementById("activity");
 const eventsEl = document.getElementById("events");
@@ -70,6 +76,12 @@ let pollTimer = null;
 let polling = false;
 /** Whether the empty-state placeholder is up, so a poll over an empty list doesn't re-render it. */
 let emptyPlaceholderShown = false;
+/** The session-list heartbeat (fetch) leg: "pending" until the first poll settles, then "ok" / "failed". */
+let pollState = "pending";
+/** The selected session's downstream SSE leg: "idle" (none) | "connecting" | "open" | "reconnecting". */
+let streamState = "idle";
+/** The last connection-health verdict painted to #connection, so an unchanged poll doesn't re-announce it. */
+let renderedConnection = null;
 
 /** Build one transcript `<li>`: a bold subtype label plus an optional human summary. */
 function transcriptItem(subtype, summary) {
@@ -108,6 +120,23 @@ function renderActivity(status, text) {
   activityEl.hidden = false;
   activityEl.dataset.status = status;
   activityEl.textContent = text;
+}
+
+/**
+ * Repaint the always-visible connection-health indicator from the two transport legs (#75).
+ * The verdict — live / reconnecting / offline — is `./connection.js`'s pure reduction of the
+ * poll (fetch) heartbeat and the selected session's SSE stream; `data-connection` drives the
+ * colour and the text is the state word. Guarded so an unchanged verdict (e.g. a steady poll
+ * every 2s while live) neither rewrites the DOM nor re-announces to the `aria-live` region.
+ */
+function renderConnection() {
+  const verdict = connectionHealth({ poll: pollState, stream: streamState });
+  if (verdict === renderedConnection) {
+    return;
+  }
+  renderedConnection = verdict;
+  connectionEl.dataset.connection = verdict;
+  connectionEl.textContent = verdict;
 }
 
 /** Apply one SSE line to the page via the instruction `./transcript.js` returns. */
@@ -255,8 +284,14 @@ async function loadSessions() {
       throw new Error(`list failed (${response.status})`);
     }
     payload = await response.json();
+    // The heartbeat beat: the phone can reach the server (#75).
+    pollState = "ok";
+    renderConnection();
   } catch (error) {
     statusEl.textContent = `could not list sessions: ${error.message}`;
+    // The heartbeat missed: the request path — which steering also rides — is down (#75).
+    pollState = "failed";
+    renderConnection();
     return;
   }
   const sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
@@ -274,17 +309,23 @@ async function loadSessions() {
   }
 }
 
-/** Close the active EventSource, if any. */
+/** Close the active EventSource, if any, and drop the stream leg to idle. */
 function disconnect() {
   if (source !== null) {
     source.close();
     source = null;
   }
+  // The stream leg is now idle — the connection-health verdict falls back to the poll heartbeat
+  // alone (so clearing a vanished selection doesn't leave a stale "reconnecting" downstream state).
+  streamState = "idle";
+  renderConnection();
 }
 
 /** Subscribe to a session's downstream control-event stream. */
 function connect(sessionId) {
   statusEl.textContent = "connecting…";
+  streamState = "connecting";
+  renderConnection();
   // The downstream is an EventSource, which cannot carry an Authorization header; applying the
   // paired token to the SSE stream (a query token would land in the server log, so not that)
   // is deferred to the later credentialed-wave item that also adds server-side enforcement (#74
@@ -293,6 +334,8 @@ function connect(sessionId) {
 
   source.addEventListener("open", () => {
     statusEl.textContent = `connected — ${sessionId}`;
+    streamState = "open";
+    renderConnection();
   });
 
   source.addEventListener("message", (event) => {
@@ -301,6 +344,8 @@ function connect(sessionId) {
 
   source.addEventListener("error", () => {
     statusEl.textContent = "disconnected — reconnecting…";
+    streamState = "reconnecting";
+    renderConnection();
     // EventSource reconnects automatically, replaying past its Last-Event-ID;
     // the server reconciles the gap per session (#13/#20), so nothing else to do here.
   });
@@ -417,6 +462,9 @@ approveButtonEl.addEventListener("click", () => {
 // A returning paired device reuses its stored token; every fetch above then carries it as an
 // Authorization: Bearer header.
 applyPairingToken({ location, history, storage: localStorage });
+
+// Seed the connection-health indicator (#75): "reconnecting" until the first heartbeat settles it.
+renderConnection();
 
 // List now and keep polling so the picker's per-session status stays live (#25 AC3).
 pollSessions();

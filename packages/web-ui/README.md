@@ -1,11 +1,12 @@
 # @ccctl/web-ui
 
 The zero-build browser UI for [ccctl](../../README.md). Deliberately has **no
-framework and no bundler**: it is a single `index.html` plus four vanilla ES
+framework and no bundler**: it is a single `index.html` plus five vanilla ES
 modules served statically — `src/app.js` (the thin DOM shell), `src/transcript.js`
 (the DOM-free downstream rendering logic), `src/command.js` (the DOM-free
-upstream steer-building logic) and `src/sessions.js` (the DOM-free session-list
-diff / label / selection logic). There is nothing to compile; `build` just copies
+upstream steer-building logic), `src/sessions.js` (the DOM-free session-list
+diff / label / selection logic) and `src/connection.js` (the DOM-free
+connection-health verdict). There is nothing to compile; `build` just copies
 the static assets into `dist/`, and the modules can be served as-is by the daemon
 (or locally, e.g. `npx serve .`).
 
@@ -43,12 +44,23 @@ zero-build transport pair:
   transcript — marked outbound — so it is reflected in the viewed session even
   before the worker's own events flow back down the SSE stream.
 
+Above the session picker sits an always-visible **connection-health indicator
+(#75)** — `live` / `reconnecting` / `offline` — for the phone↔server transport as a
+whole, distinct from any one session's status. `src/connection.js` reduces the two
+transport legs to the verdict: the **poll (fetch) heartbeat** is the authority on
+reachability (it runs on the interval whether or not a session is selected, and
+steering rides the same request path), and the selected session's **SSE stream**
+refines it downward (a stream mid-(re)connect reads as `reconnecting`). It never
+reads a session's worker status. A failed poll shows `offline`; the state repaints
+within a poll interval of any change.
+
 The `@ccctl/core` frame shapes are **mirrored, not imported** — this UI is served
 to the browser as-is, so `src/*.js` stays dependency-free vanilla ESM. The
 downstream rendering logic in `src/transcript.js`, the upstream steer-building
-logic in `src/command.js` and the session-list diff / label / selection logic in
-`src/sessions.js` are all unit-tested (`vitest`), and the e2e harness imports the
-first two to drive the real decode / steer path against a real daemon. The DOM
+logic in `src/command.js`, the session-list diff / label / selection logic in
+`src/sessions.js` and the connection-health verdict in `src/connection.js` are all
+unit-tested (`vitest`), and the e2e harness imports the first two to drive the real
+decode / steer path against a real daemon. The DOM
 shell in `src/app.js` is thin glue that is **not** directly exercised: it reads the
 DOM at module load and the repo ships no DOM driver, so it is verified by
 inspection. That is the split the modules exist to enable — every decision lives in
