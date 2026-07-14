@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyWorkerStatusFrame,
+  createRegisteringSession,
   createSession,
   DEFAULT_HEARTBEAT_STALE_AFTER_MS,
   DEFAULT_REQUIRES_ACTION_DETAIL,
@@ -87,6 +88,39 @@ describe("session identity (AC: identity is the register-response session id)", 
       lastActivityAt: T0,
       lastHeartbeatAt: T0,
     });
+  });
+
+  // #33: a UC2 launch places its session in the registry BEFORE the worker has ever spoken — up on
+  // its terminal, not yet checked in. It is a normal session in every other respect, so it lists,
+  // and carries its life-long degraded marker from birth; only its lifecycle entry point differs.
+  it("createRegisteringSession is a fresh session that enters the lifecycle at `registering`", () => {
+    const session = createRegisteringSession("sess-1", "default", T0);
+    expect(session).toEqual({
+      id: "sess-1",
+      status: "registering",
+      activity: { kind: "idle" },
+      notificationsDegraded: false,
+      createdAt: T0,
+      lastActivityAt: T0,
+      lastHeartbeatAt: T0,
+    });
+  });
+
+  it("createRegisteringSession derives the SAME life-long degraded marker as createSession", () => {
+    // Identical birth, one step earlier in the lifecycle: the only difference is `status`.
+    for (const mode of ["default", "plan", "acceptEdits", "bypassPermissions"] as const) {
+      const registering = createRegisteringSession("sess-1", mode, T0);
+      const connecting = createSession("sess-1", mode, T0);
+      expect(registering.notificationsDegraded).toBe(connecting.notificationsDegraded);
+      expect({ ...registering, status: "connecting" }).toEqual(connecting);
+    }
+  });
+
+  it("markSessionReady does not advance a `registering` session — it must register first", () => {
+    // The forward-only guard (`connecting` → `ready`) already refuses it: a launched session that has
+    // not checked in has no worker channel, so it cannot possibly be steerable.
+    const registering = createRegisteringSession("sess-1", "default", T0);
+    expect(markSessionReady(registering)).toBe(registering);
   });
 
   it("a session keys on the SessionCreateResponse.sessionId, not the ws_url (§2 identity)", () => {

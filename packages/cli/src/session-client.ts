@@ -27,7 +27,13 @@
  */
 
 import { formatAuthority, type HostEndpoint } from "@ccctl/core";
-import type { LaunchAcceptedWire, SessionLaunchOptions, SessionSummaryWire } from "@ccctl/server";
+import {
+  isLaunchFailureCode,
+  type LaunchAcceptedWire,
+  type LaunchFailureCode,
+  type SessionLaunchOptions,
+  type SessionSummaryWire,
+} from "@ccctl/server";
 
 /** How long a CLI round-trip to the daemon waits before it is treated as hung (matches the e2e harness). */
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -83,22 +89,62 @@ function sessionCommandUrl(target: HostEndpoint, sessionId: string): string {
 }
 
 /**
- * Map a non-`201` `POST /api/sessions` status to a clear, actionable CLI error. The daemon fails
- * closed per branch (`ui-session-launch.ts`): `501` when it has no launcher wired — the common
- * case against today's `serve`, whose launch backend lands in a later wave — and `502` when every
- * backend could bring up no surface. Any other status is surfaced verbatim so a drift stays loud.
+ * Turn a failed `POST /api/sessions` into a clear, actionable CLI error, branching on the TYPED
+ * {@link LaunchFailureCode} the daemon answers (#33) rather than on the HTTP status.
+ *
+ * The daemon fails closed per branch (`ui-session-launch.ts`) and says WHICH failure it was in the
+ * body's `code`, so the CLI can name the operator's next move precisely — a directory that does not
+ * exist and a host with no terminal backend are both "the launch failed", but they are fixed by
+ * completely different actions, and a status alone (both were once a flat 502) cannot tell them apart.
+ *
+ * The daemon's own `error` sentence is already actionable, so it is carried through verbatim as the
+ * message; the code is what selects the ADDED hint. A body with no recognizable code — an older
+ * daemon, or a proxy that ate it — degrades to a status-shaped message rather than throwing: a
+ * client that cannot parse the failure must still report the failure.
  */
-function launchError(status: number): Error {
-  if (status === 501) {
-    return new Error(
-      "ccctl: the daemon has no session launcher configured — it cannot launch sessions yet " +
-        "(the launch backend lands in a later wave). Is this the right server?",
-    );
+function launchError(status: number, failure: LaunchFailure | null): Error {
+  if (failure === null) {
+    return new Error(`ccctl: launch failed — POST /api/sessions returned ${status}`);
   }
-  if (status === 502) {
-    return new Error("ccctl: the daemon could bring up no session terminal (no launcher backend available)");
+  const hint = LAUNCH_FAILURE_HINTS[failure.code];
+  return new Error(hint === undefined ? failure.error : `${failure.error}. ${hint}`);
+}
+
+/** The parsed `{ error, code }` a failed launch answers — the daemon's `LaunchFailureWire`. */
+interface LaunchFailure {
+  readonly error: string;
+  readonly code: LaunchFailureCode;
+}
+
+/**
+ * The CLI-specific next-move hint per {@link LaunchFailureCode}, ADDED to the daemon's own sentence
+ * (which already says what went wrong). Only the codes where the CLI knows something the daemon does
+ * not — that this is a `ccctl` command, run from a shell, by the person who can install tmux or fix
+ * the path — earn a hint; the rest are already fully actionable as the daemon phrased them.
+ */
+const LAUNCH_FAILURE_HINTS: Partial<Record<LaunchFailureCode, string>> = {
+  "launcher-absent": "Is this the right server? (a daemon without a launcher can relay sessions but not start them)",
+  "invalid-cwd": "Pass an existing directory with `--cwd`",
+  "backend-unavailable": "Install tmux for an attachable terminal, or build the optional `node-pty` fallback",
+  "worker-not-found": "Check that the patched `claude` is installed and on PATH (`ccctl patch`)",
+};
+
+/** Read a failed launch's `{ error, code }` body, or `null` when it is not one (an older daemon, a proxy). */
+async function readLaunchFailure(res: Response): Promise<LaunchFailure | null> {
+  try {
+    const body: unknown = await res.json();
+    if (typeof body !== "object" || body === null) {
+      return null;
+    }
+    const { error, code } = body as { error?: unknown; code?: unknown };
+    if (typeof error !== "string" || !isLaunchFailureCode(code)) {
+      return null;
+    }
+    return { error, code };
+  } catch {
+    // A non-JSON body (a proxy's HTML error page, a truncated response) — nothing to type.
+    return null;
   }
-  return new Error(`ccctl: launch failed — POST /api/sessions returned ${status}`);
 }
 
 /**
@@ -141,16 +187,17 @@ export const defaultSessionClient: SessionClient = {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (res.status !== 201) {
-      throw launchError(res.status);
+      throw launchError(res.status, await readLaunchFailure(res));
     }
     const body: unknown = await res.json();
     if (
       typeof body !== "object" ||
       body === null ||
+      typeof (body as { sessionId?: unknown }).sessionId !== "string" ||
       typeof (body as { attachable?: unknown }).attachable !== "boolean" ||
       typeof (body as { hint?: unknown }).hint !== "string"
     ) {
-      throw new Error("ccctl: POST /api/sessions did not return a { attachable, hint } body");
+      throw new Error("ccctl: POST /api/sessions did not return a { sessionId, attachable, hint } body");
     }
     return body as LaunchAcceptedWire;
   },

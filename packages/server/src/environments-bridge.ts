@@ -49,7 +49,6 @@ import {
   SESSIONS_PATH,
   WORK_SECRET_VERSION,
   type HostEndpoint,
-  type Session,
   type WorkItem,
   type WorkSecret,
 } from "@ccctl/core";
@@ -61,6 +60,7 @@ import {
   toEnvironmentRegisterResponseWire,
   toWorkItemWire,
 } from "./bridge-wire.js";
+import { claimPendingLaunch, type PendingLaunchState } from "./pending-launch.js";
 import { toSessionCreateResponseWire } from "./session-create-wire.js";
 
 /** Hard ceiling on a bridge request body (1 MiB) — a control-plane body fits well within it. */
@@ -110,12 +110,15 @@ export interface EnvironmentRecord {
  * The per-server state the environments-bridge legs read and update. The overall
  * {@link CcctlServer} state satisfies this structurally, so the handlers stay
  * decoupled from the HTTP wiring in `index.ts`.
+ *
+ * Extends {@link PendingLaunchState} because §2 is where a LAUNCHED session's worker checks in
+ * (#33): registration is the event that claims a pending launch, and a claim can retire that
+ * launch's placeholder row outright (`pending-launch.ts` § Correlation) — so the registration leg
+ * genuinely reaches the sessions map, the relays and the pending registry, and says so.
  */
-export interface BridgeState {
+export interface BridgeState extends PendingLaunchState {
   /** Environments registered on this server, keyed by environment id. */
   readonly environments: Map<string, EnvironmentRecord>;
-  /** Sessions tracked by this server, keyed by ccctl session id (session-create adds here). */
-  readonly sessions: Map<string, Session>;
   /** The bound address, so §2 can mint the work-secret's `api_base_url` pointing back at this server. */
   readonly address: HostEndpoint;
   /** Long-poll hold before an empty `…/work/poll` answers (ms). */
@@ -171,6 +174,25 @@ export function handleEnvironmentRegister(req: IncomingMessage, res: ServerRespo
  * `connecting` {@link Session}, AUTO-ENQUEUES its `session` work item — with a
  * locally-minted work-secret — for the worker to poll, and answers `201` with the
  * golden-pinned `{ session_id }` wire (NO `ws_url`).
+ *
+ * **This is also where a LAUNCHED session's registration lands (#33).** A worker the server
+ * launched itself (UC2) already has a `registering` session waiting for it in the registry, so
+ * before minting a fresh id this leg asks whether THIS registration is that one
+ * ({@link claimPendingLaunch}, matched on the launch's `cwd` + `permission_mode`). The claim is what
+ * disarms that launch's eviction timer — so a session that DID register can no longer be reaped as a
+ * ghost, which would close its terminal out from under a live session — and, when the match is
+ * unambiguous, it hands back the pending session's id so the row the operator is already watching
+ * advances IN PLACE from `registering` to `connecting` rather than a second row appearing beside it.
+ *
+ * A fresh id is minted in every other case, and both of them are honest: a registration matching no
+ * pending launch is an ATTACHED session (UC1) — not something this server launched — exactly as
+ * before; and a registration whose match is AMBIGUOUS (two launches shared one cwd + mode) is a
+ * launched session this server cannot pin to a specific terminal, so it is deliberately given a new
+ * identity instead of a possibly-wrong one (`pending-launch.ts` § Correlation).
+ *
+ * Either way the session is (re)born here through {@link createSession} from the OBSERVED
+ * `permission_mode`, so its life-long `notificationsDegraded` marker is derived from what the worker
+ * actually runs, never from what a launch merely asked for.
  */
 export function handleSessionCreate(req: IncomingMessage, res: ServerResponse, state: BridgeState): void {
   if (req.method !== "POST") {
@@ -193,7 +215,10 @@ export function handleSessionCreate(req: IncomingMessage, res: ServerResponse, s
       writeError(res, 400, "ccctl: malformed session-create body (bad session_context/source/permission_mode)");
       return;
     }
-    const sessionId = randomUUID();
+    // Is this the worker of a session THIS server launched (#33)? If so, claim its pending
+    // `registering` session — reuse that id (the list row advances in place) and disarm its
+    // eviction timer. If not, this is an attached session (UC1): mint a fresh id, as ever.
+    const sessionId = claimPendingLaunch(state, body.context.cwd, body.permissionMode) ?? randomUUID();
     // The session is marked notifications-degraded at birth from its OBSERVED
     // permission mode (a non-prompting mode never emits `requires_action`); the
     // marker is life-long since a running session's mode cannot change.

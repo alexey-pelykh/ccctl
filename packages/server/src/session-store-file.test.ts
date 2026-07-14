@@ -75,6 +75,59 @@ describe("createFileSessionStore", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  // A `registering` session (#33) is a launch whose worker has not checked in. The only two things
+  // that can resolve one — the pending-launch record its registration would claim, and the eviction
+  // timer holding its terminal — live in the process that launched it, and neither survives a restart.
+  // Persisted, it would come back as an immortal ghost: unclaimable, un-evictable, listed forever.
+  describe("`registering` sessions never reach the disk (#33)", () => {
+    const registering: Session = { ...createSession("sess-launching", "default", T0), status: "registering" };
+
+    it("drops them on SAVE — the row is not in the file, and the live ones still are", async () => {
+      const store = createFileSessionStore(filePath);
+
+      await store.save({ version: SESSION_STORE_SNAPSHOT_VERSION, sessions: [...sessions, registering], unread });
+
+      const persisted = JSON.parse(await readFile(filePath, "utf8")) as SessionStoreSnapshot;
+      expect(persisted.sessions.map((session) => session.id)).toEqual(["sess-running", "sess-blocked", "sess-fresh"]);
+    });
+
+    it("drops them on LOAD too — a snapshot written by a build without the guard cannot poison the list", async () => {
+      // Hand-written on-disk state, as an older build (or a hand-edit) could have left it.
+      await writeFile(
+        filePath,
+        JSON.stringify({ version: SESSION_STORE_SNAPSHOT_VERSION, sessions: [registering, ...sessions], unread }),
+        { mode: 0o600 },
+      );
+
+      const restored = await createFileSessionStore(filePath).load();
+
+      expect(restored?.sessions.map((session) => session.id)).toEqual(["sess-running", "sess-blocked", "sess-fresh"]);
+    });
+
+    it("reaps the dropped session's unread entries alongside it — no ghost badge for a session not in the list", async () => {
+      // An `unread` entry keyed to the registering session. A build without this guard could persist
+      // one; dropping the row but keeping this entry trades a ghost ROW for a ghost BADGE — an unread
+      // count on a session the operator can never open, clear, or even see in the list.
+      const orphaning = [...unread, { sessionId: registering.id, at: T0 + 3, activity: { kind: "idle" as const } }];
+      await writeFile(
+        filePath,
+        JSON.stringify({
+          version: SESSION_STORE_SNAPSHOT_VERSION,
+          sessions: [registering, ...sessions],
+          unread: orphaning,
+        }),
+        { mode: 0o600 },
+      );
+
+      const restored = await createFileSessionStore(filePath).load();
+
+      // Every surviving unread entry names a session that is actually in the restored registry.
+      expect(restored?.unread).toEqual(unread);
+      const listed = new Set(restored?.sessions.map((session) => session.id));
+      expect(restored?.unread.every((entry) => listed.has(entry.sessionId))).toBe(true);
+    });
+  });
+
   describe("round-trip + restart persistence (AC1)", () => {
     it("returns null before anything is saved — a fresh daemon has no snapshot", async () => {
       const store = createFileSessionStore(filePath);

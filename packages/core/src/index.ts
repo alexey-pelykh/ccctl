@@ -370,8 +370,29 @@ export function loggablePairingUrl(url: string): string {
 // session / state model
 // ---------------------------------------------------------------------------
 
-/** Lifecycle of a single steered Claude Code session. */
-export type SessionStatus = "connecting" | "ready" | "busy" | "closed" | "errored";
+/**
+ * Lifecycle of a single steered Claude Code session.
+ *
+ * `registering` is the PRE-transport entry point, and the only status a session can hold
+ * before a worker has ever spoken to the server (#33): a UC2 launch brought a terminal up
+ * and is now waiting for the worker inside it to register over the bridge (§2). It exists so
+ * a launched-but-not-yet-registered session is VISIBLE (the operator sees it coming up)
+ * without being mistaken for a live one: it has no worker channel, so it cannot be STEERED
+ * (a steer fails closed) and the whole §4 worker surface is shut to it. A UI may still SUBSCRIBE
+ * to it — that is the point of showing the row, and the subscriber's stream is ended for them if
+ * the session is evicted. It is transient by construction: the registration CLAIMS it (→ a fresh
+ * `connecting` session on the same id), or the registration timeout EVICTS it. A session that
+ * ccctl merely ATTACHED to (UC1) never passes through it — it is born `connecting` at
+ * registration ({@link createSession}).
+ *
+ * **A `registering` session must never be RESTORED.** What bounds it is a live, in-process eviction
+ * timer holding the handle of the terminal the launch spawned (`pending-launch.ts`), and neither
+ * survives a restart. A `registering` row rehydrated from a persisted snapshot would therefore be
+ * precisely the ghost this status exists to prevent: nothing can claim it (its worker is long gone)
+ * and nothing is left to evict it. A session store must drop `registering` sessions — the status
+ * marks work IN FLIGHT, not a state worth keeping.
+ */
+export type SessionStatus = "registering" | "connecting" | "ready" | "busy" | "closed" | "errored";
 
 /**
  * A Claude Code session under ccctl control, as tracked by the hub.
@@ -445,6 +466,27 @@ export function createSession(id: string, permissionMode: PermissionMode, now: n
     lastActivityAt: now,
     lastHeartbeatAt: now,
   };
+}
+
+/**
+ * Create the PROVISIONAL session a UC2 launch places in the registry the moment its terminal
+ * comes up — `registering` lifecycle, awaiting the worker's own bridge registration (§2, #33).
+ * Identical birth to {@link createSession} — same id, same life-long
+ * {@link Session.notificationsDegraded} marker derived from the mode the session was LAUNCHED
+ * under, same clocks started at `now` — but entering the lifecycle one step EARLIER, so the
+ * launched session is visible in the list from LAUNCH rather than only from registration.
+ *
+ * It is transient: the worker's registration claims it (the server replaces it with a
+ * `connecting` {@link createSession} on the SAME id, so the list row advances in place rather
+ * than duplicating), or the registration timeout evicts it. `now` is injectable for the same
+ * determinism reason as {@link createSession}.
+ */
+export function createRegisteringSession(
+  id: string,
+  permissionMode: PermissionMode,
+  now: number = Date.now(),
+): Session {
+  return { ...createSession(id, permissionMode, now), status: "registering" };
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,8 +1204,9 @@ export function markSessionReady(session: Session): Session {
  * Explicit transition — drive a session's transport lifecycle to its TERMINAL `closed`
  * state (the reverse leg of {@link markSessionReady}), applied when the worker has
  * terminally exited and the session is being torn down. Returns a NEW `closed` session
- * from any LIVE status (`connecting` / `ready` / `busy`); an ALREADY-terminal session
- * (`closed` / `errored`) is returned UNCHANGED (same reference) — a terminal state never
+ * from any NON-terminal status — it is a blocklist, not an allowlist, so a `registering`
+ * session closes too (its terminal is real even before its worker checks in); an ALREADY-terminal
+ * session (`closed` / `errored`) is returned UNCHANGED (same reference) — a terminal state never
  * moves, so re-closing is a no-op and a distinct `errored` is never clobbered to `closed`.
  * Only `status` moves; the orthogonal activity / liveness dimensions are untouched. Pure:
  * never mutates the input, so one session's teardown cannot touch another's.

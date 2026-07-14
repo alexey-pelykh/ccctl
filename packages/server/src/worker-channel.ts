@@ -221,11 +221,39 @@ export function matchWorkerRoute(pathname: string): WorkerRoute | null {
 }
 
 /**
+ * Fail closed on any §4 leg addressed to a session that has not yet registered over the bridge (#33)
+ * — answers `409` and returns `true` when the caller must stop.
+ *
+ * A `registering` session is a UC2 launch whose worker has not checked in yet. It IS in the session
+ * map (that is the point — the operator watches it come up), so the "unknown session" `404` does not
+ * catch it. But it is not yet ANYBODY'S: its id was minted server-side and handed to the OPERATOR,
+ * while a launched worker only ever learns its own id from the §3 work item that §2 enqueues — so §2
+ * necessarily precedes §4, and no legitimate §4 caller can be holding this id. The session is also
+ * still EVICTABLE, and eviction reaps the session and its relay while knowing nothing about worker
+ * channels: anything a §4 leg builds on it (a channel with its held-open downstream and liveness
+ * interval; a refreshed heartbeat) would outlive the session that owns it.
+ *
+ * So the whole §4 surface is closed until §2 has run — not merely `register`, even though `register`
+ * is the only leg that can CREATE a channel. A heartbeat answering `200` for a session no worker can
+ * legitimately be heartbeating would undercut exactly the argument this guard rests on.
+ */
+function rejectIfRegistering(res: ServerResponse, session: Session, sessionId: string): boolean {
+  if (session.status !== "registering") {
+    return false;
+  }
+  writeError(res, 409, `ccctl: session ${sessionId} has not registered over the bridge yet`);
+  return true;
+}
+
+/**
  * `POST …/worker/register` (§4). Mints and returns a fresh per-session
  * `worker_epoch` — monotonic, so a re-register SUPERSEDES the prior epoch and any
  * upstream POST still stamped with it fails closed 409. Ends a stale held-open
  * downstream from the superseded epoch. The `{}` body is not load-bearing (drained,
- * ignored). Fails closed 404 for an unknown session.
+ * ignored). Fails closed 404 for an unknown session, and 409 for a session that has
+ * not registered over the bridge yet ({@link rejectIfRegistering}) — this is the only
+ * leg that can create a worker channel, so it is the one that must not create one on a
+ * session eviction may still reap.
  */
 export function handleWorkerRegister(
   req: IncomingMessage,
@@ -238,8 +266,12 @@ export function handleWorkerRegister(
     writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on the worker-register path`);
     return;
   }
-  if (!state.sessions.has(sessionId)) {
+  const session = state.sessions.get(sessionId);
+  if (session === undefined) {
     writeError(res, 404, `ccctl: no session ${sessionId}`);
+    return;
+  }
+  if (rejectIfRegistering(res, session, sessionId)) {
     return;
   }
   req.resume(); // drain the ignorable `{}` body so the socket does not stall.
@@ -410,7 +442,8 @@ export function handleWorkerStatus(
  * `external_metadata` / `internal_metadata` are read off the `PUT` status body but not
  * persisted, so there is nothing to restore), or, once such state IS tracked,
  * `{ worker: { external_metadata, internal_metadata } }`. Fails closed `404` for an
- * unknown session, `405` for a non-GET (defensive — the router sends GET here).
+ * unknown session, `409` for one that has not registered over the bridge yet
+ * ({@link rejectIfRegistering}), `405` for a non-GET (defensive — the router sends GET here).
  */
 export function handleWorkerStateRestore(
   req: IncomingMessage,
@@ -423,8 +456,12 @@ export function handleWorkerStateRestore(
     writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on the worker-state-restore path`);
     return;
   }
-  if (!state.sessions.has(sessionId)) {
+  const session = state.sessions.get(sessionId);
+  if (session === undefined) {
     writeError(res, 404, `ccctl: no session ${sessionId}`);
+    return;
+  }
+  if (rejectIfRegistering(res, session, sessionId)) {
     return;
   }
   // No restorable worker state is persisted at this slice, so this is always the empty
@@ -436,7 +473,9 @@ export function handleWorkerStateRestore(
  * `POST …/worker/heartbeat` (§4). Liveness: refreshes the session's
  * `lastActivityAt` ({@link recordHeartbeat}). The body is not load-bearing (drained,
  * ignored) — liveness must stay robust, so it is not epoch-gated. Fails closed
- * 404/405 for an unknown session / wrong method. MUST `200`.
+ * 404/405 for an unknown session / wrong method, and 409 for one that has not registered
+ * over the bridge yet ({@link rejectIfRegistering}) — a `registering` session has no worker
+ * that could legitimately be heartbeating it. MUST `200` otherwise.
  */
 export function handleWorkerHeartbeat(
   req: IncomingMessage,
@@ -452,6 +491,9 @@ export function handleWorkerHeartbeat(
   const session = state.sessions.get(sessionId);
   if (session === undefined) {
     writeError(res, 404, `ccctl: no session ${sessionId}`);
+    return;
+  }
+  if (rejectIfRegistering(res, session, sessionId)) {
     return;
   }
   req.resume(); // drain the (ignorable) body.

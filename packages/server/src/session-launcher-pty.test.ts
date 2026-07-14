@@ -10,6 +10,7 @@ import {
   type PtySpawnOptions,
 } from "./session-launcher-pty.js";
 import type { WorkerCommandFactory } from "./session-launcher-tmux.js";
+import { SessionLaunchError } from "./session-launcher.js";
 import type { SessionLaunchOptions } from "./session-launcher.js";
 
 // #30 is the owned-pty backend of the #28 `ISessionLauncher` port — the PORTABLE FALLBACK. The one
@@ -216,17 +217,39 @@ describe("createPtySessionLauncher (#30 owned-pty backend)", () => {
     expect(fake.killCount()).toBe(1);
   });
 
-  it("rejects when the pty cannot be brought up, so the caller falls back to another backend", async () => {
-    // The spawner rejecting is the "backend cannot bring a surface up" signal — e.g. node-pty absent.
-    const launcher = createPtySessionLauncher({
-      workerCommand,
-      spawn: () => Promise.reject(new Error("node-pty unavailable")),
-    });
+  it("rejects a TYPED `spawn-failed` when the pty cannot be brought up for a reason it cannot name", async () => {
+    // The spawner rejecting is the "backend cannot bring a surface up" signal. With no errno to read,
+    // this backend does NOT guess (#33): `spawn-failed` is the honest answer, and the original
+    // failure survives as `cause` rather than being swallowed.
+    const cause = new Error("node-pty unavailable");
+    const launcher = createPtySessionLauncher({ workerCommand, spawn: () => Promise.reject(cause) });
 
-    await expect(launcher.launch(OPTIONS)).rejects.toThrow(/node-pty unavailable/);
+    const error = await launcher.launch(OPTIONS).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(SessionLaunchError);
+    expect((error as SessionLaunchError).code).toBe("spawn-failed");
+    expect((error as SessionLaunchError).cause).toBe(cause);
   });
 
-  it("rejects when the spawner throws synchronously", async () => {
+  it("rejects a TYPED `worker-not-found` when the worker binary is not there (an ENOENT errno)", async () => {
+    // The ONE cause a pty spawn names structurally: `ENOENT` on the executable. That is the patched
+    // `claude` missing — a caller-fault no fallback backend would fix — NOT this backend being
+    // unavailable, and the two send the operator to completely different fixes.
+    const enoent = Object.assign(new Error("File not found: claude"), { code: "ENOENT" });
+    const launcher = createPtySessionLauncher({
+      workerCommand: () => ["claude", "--sdk-url", "http://127.0.0.1:1"],
+      spawn: () => Promise.reject(enoent),
+    });
+
+    const error = await launcher.launch(OPTIONS).catch((e: unknown) => e);
+
+    expect((error as SessionLaunchError).code).toBe("worker-not-found");
+    // The message names the executable it could not run, so the operator knows WHAT is missing.
+    expect((error as SessionLaunchError).message).toContain("claude");
+    expect((error as SessionLaunchError).cause).toBe(enoent);
+  });
+
+  it("rejects a TYPED `spawn-failed` when the spawner throws synchronously", async () => {
     const launcher = createPtySessionLauncher({
       workerCommand,
       spawn: () => {
@@ -234,7 +257,9 @@ describe("createPtySessionLauncher (#30 owned-pty backend)", () => {
       },
     });
 
-    await expect(launcher.launch(OPTIONS)).rejects.toThrow(/spawn failed/);
+    const error = await launcher.launch(OPTIONS).catch((e: unknown) => e);
+
+    expect((error as SessionLaunchError).code).toBe("spawn-failed");
   });
 
   it("rejects a worker command that names no executable (empty argv)", async () => {

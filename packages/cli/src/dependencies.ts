@@ -131,10 +131,14 @@ export const defaultDependencies: CliDependencies = {
   sessionClient: defaultSessionClient,
   renderQr: defaultRenderQr,
   // Compose the tmux backend (#29) behind the fallback launcher composite (#31) — the documented
-  // composition-root shape, forward-compatible with the owned-pty fallback (#30) when it lands —
-  // driving the production `remote-control` worker-argv builder (#157) on the CONFIGURED binary
-  // (CCCTL_CLAUDE_BIN, default `claude`). Absent tmux, a launch fails closed daemon-side; and the
-  // CONFIGURED binary MUST be the PATCHED `claude` — an unpatched one reaches the real bridge, since
+  // composition-root shape — driving the production `remote-control` worker-argv builder (#157) on
+  // the CONFIGURED binary (CCCTL_CLAUDE_BIN, default `claude`). Absent tmux, a launch fails closed
+  // daemon-side; a missing/unrunnable worker binary is caught by the tmux backend's own pre-flight
+  // and fails closed as a typed `worker-not-found` (#33). The owned-pty backend (#30) has LANDED but
+  // is deliberately NOT in this chain yet: tmux does not FAIL when it cannot run the worker (it opens
+  // a window and the command dies), so a fallback behind it would never be reached — wiring pty needs
+  // the composite to fall back on a launch that "succeeded" into nothing, which is its own item.
+  // The CONFIGURED binary MUST be the PATCHED `claude` — an unpatched one reaches the real bridge, since
   // local-server registration is its baked-in `--sdk-url` wiring, not this argv (see `worker-command.ts`).
   launcher: createFallbackSessionLauncher([createTmuxSessionLauncher({ workerCommand: defaultWorkerCommand })]),
 };

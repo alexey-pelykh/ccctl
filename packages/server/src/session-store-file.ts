@@ -158,7 +158,7 @@ class FileSessionStore implements ISessionStore {
       );
     }
 
-    return parsed as SessionStoreSnapshot;
+    return persistableSnapshot(parsed as SessionStoreSnapshot);
   }
 
   async save(snapshot: SessionStoreSnapshot): Promise<void> {
@@ -166,7 +166,7 @@ class FileSessionStore implements ISessionStore {
 
     // Pretty-printed + trailing newline so the state file is human-inspectable (a POSIX
     // text file), which a JSON snapshot at rest usefully is.
-    const serialized = `${JSON.stringify(snapshot, null, 2)}\n`;
+    const serialized = `${JSON.stringify(persistableSnapshot(snapshot), null, 2)}\n`;
 
     // Atomic + exactly-0600. Write a uniquely-named temp in the SAME directory (so the
     // rename is atomic on one filesystem), created at 0600 so it is never briefly
@@ -200,4 +200,39 @@ class FileSessionStore implements ISessionStore {
  */
 export function createFileSessionStore(filePath: string = resolveSessionStorePath()): ISessionStore {
   return new FileSessionStore(filePath);
+}
+
+/**
+ * Drop every `registering` session from a snapshot — and, with it, any unread entry that named one —
+ * applied on BOTH save and load (#33).
+ *
+ * A `registering` session is a UC2 launch whose worker has not checked in yet, and the only two
+ * things that can ever resolve it live IN THIS PROCESS: the pending-launch record that its §2
+ * registration would claim, and the eviction timer holding its terminal handle (`pending-launch.ts`).
+ * Neither survives a restart. So a `registering` row that reached the disk would come back as an
+ * IMMORTAL ghost — nothing can claim it (its worker died with the old process), nothing can evict it
+ * (there is no pending record to evict), and it would sit in the operator's session list forever.
+ * That is exactly the ghost #33 exists to prevent, resurrected by persistence.
+ *
+ * The unread queue is filtered ALONGSIDE the registry, because dropping a session while keeping the
+ * entries keyed to it would trade the ghost row for a ghost BADGE: an unread count the operator can
+ * never open, clear, or attribute, pointing at a session that is not in the list. Today a
+ * `registering` session cannot accrue unread activity at all (it has no worker channel to accrue it
+ * over — `rejectIfRegistering` in `worker-channel.ts` 409s every leg), so this filter is a no-op on
+ * any snapshot THIS build writes. It is not written for this build: `load` accepts snapshots from
+ * other ones, and the invariant worth holding at the boundary is the whole-snapshot one — every
+ * unread entry names a session in the registry — not merely the row-level one.
+ *
+ * Enforced HERE, at the boundary, rather than trusted to whichever caller eventually wires the store:
+ * a rule that lives only in a doc comment is a rule that holds only until someone does not read it.
+ * Filtering on LOAD as well as on save also means a snapshot written by a build without this guard
+ * cannot poison a session list either.
+ */
+function persistableSnapshot(snapshot: SessionStoreSnapshot): SessionStoreSnapshot {
+  const sessions = snapshot.sessions.filter((session) => session.status !== "registering");
+  if (sessions.length === snapshot.sessions.length) {
+    return snapshot;
+  }
+  const persisted = new Set(sessions.map((session) => session.id));
+  return { ...snapshot, sessions, unread: snapshot.unread.filter((entry) => persisted.has(entry.sessionId)) };
 }

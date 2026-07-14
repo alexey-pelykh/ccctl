@@ -25,7 +25,22 @@
  * silently dropped onto a lesser surface while a better one was available earlier in the order.
  */
 
-import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
+import {
+  isSessionLaunchError,
+  SessionLaunchError,
+  type ISessionLauncher,
+  type LaunchedSession,
+  type LaunchFailureCode,
+  type SessionLaunchOptions,
+} from "./session-launcher.js";
+
+/**
+ * The failure codes that describe the REQUEST rather than the host (#33). When every backend has
+ * rejected, one of these among the failures is the honest answer — a launch the operator must fix
+ * would have failed on ANY backend, so reporting "no backend was available" instead would blame the
+ * host for the caller's mistake and send them off installing tmux to fix a missing binary.
+ */
+const CALLER_FAULT_CODES: readonly LaunchFailureCode[] = ["invalid-cwd", "worker-not-found", "non-prompting-mode"];
 
 /**
  * Compose an ordered list of {@link ISessionLauncher} backends into one fallback launcher.
@@ -56,10 +71,29 @@ export function createFallbackSessionLauncher(backends: readonly ISessionLaunche
           failures.push(error);
         }
       }
-      throw new AggregateError(
+      // Every backend rejected. The composite must now answer ONE typed reason (#33) for what were
+      // N failures — and the choice matters, because it is what the operator is told to go fix.
+      //
+      // A caller-fault code among the failures WINS over `backend-unavailable`: a launch that is
+      // wrong in itself (a missing worker binary) fails identically on every backend, so the fact
+      // that all of them rejected says nothing about the host — reporting "no backend available"
+      // there would be a true statement that misleads. Only when NOTHING more specific was named do
+      // we conclude the honest, literal thing: no backend could bring a surface up.
+      //
+      // The AggregateError is preserved as `cause`, so every backend's own failure is still there
+      // for a log even though only one code reaches the wire.
+      const cause = new AggregateError(
         failures,
         `ccctl: no session-launcher backend could launch a session (tried ${backends.length})`,
       );
+      const specific = failures.find(
+        (failure): failure is SessionLaunchError =>
+          isSessionLaunchError(failure) && CALLER_FAULT_CODES.includes(failure.code),
+      );
+      if (specific !== undefined) {
+        throw new SessionLaunchError(specific.code, specific.message, { cause });
+      }
+      throw new SessionLaunchError("backend-unavailable", cause.message, { cause });
     },
   };
 }

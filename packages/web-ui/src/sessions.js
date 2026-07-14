@@ -22,7 +22,11 @@
  *
  *   SessionSummaryWire = { id: string, status: SessionStatus, activity: SessionActivity,
  *                          notificationsDegraded: boolean }
- *   SessionStatus      = "connecting" | "ready" | "busy" | "closed" | "errored"  (transport)
+ *   SessionStatus      = "registering" | "connecting" | "ready" | "busy" | "closed" | "errored"
+ *                                                                                   (transport;
+ *                        `registering` is a session ccctl LAUNCHED whose worker has not checked in
+ *                        yet — it is listed so the operator watches it come up, and it is either
+ *                        claimed by that registration or evicted, #33)
  *   SessionActivity    = { kind: "running" }
  *                      | { kind: "requires_action"; detail: string }
  *                      | { kind: "idle" }                                        (what the worker is doing)

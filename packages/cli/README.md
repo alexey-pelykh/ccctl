@@ -47,8 +47,12 @@ in the list alongside phone-driven ones and is steerable the same way:
   `--prompt <text>` (send input), `--approve` (clear a pending action, optionally `--tool-use-id`),
   or `--interrupt <reason>` (redirect the current turn). Reports the daemon's minted correlation id.
 
-A launch confirms a terminal came up; the launched worker then registers itself over the bridge
-and joins `ccctl attach` on its own (a later credentialed wave that ships in `ccctl-patch`).
+A launch reports the session it started, and that session is in `ccctl attach` immediately — as
+`registering`: its terminal is up, but its worker has not checked in over the bridge yet (that
+registration ships in `ccctl-patch`, a later credentialed wave). It goes live once the worker
+registers; if the worker never does, the daemon evicts it rather than leaving a ghost session
+behind. A launch that cannot start at all fails with a typed reason — a directory that does not
+exist, a missing terminal backend — so the message names what to fix.
 
 ## Layout
 

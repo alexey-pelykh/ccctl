@@ -108,6 +108,90 @@ export interface ISessionLauncher {
    * {@link LaunchedSession} once the surface is up; rejects if the backend cannot bring one
    * up (e.g. tmux is absent for the tmux backend — the caller then falls back to another
    * backend).
+   *
+   * A reject SHOULD be a {@link SessionLaunchError} carrying the {@link LaunchFailureCode}
+   * that says WHY (#33) — the discriminant the ingress projects onto the wire so the UI can
+   * tell "that directory does not exist" from "no backend is available" mechanically. A
+   * backend classifies only what it knows STRUCTURALLY (an errno, a module that would not
+   * load, a runner that rejected); it never guesses from prose, and an unclassifiable failure
+   * is honestly `spawn-failed`. A plain `Error` from a backend is tolerated and read as
+   * `spawn-failed`.
    */
   launch(options: SessionLaunchOptions): Promise<LaunchedSession>;
+}
+
+/**
+ * WHY a launch could not bring a session up (#33) — the pinned, machine-readable discriminant
+ * a UI switches on, so a failed launch is a TYPED error rather than an opaque 502 + prose.
+ * Every launch-failure branch carries exactly one of these, and each maps to one HTTP status at
+ * the ingress (`ui-session-launch.ts`).
+ *
+ * The set partitions the failures by WHO must act:
+ *
+ *   - the OPERATOR's request is wrong — `invalid-cwd` (the working directory does not exist, or
+ *     is not a directory), `non-prompting-mode` (a mode that could never raise the awaiting-input
+ *     signal, SRV-C-003), `malformed-request` (an unparseable body);
+ *   - this SERVER cannot launch at all — `launcher-absent` (no launcher was wired into it);
+ *   - the HOST cannot bring a surface up — `backend-unavailable` (no backend could: tmux is
+ *     absent AND the owned-pty fallback could not load), `worker-not-found` (the patched
+ *     `claude` binary is not executable at the path the worker argv names);
+ *   - anything else — `spawn-failed`, the honest catch-all for a surface that could not be
+ *     spawned for a reason the server cannot classify structurally. It is a real answer, not a
+ *     dumping ground: a backend that CAN name its failure must, and only an unclassifiable one
+ *     lands here.
+ */
+export type LaunchFailureCode =
+  | "launcher-absent"
+  | "malformed-request"
+  | "non-prompting-mode"
+  | "invalid-cwd"
+  | "worker-not-found"
+  | "backend-unavailable"
+  | "spawn-failed";
+
+/** The pinned {@link LaunchFailureCode} set, in one place, for the guard, the status map, and the tests. */
+export const LAUNCH_FAILURE_CODES: readonly LaunchFailureCode[] = [
+  "launcher-absent",
+  "malformed-request",
+  "non-prompting-mode",
+  "invalid-cwd",
+  "worker-not-found",
+  "backend-unavailable",
+  "spawn-failed",
+];
+
+/** Runtime guard for {@link LaunchFailureCode} — fails closed on anything outside the pinned set. */
+export function isLaunchFailureCode(value: unknown): value is LaunchFailureCode {
+  return typeof value === "string" && (LAUNCH_FAILURE_CODES as readonly string[]).includes(value);
+}
+
+/**
+ * The typed reject of {@link ISessionLauncher.launch} (and of the ingress's own pre-flight
+ * guards) — an `Error` that additionally names its {@link LaunchFailureCode}. The `message`
+ * stays the human-facing, actionable sentence the operator reads; the `code` is what a program
+ * branches on. Carries the underlying failure as `cause` (never swallowed), so the reason a
+ * launch died is still recoverable in a log even though it never reaches the wire.
+ */
+export class SessionLaunchError extends Error {
+  /** The machine-readable reason this launch failed. */
+  readonly code: LaunchFailureCode;
+
+  constructor(code: LaunchFailureCode, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SessionLaunchError";
+    this.code = code;
+  }
+}
+
+/**
+ * Whether `value` is a {@link SessionLaunchError} — the guard the ingress uses to decide between
+ * a typed failure (project its `code`) and an unclassified throw (→ `spawn-failed`). Structural
+ * rather than `instanceof`, so an error that crossed a module boundary (or a backend that built
+ * its own equivalent) is still read as typed — but it fails CLOSED on the code itself
+ * ({@link isLaunchFailureCode}), so an errno-bearing throw (`ENOENT` and friends carry a string
+ * `code` too) is NOT mistaken for a typed launch failure and can never smuggle a foreign code
+ * onto the wire.
+ */
+export function isSessionLaunchError(value: unknown): value is SessionLaunchError {
+  return value instanceof Error && isLaunchFailureCode((value as { code?: unknown }).code);
 }
