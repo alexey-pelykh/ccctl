@@ -39,6 +39,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-turbo-
 
+      # The tmux session-launcher backend (#29) has integration tests that hand their
+      # arguments to the REAL binary, because a fake `TmuxRunner` can only record the
+      # argv we build — it cannot tell us what tmux DOES with it. Those tests found two
+      # bugs a fully green faked suite passed over for four review rounds (tmux
+      # format-expands `-c`, and it renumbers the window indices we teardown by). They
+      # are `describe.skipIf(!TMUX_INSTALLED)`, so WITHOUT tmux on the runner they do not
+      # fail here — they silently do not run, which is the worse outcome: the suite
+      # reports green having never asked the only question those tests exist to ask.
+      - name: Install tmux (the #29 launcher backend's integration tests need a real one)
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

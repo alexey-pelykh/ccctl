@@ -42,7 +42,12 @@
  * merely importing `@ccctl/server` never loads the native binding.
  */
 
-import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
+import {
+  SessionLaunchError,
+  type ISessionLauncher,
+  type LaunchedSession,
+  type SessionLaunchOptions,
+} from "./session-launcher.js";
 // The worker-argv seam is shared by every backend (turn one launch's options into the patched
 // worker's argv); it is defined once alongside the first backend (tmux, #29) and imported here as
 // a TYPE only (erased at runtime — no runtime coupling between the sibling backends).
@@ -171,7 +176,10 @@ export function defaultPtySpawner(): PtySpawner {
     try {
       module = (await import("node-pty")) as unknown as NodePtyModule;
     } catch (cause) {
-      throw new Error(
+      // This backend cannot exist on this host — the honest `backend-unavailable` (#33), the very
+      // condition the fallback chain and its typed error were built to report.
+      throw new SessionLaunchError(
+        "backend-unavailable",
         "ccctl: the owned-pty launcher backend needs the optional 'node-pty' native module, which failed to load " +
           "(absent, or its native binding was not built for this platform). Install/build node-pty, or use the tmux backend.",
         { cause },
@@ -179,7 +187,10 @@ export function defaultPtySpawner(): PtySpawner {
     }
     const spawn = module.spawn ?? module.default?.spawn;
     if (spawn === undefined) {
-      throw new Error("ccctl: the loaded 'node-pty' module exposes no `spawn` — an unexpected node-pty shape");
+      throw new SessionLaunchError(
+        "backend-unavailable",
+        "ccctl: the loaded 'node-pty' module exposes no `spawn` — an unexpected node-pty shape",
+      );
     }
     return spawn(file, [...args], {
       cwd: options.cwd,
@@ -189,6 +200,30 @@ export function defaultPtySpawner(): PtySpawner {
       env: process.env,
     });
   };
+}
+
+/**
+ * Classify a pty-spawn failure into its typed {@link SessionLaunchError} (#33). An error that is
+ * ALREADY typed (the module-load reject, reached through an injected spawner) passes through
+ * unchanged. Otherwise the only structural signal a spawn failure carries is its errno: `ENOENT`
+ * says the executable is not at `file` — the patched `claude` was not found, a `worker-not-found`
+ * that no fallback backend would fix. Everything else is `spawn-failed`: honest about the fact that
+ * this backend could not spawn, and honest about not knowing why.
+ */
+function toPtyLaunchFailure(cause: unknown, file: string): SessionLaunchError {
+  if (cause instanceof SessionLaunchError) {
+    return cause;
+  }
+  if ((cause as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+    return new SessionLaunchError(
+      "worker-not-found",
+      `ccctl: the owned-pty backend could not run \`${file}\` — no such executable`,
+      { cause },
+    );
+  }
+  return new SessionLaunchError("spawn-failed", "ccctl: the owned-pty backend could not spawn the worker's pty", {
+    cause,
+  });
 }
 
 /**
@@ -210,10 +245,24 @@ export function createPtySessionLauncher(config: PtySessionLauncherConfig): ISes
       const [file, ...args] = workerArgv;
       if (file === undefined) {
         // A worker command must name at least the executable; an empty argv could spawn nothing.
-        throw new Error("ccctl: the owned-pty backend needs a non-empty worker command to launch");
+        throw new SessionLaunchError(
+          "spawn-failed",
+          "ccctl: the owned-pty backend needs a non-empty worker command to launch",
+        );
       }
 
-      const pty = await spawn(file, args, { cwd: options.cwd, name: termName, cols, rows });
+      let pty: OwnedPty;
+      try {
+        pty = await spawn(file, args, { cwd: options.cwd, name: termName, cols, rows });
+      } catch (cause) {
+        // Classify the spawn failure STRUCTURALLY, never from its prose (#33): an `ENOENT` errno
+        // means the executable at `file` is not there — the patched `claude` was not found, which is
+        // `worker-not-found` and nothing to do with this backend's availability. Anything else this
+        // backend cannot name honestly becomes `spawn-failed` rather than a guess. (A node-pty error
+        // that already carries a LaunchFailureCode — the module-load reject above, reached through an
+        // injected spawner — passes through untouched.)
+        throw toPtyLaunchFailure(cause, file);
+      }
 
       // Track the child's exit so close() can AWAIT the reaping (the "reaps the child" half of AC2)
       // and stay idempotent + safe on an already-exited child. onExit fires once — on the child's

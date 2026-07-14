@@ -3,7 +3,12 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { createFallbackSessionLauncher } from "./session-launcher-fallback.js";
-import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
+import {
+  SessionLaunchError,
+  type ISessionLauncher,
+  type LaunchedSession,
+  type SessionLaunchOptions,
+} from "./session-launcher.js";
 
 // The fallback composite is the reification of the port's "the caller falls back to another
 // backend" contract (#31). These tests exercise it against fakes — one that RESOLVES (a surface
@@ -22,6 +27,11 @@ function resolvingLauncher(hint: string): ISessionLauncher & { lastOptions: Sess
     },
   };
   return launcher;
+}
+
+/** A launcher that always rejects with the given error — for pinning how the composite CLASSIFIES it (#33). */
+function failingLauncher(error: unknown): ISessionLauncher {
+  return { launch: (): Promise<LaunchedSession> => Promise.reject(error) };
 }
 
 /** A launcher that always rejects — the "backend cannot bring a surface up" signal (tmux absent). */
@@ -65,13 +75,47 @@ describe("createFallbackSessionLauncher", () => {
     expect(session.attachment.hint).toBe("third");
   });
 
-  it("rejects with an AggregateError carrying every backend failure when all reject", async () => {
+  it("rejects a TYPED `backend-unavailable` when all reject, carrying every backend failure as its cause", async () => {
     const launcher = createFallbackSessionLauncher([rejectingLauncher("no tmux"), rejectingLauncher("no pty")]);
 
-    await expect(launcher.launch(OPTIONS)).rejects.toBeInstanceOf(AggregateError);
     const error = await launcher.launch(OPTIONS).catch((caught: unknown) => caught);
-    expect(error).toBeInstanceOf(AggregateError);
-    expect((error as AggregateError).errors).toHaveLength(2);
+
+    // N failures, ONE answer (#33): nothing more specific was named, so the honest, literal reading
+    // is the one it gives — no backend could bring a surface up.
+    expect(error).toBeInstanceOf(SessionLaunchError);
+    expect((error as SessionLaunchError).code).toBe("backend-unavailable");
+    // Every backend's own failure survives underneath, so a log can still say WHICH failed and how.
+    const cause = (error as SessionLaunchError).cause;
+    expect(cause).toBeInstanceOf(AggregateError);
+    expect((cause as AggregateError).errors).toHaveLength(2);
+  });
+
+  // The rule that keeps the composite's answer HONEST: a launch that is wrong in itself fails on
+  // every backend identically, so "all backends rejected" says nothing about the host. Reporting
+  // `backend-unavailable` there would be true-but-misleading — it would send the operator off
+  // installing tmux to fix a missing worker binary.
+  it("prefers a CALLER-FAULT code over `backend-unavailable` when one is among the failures", async () => {
+    const launcher = createFallbackSessionLauncher([
+      rejectingLauncher("no tmux"),
+      failingLauncher(new SessionLaunchError("worker-not-found", "ccctl: could not run `claude`")),
+    ]);
+
+    const error = await launcher.launch(OPTIONS).catch((caught: unknown) => caught);
+
+    expect((error as SessionLaunchError).code).toBe("worker-not-found");
+    // The full picture is still preserved beneath it.
+    expect((error as SessionLaunchError).cause).toBeInstanceOf(AggregateError);
+  });
+
+  it("still answers `backend-unavailable` when every failure is a backend's own unavailability", async () => {
+    const launcher = createFallbackSessionLauncher([
+      failingLauncher(new SessionLaunchError("backend-unavailable", "ccctl: tmux is absent")),
+      failingLauncher(new SessionLaunchError("backend-unavailable", "ccctl: node-pty would not load")),
+    ]);
+
+    const error = await launcher.launch(OPTIONS).catch((caught: unknown) => caught);
+
+    expect((error as SessionLaunchError).code).toBe("backend-unavailable");
   });
 
   it("throws at construction when given no backends", () => {

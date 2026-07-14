@@ -336,7 +336,10 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
         };
 
         const accepted = await deps.sessionClient.launch(target, launchOptions);
-        console.log(`ccctl: launched a new session on ${serverUrl(target.host, target.port)}`);
+        // Name the session it started (#33): the daemon mints the id AT launch and the session is
+        // already listed (as `registering`), so the operator can address the row that is theirs
+        // instead of guessing which of N it is.
+        console.log(`ccctl: launched session ${accepted.sessionId} on ${serverUrl(target.host, target.port)}`);
         // The tmux backend is fully attachable (a concrete `tmux attach` line); the owned-pty
         // fallback surfaces its degradation instead of pretending otherwise — pass the daemon's
         // own hint through either way.
@@ -345,9 +348,9 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
             ? `ccctl: attach it with — ${accepted.hint}`
             : `ccctl: this surface is not fully attachable — ${accepted.hint}`,
         );
-        // The launch confirms a terminal came up; the launched worker registers itself over the
-        // bridge and then shows up in `ccctl attach` on its own (a later credentialed wave).
-        console.log("ccctl: it joins `ccctl attach` once its worker registers.");
+        // It is listed from birth, but it is not LIVE until its worker checks in over the bridge —
+        // and if it never does, the daemon evicts it rather than leaving a ghost behind (#33).
+        console.log("ccctl: it is `registering` until its worker checks in — `ccctl attach` shows its status.");
       },
     );
 

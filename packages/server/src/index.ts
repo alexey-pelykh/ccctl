@@ -33,7 +33,9 @@
  *
  * **Browser-facing session namespace (#13, session-addressed by #20).** The UI transport
  * is per session: `GET /api/sessions` lists the tracked sessions and `POST /api/sessions`
- * LAUNCHES a fresh headful session via the injected launcher (#31 — `ui-session-launch.ts`);
+ * LAUNCHES a fresh headful session via the injected launcher (#31 — `ui-session-launch.ts`),
+ * which lists immediately as `registering` until its worker checks in over the bridge — or is
+ * evicted, never left as a ghost, if it never does (#33 — `pending-launch.ts`);
  * `GET /api/sessions/{id}/events` subscribes to one session's Server-Sent Events stream (the
  * worker channel fans that session's upstream `worker/events` payloads (§5) out to ONLY
  * its subscribers); and `POST /api/sessions/{id}/command` steers that one session (the
@@ -73,7 +75,9 @@ import {
   closeLaunchedSessions,
   handleSessionLaunch,
   launchSession as launchTrackedSession,
+  type LaunchOutcome,
 } from "./ui-session-launch.js";
+import { DEFAULT_REGISTRATION_TIMEOUT_MS, type PendingLaunch } from "./pending-launch.js";
 import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
 import { writeError } from "./http-response.js";
 import {
@@ -130,6 +134,30 @@ export type {
   LaunchedSession,
   TerminalAttachment,
 } from "./session-launcher.js";
+
+// Re-export the TYPED launch-failure contract (#33) on the public surface — the pinned
+// `LaunchFailureCode` union every failed `POST /api/sessions` answers, its runtime guard, and the
+// `SessionLaunchError` the port's backends reject with. The SAME contract-consumer reason as the
+// wire types above: the `ccctl` CLI (and a future web UI) branches on the `code` a failed launch
+// carries — "that directory does not exist" vs "no backend is available" — so it must assert against
+// the PINNED set rather than re-transcribe it (a drift then breaks the consumer's typecheck instead
+// of silently falling through to a generic message). Ships runtime (the class + the guard + the
+// pinned set), so a value export. Defined in session-launcher.ts; its wire projection
+// (`LaunchFailureWire`) is exported below alongside the launch-accepted body.
+export {
+  isLaunchFailureCode,
+  LAUNCH_FAILURE_CODES,
+  SessionLaunchError,
+  isSessionLaunchError,
+  type LaunchFailureCode,
+} from "./session-launcher.js";
+export type { LaunchFailureWire, LaunchOutcome } from "./ui-session-launch.js";
+
+// Re-export the pending-launch registry's public constant (#33) — the default window a launched
+// session may stay `registering` before it is evicted as a ghost. The daemon (and a test) overrides
+// it via ServerConfig.registrationTimeoutMs; exported so a caller can name the default rather than
+// re-hardcode 10_000. Defined and unit-tested in pending-launch.ts.
+export { DEFAULT_REGISTRATION_TIMEOUT_MS } from "./pending-launch.js";
 
 // Re-export the tmux launcher backend (#29) on the public surface — the PRIMARY
 // ISessionLauncher backend: a `tmux new-window` surface an operator can `tmux attach` from a
@@ -255,6 +283,14 @@ export interface ServerConfig {
    * and relays sessions but cannot launch one; `POST /api/sessions` fails closed with a 501.
    */
   launcher?: ISessionLauncher;
+  /**
+   * How long (ms) a LAUNCHED session may stay `registering` — up on its terminal but not yet
+   * checked in over the bridge (§2) — before it is evicted as a ghost (#33): its session dropped
+   * from the registry and its terminal closed, so a worker that never registers cannot leave an
+   * orphaned process behind. Defaults to {@link DEFAULT_REGISTRATION_TIMEOUT_MS} (10s). A test
+   * passes a short value to exercise eviction deterministically; a slow host can raise it.
+   */
+  registrationTimeoutMs?: number;
 }
 
 /** A running ccctl server: the relay between the environments-bridge worker and the UI. */
@@ -292,14 +328,22 @@ export interface CcctlServer {
    */
   hasSessionRelay(sessionId: string): boolean;
   /**
-   * Launch a fresh headful session (#31) via the configured {@link ServerConfig.launcher} and
-   * track its terminal handle for shutdown teardown — the programmatic form of a
-   * `POST /api/sessions` "New session" request. Resolves with the {@link LaunchedSession}
-   * ({@link TerminalAttachment} + `close`). Rejects if no launcher is configured, or if every
-   * launcher backend could bring up no surface. The launched worker registers itself over the
-   * bridge (§2) and then appears in {@link CcctlServer.sessions} on its own.
+   * Launch a fresh headful session (#31) via the configured {@link ServerConfig.launcher} and track
+   * its terminal handle for shutdown teardown — the programmatic form of a `POST /api/sessions`
+   * "New session" request. Resolves with the {@link LaunchOutcome}: the server-minted session id
+   * and the {@link LaunchedSession} handle ({@link TerminalAttachment} + `close`).
+   *
+   * The launched session is in {@link CcctlServer.sessions} the moment this resolves — as
+   * `registering` (#33), not as a live session: its terminal is up but its worker has not checked
+   * in yet. It then either registers over the bridge (§2), advancing IN PLACE on the same id to
+   * `connecting`, or fails to and is EVICTED after {@link ServerConfig.registrationTimeoutMs} — its
+   * session dropped and its terminal closed, never left behind as a ghost.
+   *
+   * Rejects with a {@link SessionLaunchError} carrying a {@link LaunchFailureCode}: no launcher
+   * configured, a non-prompting permission-mode, a `cwd` that is not an existing directory, or a
+   * launcher that could bring up no surface. A failed launch touches no state at all.
    */
-  launchSession(options: SessionLaunchOptions): Promise<LaunchedSession>;
+  launchSession(options: SessionLaunchOptions): Promise<LaunchOutcome>;
   /** Stop accepting connections and release the port. */
   close(): Promise<void>;
 }
@@ -317,6 +361,14 @@ interface ServerState {
   readonly launcher: ISessionLauncher | undefined;
   /** Handles to the terminals this server launched (#31), tracked so shutdown tears them down. */
   readonly launchedSessions: Set<LaunchedSession>;
+  /**
+   * Launches awaiting their worker's registration (#33), keyed by the session id minted at launch —
+   * each holding its terminal handle and an armed eviction timer. A launch adds one; the §2
+   * registration claims it, or the timer evicts it. Empty in the steady state.
+   */
+  readonly pendingLaunches: Map<string, PendingLaunch>;
+  /** How long a launched session may stay `registering` before it is evicted as a ghost (ms, #33). */
+  readonly registrationTimeoutMs: number;
   /** Long-poll hold (ms) for an empty `…/work/poll`. */
   readonly workPollTimeoutMs: number;
   /** Interval (ms) between per-session downstream liveness frames (§4/§5, #166). */
@@ -430,7 +482,7 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
     hasSessionRelay(sessionId: string): boolean {
       return state.eventRelays.has(sessionId);
     },
-    launchSession(options: SessionLaunchOptions): Promise<LaunchedSession> {
+    launchSession(options: SessionLaunchOptions): Promise<LaunchOutcome> {
       return launchTrackedSession(state, options);
     },
     close(): Promise<void> {
@@ -455,7 +507,9 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
         closeEventStreams(state.eventRelays);
         closeWorkerChannels(state);
         // Tear down every terminal this server launched (#31) — a tmux window kept open past
-        // shutdown would leak; each close() is idempotent and swallows its own errors.
+        // shutdown would leak; each close() is idempotent and swallows its own errors. This also
+        // disarms any pending registration-eviction timer (#33), so a launch still registering at
+        // shutdown neither holds the loop open nor fires against a dead server's state.
         closeLaunchedSessions(state);
         // Release idle keep-alive HTTP sockets so a quiescent server closes promptly
         // instead of waiting on pooled client connections.
@@ -479,6 +533,8 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     eventRelays: createSessionEventRelays(),
     launcher: config.launcher,
     launchedSessions: new Set<LaunchedSession>(),
+    pendingLaunches: new Map<string, PendingLaunch>(),
+    registrationTimeoutMs: config.registrationTimeoutMs ?? DEFAULT_REGISTRATION_TIMEOUT_MS,
     workPollTimeoutMs: config.workPollTimeoutMs ?? DEFAULT_WORK_POLL_TIMEOUT_MS,
     workerLivenessIntervalMs: config.workerLivenessIntervalMs ?? DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
     sessionEvictionGraceMs: config.sessionEvictionGraceMs ?? DEFAULT_SESSION_EVICTION_GRACE_MS,

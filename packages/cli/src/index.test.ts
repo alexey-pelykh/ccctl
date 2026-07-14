@@ -90,7 +90,13 @@ function makeDeps(options: FakeDepsOptions = {}): {
   const launch = vi.fn(
     options.launch ??
       ((_target: HostEndpoint, _launchOptions: SessionLaunchOptions) =>
-        Promise.resolve({ attachable: true, hint: "tmux attach -t ccctl:1" } satisfies LaunchAcceptedWire)),
+        Promise.resolve({
+          // The daemon mints the session id AT launch (#33) and lists the session as `registering`
+          // straight away, so a launch answers WHICH session it started — the CLI prints it.
+          sessionId: "sess-launched-1",
+          attachable: true,
+          hint: "tmux attach -t ccctl:1",
+        } satisfies LaunchAcceptedWire)),
   );
   const list = vi.fn(options.list ?? ((_target: HostEndpoint) => Promise.resolve([] as SessionSummaryWire[])));
   // The `steer` client the `steer` verb drives. Defaults to an accepted steer returning a
@@ -418,8 +424,11 @@ describe("ccctl launch — drives a UC2 launch on a running daemon (AC1)", () =>
       { host: "127.0.0.1", port: 4321 },
       { cwd: process.cwd(), permissionMode: "default" },
     );
-    expect(loggedText()).toContain("launched a new session on http://127.0.0.1:4321");
+    // It names the session it started (#33) — the operator can address their own row immediately —
+    // and is honest that it is not live until its worker checks in.
+    expect(loggedText()).toContain("launched session sess-launched-1 on http://127.0.0.1:4321");
     expect(loggedText()).toContain("attach it with — tmux attach -t ccctl:1");
+    expect(loggedText()).toContain("`registering` until its worker checks in");
   });
 
   it("passes an explicit --host/--port/--cwd/--permission-mode plus --project and --initial-prompt through", async () => {

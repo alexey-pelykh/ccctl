@@ -17,6 +17,11 @@ import {
 // exact `remote-control` subcommand argv the worker registers with. These unit the pure builder + the
 // env resolution, then wire the production factory THROUGH the tmux backend to prove the argv the
 // launcher actually execs — the acceptance shape, end to end short of a real tmux/worker.
+//
+// The tmux backend's worker-binary pre-flight (#33 `worker-not-found`) is stubbed FOUND throughout:
+// these tests are about the argv the builder produces, not about what is installed on the machine
+// running them. Leaving it real would make them pass or fail on whether a `claude` happens to be on
+// the test host's PATH — which is exactly the kind of accidental green this suite must not have.
 
 const PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan"] as const;
 
@@ -134,12 +139,16 @@ describe("wired through the tmux launcher — the argv the daemon actually execs
    * A fake {@link TmuxRunner} that records every tmux invocation and answers `has-session` as
    * "exists" (so no `new-session` is issued) and `new-window` with a stable target — letting the
    * test read back the argv passed as `new-window`'s trailing arguments.
+   *
+   * The `new-window` reply must lead with a `@<id>` window handle, matching the `-F` format the
+   * backend now asks for (`#{window_id} …`): the launcher fails closed on a reply it cannot read one
+   * from, since a garbage teardown handle silently no-ops every later `kill-window` (#33).
    */
   function recordingRunner(): { runner: (args: readonly string[]) => Promise<string>; calls: string[][] } {
     const calls: string[][] = [];
     const runner = (args: readonly string[]): Promise<string> => {
       calls.push([...args]);
-      return Promise.resolve(args[0] === "new-window" ? "ccctl:1" : "");
+      return Promise.resolve(args[0] === "new-window" ? "@1 ccctl:1" : "");
     };
     return { runner, calls };
   }
@@ -156,7 +165,11 @@ describe("wired through the tmux launcher — the argv the daemon actually execs
   it("execs `claude remote-control … --spawn=same-dir` by default (always the remote-control subcommand — never a bare `claude`)", async () => {
     Reflect.deleteProperty(process.env, CLAUDE_BIN_ENV);
     const { runner, calls } = recordingRunner();
-    const launcher = createTmuxSessionLauncher({ workerCommand: defaultWorkerCommand, runner });
+    const launcher = createTmuxSessionLauncher({
+      workerCommand: defaultWorkerCommand,
+      runner,
+      workerBinaryProbe: () => true,
+    });
 
     await launcher.launch(options);
 
@@ -174,7 +187,11 @@ describe("wired through the tmux launcher — the argv the daemon actually execs
   it("execs the CONFIGURED patched binary when CCCTL_CLAUDE_BIN is set (spawns patched, not bare)", async () => {
     process.env[CLAUDE_BIN_ENV] = "/opt/ccctl/claude-patched";
     const { runner, calls } = recordingRunner();
-    const launcher = createTmuxSessionLauncher({ workerCommand: defaultWorkerCommand, runner });
+    const launcher = createTmuxSessionLauncher({
+      workerCommand: defaultWorkerCommand,
+      runner,
+      workerBinaryProbe: () => true,
+    });
 
     await launcher.launch(options);
 

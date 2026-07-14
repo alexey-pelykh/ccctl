@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  SessionLaunchError,
   startServer,
   type CcctlServer,
   type ISessionLauncher,
@@ -10,6 +13,9 @@ import {
   type SessionLaunchOptions,
 } from "@ccctl/server";
 import { defaultSessionClient } from "./session-client.js";
+
+/** A REAL directory: the daemon's launch pre-flight (#33) refuses a cwd that does not exist. */
+const LAUNCH_CWD = process.cwd();
 
 // The launch/attach verbs' UNIT tests exercise the command tree against a FAKE session client
 // (index.test.ts). These tests close the other half: the REAL `defaultSessionClient` (real
@@ -46,14 +52,17 @@ afterEach(async () => {
 });
 
 describe("defaultSessionClient.launch — real POST /api/sessions wire (UC2)", () => {
-  it("round-trips a launch against the real handler, returning the surface's attach info", async () => {
+  it("round-trips a launch against the real handler, returning the session id and the surface's attach info", async () => {
     const server = await startTestServer(fakeLauncher("tmux attach -t ccctl:2"));
     const accepted = await defaultSessionClient.launch(server.address, {
-      cwd: "/work/repo",
+      cwd: LAUNCH_CWD,
       permissionMode: "default",
     });
-    // The 201 `{ attachable, hint }` body the real handler wrote, decoded by the client.
-    expect(accepted).toEqual({ attachable: true, hint: "tmux attach -t ccctl:2" });
+    // The 201 `{ sessionId, attachable, hint }` body the real handler wrote, decoded by the client.
+    // The id (#33) addresses the `registering` row the launch just created — so `ccctl launch` can
+    // name the session it started rather than leave the operator to guess which row is theirs.
+    expect(accepted.sessionId).toEqual(expect.any(String));
+    expect(accepted).toMatchObject({ attachable: true, hint: "tmux attach -t ccctl:2" });
   });
 
   it("carries the optional project + initialPrompt through a body the real parser accepts", async () => {
@@ -64,7 +73,7 @@ describe("defaultSessionClient.launch — real POST /api/sessions wire (UC2)", (
     // is refused with its own 400 (locked in the server's ui-session-launch tests); this test is
     // about the optional-field body shape, not the permission mode.
     const accepted = await defaultSessionClient.launch(server.address, {
-      cwd: "/work/repo",
+      cwd: LAUNCH_CWD,
       permissionMode: "default",
       project: "oracle",
       initialPrompt: "ship it",
@@ -72,20 +81,51 @@ describe("defaultSessionClient.launch — real POST /api/sessions wire (UC2)", (
     expect(accepted.attachable).toBe(true);
   });
 
-  it("maps a launcher-less daemon's real 501 to a clear 'no launcher configured' error", async () => {
+  // #33: the daemon types every launch failure, and the CLI branches on that CODE rather than the
+  // HTTP status — so it can name the operator's next move. These are real-wire locks: the code is
+  // the one the real handler actually wrote, not one a fake client made up.
+  it("maps a launcher-less daemon's real 501 `launcher-absent` to a clear, actionable error", async () => {
     const server = await startTestServer(undefined);
+
     await expect(
-      defaultSessionClient.launch(server.address, { cwd: "/work/repo", permissionMode: "default" }),
-    ).rejects.toThrow(/no session launcher configured/);
+      defaultSessionClient.launch(server.address, { cwd: LAUNCH_CWD, permissionMode: "default" }),
+    ).rejects.toThrow(/no session launcher is configured.*Is this the right server\?/s);
+  });
+
+  it("maps a real 400 `invalid-cwd` to an error naming the directory AND the flag that fixes it", async () => {
+    const server = await startTestServer(fakeLauncher());
+    const missing = join(tmpdir(), "ccctl-cli-does-not-exist-8b41");
+
+    const error = await defaultSessionClient
+      .launch(server.address, { cwd: missing, permissionMode: "default" })
+      .catch((e: unknown) => e as Error);
+
+    // The daemon's own sentence (which names the bad path) plus the CLI's next-move hint.
+    expect(error.message).toContain(missing);
+    expect(error.message).toContain("--cwd");
+  });
+
+  it("maps a real 502 `backend-unavailable` to an error telling the operator how to get a terminal", async () => {
+    const unavailable: ISessionLauncher = {
+      launch: () =>
+        Promise.reject(new SessionLaunchError("backend-unavailable", "ccctl: no backend could bring up a terminal")),
+    };
+    const server = await startTestServer(unavailable);
+
+    const error = await defaultSessionClient
+      .launch(server.address, { cwd: LAUNCH_CWD, permissionMode: "default" })
+      .catch((e: unknown) => e as Error);
+
+    expect(error.message).toContain("Install tmux");
   });
 });
 
 describe("defaultSessionClient.list — real GET /api/sessions wire (UC1 on-ramp)", () => {
-  it("round-trips the list against the real handler (empty on a fresh daemon — no worker has registered)", async () => {
+  it("round-trips the list against the real handler (empty on a fresh daemon — nothing launched or attached)", async () => {
     const server = await startTestServer(fakeLauncher());
-    // A launch confirms a terminal came up but registers NO session (that is the launched worker's
-    // job, a later wave), so the fresh daemon's list is empty — proving the `{ sessions: [...] }`
-    // envelope round-trips even at zero entries.
+    // NOTHING has been launched or attached on this daemon, so its list is empty — proving the
+    // `{ sessions: [...] }` envelope round-trips even at zero entries. (A LAUNCH would now put a
+    // `registering` session here immediately (#33); this test is deliberately about the empty case.)
     const sessions = await defaultSessionClient.list(server.address);
     expect(sessions).toEqual([]);
   });
