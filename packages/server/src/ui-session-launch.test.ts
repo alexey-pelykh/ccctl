@@ -94,9 +94,11 @@ describe("POST /api/sessions (launch)", () => {
     const { launcher, launches } = fakeLauncher();
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
 
-    await postLaunch(server, { cwd: "/repo", permissionMode: "bypassPermissions" });
+    // A prompting mode (`plan`) — a non-prompting one is refused on launch (SRV-C-003 launch half),
+    // so this test uses a launchable mode; its point is that the OPTIONALS are omitted when absent.
+    await postLaunch(server, { cwd: "/repo", permissionMode: "plan" });
 
-    expect(launches[0]).toEqual({ cwd: "/repo", permissionMode: "bypassPermissions" });
+    expect(launches[0]).toEqual({ cwd: "/repo", permissionMode: "plan" });
     expect(launches[0]).not.toHaveProperty("project");
     expect(launches[0]).not.toHaveProperty("initialPrompt");
   });
@@ -119,6 +121,35 @@ describe("POST /api/sessions (launch)", () => {
     expect((await postLaunch(server, { cwd: "/repo", permissionMode: "default", project: 7 })).status).toBe(400);
     expect((await postLaunch(server, "not json")).status).toBe(400);
     expect(launches).toHaveLength(0);
+  });
+
+  // SRV-C-003, launch half (#32): a UC2 launch is remotely driven, so the launched session must run
+  // under a PROMPTING mode — one that blocks on a decision and can raise the "awaiting input" signal.
+  // A non-prompting mode is refused at the ingress (400, never launched); a prompting mode launches.
+  it("fails closed 400 on a non-prompting permission-mode — acceptEdits / bypassPermissions — and does not launch", async () => {
+    const { launcher, launches } = fakeLauncher();
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
+
+    for (const permissionMode of ["acceptEdits", "bypassPermissions"] as const) {
+      const res = await postLaunch(server, { cwd: "/repo", permissionMode });
+      expect(res.status).toBe(400);
+    }
+    // AC1 (negative): a non-prompting launch never reaches the launcher — no degraded session is born.
+    expect(launches).toHaveLength(0);
+  });
+
+  it("launches (201) under every PROMPTING permission-mode — default and plan — so it does not over-refuse", async () => {
+    const { launcher, launches } = fakeLauncher();
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
+
+    for (const permissionMode of ["default", "plan"] as const) {
+      const res = await postLaunch(server, { cwd: "/repo", permissionMode });
+      expect(res.status).toBe(201);
+    }
+    // AC1 (positive): both prompting modes reach the launcher — the guard refuses ONLY the non-prompting
+    // pair. A launched session is therefore always prompting, hence able to raise the awaiting-input
+    // signal (AC2) — its end-to-end proof is the fenced live-worker oracle, out of scope for this fake.
+    expect(launches.map((l) => l.permissionMode)).toEqual(["default", "plan"]);
   });
 
   it("fails closed 502 when every launcher backend rejects", async () => {
@@ -158,6 +189,17 @@ describe("CcctlServer.launchSession (programmatic)", () => {
     await expect(server.launchSession({ cwd: "/repo", permissionMode: "default" })).rejects.toThrow(
       /no session launcher/,
     );
+  });
+
+  it("rejects a non-prompting permission-mode — the launch-half invariant holds for the programmatic caller too", async () => {
+    const { launcher, launches } = fakeLauncher();
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
+
+    await expect(server.launchSession({ cwd: "/repo", permissionMode: "acceptEdits" })).rejects.toThrow(
+      /prompting permission-mode/,
+    );
+    // The shared core (`launchSession`) refuses BEFORE touching the launcher — no degraded session is born.
+    expect(launches).toHaveLength(0);
   });
 
   it("tears down every launched terminal on close()", async () => {
