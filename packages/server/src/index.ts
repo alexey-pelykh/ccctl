@@ -154,6 +154,22 @@ export {
 // session-launcher-fallback.ts.
 export { createFallbackSessionLauncher } from "./session-launcher-fallback.js";
 
+// Re-export the single-file JSON-snapshot ISessionStore backend (#23) on the public surface —
+// the concrete persistence the hub's session registry + unread queue survive a restart on
+// (a `0600` snapshot at an XDG state path, no secrets at rest). `@ccctl/core` owns the
+// runtime-agnostic ISessionStore CONTRACT (#22); this is its Node-coupled file backend, which
+// the daemon selects and injects. Ships runtime (the factory + path resolver), so a value export
+// alongside its named path/mode constants. Defined and unit-tested in session-store-file.ts.
+export {
+  CCCTL_STATE_DIR,
+  createFileSessionStore,
+  resolveSessionStorePath,
+  SESSION_STORE_DIR_MODE,
+  SESSION_STORE_FILE_MODE,
+  SESSION_STORE_FILE_NAME,
+  XDG_STATE_HOME_ENV,
+} from "./session-store-file.js";
+
 /** Configuration for a ccctl server instance. */
 export interface ServerConfig {
   /** Loopback port the local HTTP server binds to. `0` selects an ephemeral port. */
