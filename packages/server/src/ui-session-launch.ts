@@ -23,13 +23,15 @@
  * backend, never baked in here.
  *
  * Fail-closed on every branch that cannot launch: a wrong method (405), no launcher configured
- * (501), a malformed body (400), or a launcher that could bring up no surface at all (502) —
- * each answers a status, never a silent drop. Browser-facing auth is deferred (see
+ * (501), a malformed body (400), a non-prompting permission-mode that could never raise the
+ * "awaiting input" signal a remotely-driven UC2 session needs (400, SRV-C-003 launch half), or a
+ * launcher that could bring up no surface at all (502) — each answers a status, never a silent
+ * drop. Browser-facing auth is deferred (see
  * `event-stream.ts`) — the loopback ingress is unauthenticated at this slice.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { isPermissionMode } from "@ccctl/core";
+import { isNonPromptingPermissionMode, isPermissionMode } from "@ccctl/core";
 import { readJsonBody, writeError, writeJson } from "./http-response.js";
 import type {
   ISessionLauncher,
@@ -51,6 +53,16 @@ const MAX_LAUNCH_BODY_BYTES = 1024 * 1024;
  * two entry points describe the one condition identically (single source of truth).
  */
 const NO_LAUNCHER_CONFIGURED = "ccctl: no session launcher is configured — this server cannot launch sessions";
+
+/**
+ * The "non-prompting mode refused" reason, shared by the HTTP 400 and the programmatic throw so the
+ * two entry points describe the one condition identically (single source of truth, mirroring
+ * {@link NO_LAUNCHER_CONFIGURED}). Names the two prompting modes so the operator knows how to re-launch.
+ */
+const NON_PROMPTING_MODE_REFUSED =
+  "ccctl: a launched session must run under a prompting permission-mode (`default` or `plan`) so it can block " +
+  'on decisions and raise the "awaiting input" signal — `acceptEdits` / `bypassPermissions` never block, so a ' +
+  "session launched under them could never ask for you";
 
 /**
  * The per-server state the launch ingress reads: the injected launcher (absent → this server
@@ -120,10 +132,13 @@ function parseLaunchOptions(value: unknown): SessionLaunchOptions | null {
 /**
  * Launch a session and TRACK its handle — the shared core behind both the HTTP ingress and the
  * programmatic {@link CcctlServer.launchSession}. Throws when no launcher is configured (the
- * HTTP handler pre-checks this to answer a 501; the programmatic caller gets the throw) and
- * propagates a launcher reject (every backend failed). On success the handle is recorded so
- * {@link closeLaunchedSessions} can tear the terminal down on shutdown. Mirrors the
- * {@link injectUserTurn} shared-core seam (one behavior, two entry points).
+ * HTTP handler pre-checks this to answer a 501; the programmatic caller gets the throw), throws
+ * when the launch requests a non-prompting permission-mode (`acceptEdits` / `bypassPermissions` —
+ * a session that could never raise the "awaiting input" signal a remotely-driven UC2 session needs;
+ * the HTTP handler pre-checks this too, to answer a 400), and propagates a launcher reject (every
+ * backend failed). On success the handle is recorded so {@link closeLaunchedSessions} can tear the
+ * terminal down on shutdown. Mirrors the {@link injectUserTurn} shared-core seam (one behavior, two
+ * entry points).
  */
 export async function launchSession(
   state: SessionLaunchState,
@@ -131,6 +146,15 @@ export async function launchSession(
 ): Promise<LaunchedSession> {
   if (state.launcher === undefined) {
     throw new Error(NO_LAUNCHER_CONFIGURED);
+  }
+  // The launch half of the prompting-mode requirement (SRV-C-003): a UC2 launch is remotely driven —
+  // the operator is not sitting at the terminal — so under a non-prompting mode the worker would never
+  // block on a decision and could never raise the "awaiting input" signal. Refuse it rather than birth a
+  // session that can never ask for you (the sibling attach half, #26, can only MARK such a session
+  // degraded; the launch half CONTROLS the mode, so it enforces prompting). The HTTP handler pre-checks
+  // this to answer a 400; this throw guards the programmatic caller too.
+  if (isNonPromptingPermissionMode(options.permissionMode)) {
+    throw new Error(NON_PROMPTING_MODE_REFUSED);
   }
   const launched = await state.launcher.launch(options);
   state.launchedSessions.add(launched);
@@ -141,7 +165,8 @@ export async function launchSession(
  * Handle `POST /api/sessions` — launch a fresh headful session via the injected launcher, track
  * its terminal handle, and answer `201` with the surface's {@link LaunchAcceptedWire}. Reads the
  * body under a size cap and validates it; fails closed on a non-POST method (405), no configured
- * launcher (501), a malformed body (400), or a launcher that could bring up no surface (502).
+ * launcher (501), a malformed body (400), a non-prompting permission-mode (400, SRV-C-003 launch
+ * half), or a launcher that could bring up no surface (502).
  */
 export function handleSessionLaunch(req: IncomingMessage, res: ServerResponse, state: SessionLaunchState): void {
   if (req.method !== "POST") {
@@ -167,6 +192,14 @@ export function handleSessionLaunch(req: IncomingMessage, res: ServerResponse, s
         400,
         "ccctl: malformed launch body (expected `{ cwd, permissionMode, project?, initialPrompt? }`)",
       );
+      return;
+    }
+    // Well-formed but semantically refused: a non-prompting mode could never raise the awaiting-input
+    // signal a remotely-driven UC2 session needs (SRV-C-003 launch half). Pre-check here for a precise
+    // 400 (like the 501 launcher pre-check above) rather than let launchSession's throw fall into the
+    // 502 catch below — a 502 would wrongly read as "the backend could not bring up a surface".
+    if (isNonPromptingPermissionMode(options.permissionMode)) {
+      writeError(res, 400, NON_PROMPTING_MODE_REFUSED);
       return;
     }
     try {

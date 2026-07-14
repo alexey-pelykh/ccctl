@@ -59,10 +59,13 @@ describe("defaultSessionClient.launch — real POST /api/sessions wire (UC2)", (
   it("carries the optional project + initialPrompt through a body the real parser accepts", async () => {
     const server = await startTestServer(fakeLauncher());
     // A malformed body would be a real-handler 400 → the client's `else` branch throws; a clean
-    // resolve proves the CLI's launch body is exactly what `parseLaunchOptions` accepts.
+    // resolve proves the CLI's launch body is exactly what `parseLaunchOptions` accepts. Uses a
+    // prompting mode (`default`) so the launch-half guard (#32) accepts it — a non-prompting mode
+    // is refused with its own 400 (locked in the server's ui-session-launch tests); this test is
+    // about the optional-field body shape, not the permission mode.
     const accepted = await defaultSessionClient.launch(server.address, {
       cwd: "/work/repo",
-      permissionMode: "acceptEdits",
+      permissionMode: "default",
       project: "oracle",
       initialPrompt: "ship it",
     });
