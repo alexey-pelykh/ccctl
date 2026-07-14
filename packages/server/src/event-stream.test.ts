@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { SESSIONS_PATH, workerEventsPath, workerRegisterPath, type ControlEvent } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
+import { closeSessionRelay, createSessionEventRelays, relayFor } from "./event-stream.js";
 
 const ACCOUNT_BEARER = "oauth-account-secret-sse-abc123";
 
@@ -315,5 +316,24 @@ describe("UI event stream — per-session SSE relay (GET /api/sessions/{id}/even
     const res = await fetch(`${base(server)}${eventsPath(ready.sessionId)}`, { method: "POST" });
     expect(res.status).toBe(405);
     expect(res.headers.get("allow")).toBe("GET");
+  });
+});
+
+describe("closeSessionRelay — reap a single session's relay on eviction (#176)", () => {
+  it("removes ONLY the target session's relay entry, leaving other sessions' relays intact", () => {
+    const relays = createSessionEventRelays();
+    relayFor(relays, "sess-A");
+    relayFor(relays, "sess-B");
+
+    closeSessionRelay(relays, "sess-A");
+
+    expect(relays.has("sess-A")).toBe(false); // the evicted session's relay is dropped ...
+    expect(relays.has("sess-B")).toBe(true); // ... and ONLY it — a sibling session is never cross-reaped.
+  });
+
+  it("is a no-op when the session has no relay (never subscribed-to or broadcast-to)", () => {
+    const relays = createSessionEventRelays();
+    expect(() => closeSessionRelay(relays, "ghost")).not.toThrow();
+    expect(relays.has("ghost")).toBe(false);
   });
 });

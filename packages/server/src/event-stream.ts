@@ -242,3 +242,25 @@ export function closeEventStreams(relays: SessionEventRelays): void {
     relay.subscribers.clear();
   }
 }
+
+/**
+ * Close and REMOVE a single session's relay — the per-session counterpart of
+ * {@link closeEventStreams}, called when a session is evicted from the registry (#176).
+ * Ends every open subscriber stream (so no UI client is left reading a stream onto a
+ * session that no longer exists), clears the subscriber set, then drops the session's
+ * entry from the registry so an evicted session's relay does not accumulate for the
+ * daemon's lifetime. A **no-op** when the session has no relay — one is created lazily
+ * (first subscribe or first broadcast, {@link relayFor}), so a session never broadcast-to
+ * or subscribed-to has nothing to reap.
+ */
+export function closeSessionRelay(relays: SessionEventRelays, sessionId: string): void {
+  const relay = relays.get(sessionId);
+  if (relay === undefined) {
+    return;
+  }
+  for (const res of relay.subscribers) {
+    res.end();
+  }
+  relay.subscribers.clear();
+  relays.delete(sessionId);
+}

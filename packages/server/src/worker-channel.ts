@@ -61,7 +61,7 @@ import {
   type JsonValue,
   type Session,
 } from "@ccctl/core";
-import { broadcastEvent, type SessionEventRelays } from "./event-stream.js";
+import { broadcastEvent, closeSessionRelay, type SessionEventRelays } from "./event-stream.js";
 import { readJsonBody, writeError, writeJson } from "./http-response.js";
 
 /** Hard ceiling on a worker-channel request body (1 MiB) — a control-plane batch fits within it. */
@@ -692,11 +692,13 @@ function considerEviction(state: WorkerChannelState, sessionId: string, record: 
   }
   // Terminally gone: no downstream and no heartbeat for a full grace window. Drive to the terminal
   // `closed` lifecycle (the reverse leg of #172's `connecting`→`ready`), retire the record's timers,
-  // then evict from BOTH maps so `GET /api/sessions` ("ccctl attach") stops listing it.
+  // then evict from the session + worker-channel maps so `GET /api/sessions` ("ccctl attach") stops
+  // listing it, and reap the session's UI event relay (#176) so it does not accumulate across evictions.
   endDownstream(record); // canonical record teardown — clears any residual timers before dropping it.
   state.sessions.set(sessionId, markSessionClosed(session));
   state.sessions.delete(sessionId);
   state.workerChannels.delete(sessionId);
+  closeSessionRelay(state.eventRelays, sessionId); // #176: end subscribers + drop the relay entry.
 }
 
 /**

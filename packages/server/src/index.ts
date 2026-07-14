@@ -219,6 +219,13 @@ export interface CcctlServer {
    */
   hasLiveWorker(sessionId: string): boolean;
   /**
+   * Whether the session currently has a UI event **relay** in the registry — a per-session
+   * SSE fan-out is created lazily on first UI subscribe / first worker-event broadcast, and
+   * reaped when the session is evicted (#173/#176). The receiver-grounded read of "this
+   * session's relay is still tracked", used to verify eviction reaps it and does not leak.
+   */
+  hasSessionRelay(sessionId: string): boolean;
+  /**
    * Launch a fresh headful session (#31) via the configured {@link ServerConfig.launcher} and
    * track its terminal handle for shutdown teardown — the programmatic form of a
    * `POST /api/sessions` "New session" request. Resolves with the {@link LaunchedSession}
@@ -353,6 +360,9 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
     },
     hasLiveWorker(sessionId: string): boolean {
       return hasLiveWorkerChannel(state, sessionId);
+    },
+    hasSessionRelay(sessionId: string): boolean {
+      return state.eventRelays.has(sessionId);
     },
     launchSession(options: SessionLaunchOptions): Promise<LaunchedSession> {
       return launchTrackedSession(state, options);

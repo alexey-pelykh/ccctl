@@ -555,9 +555,14 @@ function parseUiSseBlock(block: string): UiSseEvent | null {
 /**
  * Subscribe a UI client to a session's transcript stream (`GET /api/sessions/{id}/events`) and
  * collect its data events — used to prove a downstream liveness frame surfaces NOTHING to the UI
- * (the transcript is fed only by the upstream `worker/events` leg).
+ * (the transcript is fed only by the upstream `worker/events` leg). `closed()` reports whether the
+ * server has ended THIS subscriber stream — the receiver-grounded read that eviction reaped the
+ * relay and closed its subscribers (#176).
  */
-function openUiEventStream(server: CcctlServer, sessionId: string): Promise<{ received(): UiSseEvent[] }> {
+function openUiEventStream(
+  server: CcctlServer,
+  sessionId: string,
+): Promise<{ received(): UiSseEvent[]; closed(): boolean }> {
   const { host, port } = server.address;
   return new Promise((resolve, reject) => {
     const req = httpRequest(
@@ -572,6 +577,15 @@ function openUiEventStream(server: CcctlServer, sessionId: string): Promise<{ re
         streams.push(res);
         res.setEncoding("utf8");
         res.on("error", () => {}); // swallow a reset when the server ends the stream on shutdown.
+        let closed = false;
+        // The server ends this response when the session's relay is reaped on eviction (#176) or on
+        // shutdown; either `end` (readable drained) or `close` (connection gone) marks it closed.
+        res.on("end", () => {
+          closed = true;
+        });
+        res.on("close", () => {
+          closed = true;
+        });
         const events: UiSseEvent[] = [];
         let buffer = "";
         res.on("data", (chunk: string) => {
@@ -586,7 +600,7 @@ function openUiEventStream(server: CcctlServer, sessionId: string): Promise<{ re
             boundary = buffer.indexOf("\n\n");
           }
         });
-        resolve({ received: () => events });
+        resolve({ received: () => events, closed: () => closed });
       },
     );
     req.on("error", reject);
@@ -825,5 +839,64 @@ describe("§4 worker session eviction — a terminally-gone worker's session is 
     // Grace == staleness window: a session with no downstream and no heartbeat for one staleness
     // window is terminally gone. The knob is injectable, so this is a documented design value.
     expect(DEFAULT_SESSION_EVICTION_GRACE_MS).toBe(DEFAULT_HEARTBEAT_STALE_AFTER_MS);
+  });
+});
+
+// --- #176: reap the per-session UI event relay when the session is evicted ---
+
+describe("§ UI event relay eviction — a terminally-gone session's relay is reaped, reconnect-safe (#176)", () => {
+  const GRACE_MS = 40;
+
+  it("reaps the session's UI event relay on eviction — closes the subscriber stream AND removes the entry from the registry, so it does not leak (#176)", async () => {
+    const server = await startEvictionServer(GRACE_MS);
+    const sessionId = await registerSession(server);
+    // A UI client subscribes first — the session's event relay is lazily created (relayFor) and holds
+    // a live subscriber stream. Opening it BEFORE the worker downstream keeps `streams.pop()` below
+    // pointing at the worker stream while this UI subscriber stays open to observe the eviction close.
+    const ui = await openUiEventStream(server, sessionId);
+    await waitFor(() => server.hasSessionRelay(sessionId));
+    expect(ui.closed()).toBe(false);
+    // Bring up the worker and its held-open downstream.
+    await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId);
+    await waitFor(() => server.hasLiveWorker(sessionId));
+
+    // The worker terminally exits: its downstream (opened last) closes and NO heartbeat follows, so the
+    // session goes downstream-null AND heartbeat-stale.
+    streams.pop()?.destroy();
+
+    // After the grace window the session is evicted; its event relay is reaped alongside the #173
+    // session + worker-channel maps, and the UI subscriber stream is closed.
+    await waitFor(() => !server.sessions.has(sessionId));
+    expect(server.hasSessionRelay(sessionId)).toBe(false);
+    await waitFor(() => ui.closed());
+  });
+
+  it("does NOT reap the relay of a transiently-reconnecting session — the relay + its subscriber survive the blip (#176 reconnect-safety)", async () => {
+    // A generous grace so the reconnect comfortably completes before the eviction check could fire.
+    const RECONNECT_GRACE_MS = 300;
+    const server = await startEvictionServer(RECONNECT_GRACE_MS);
+    const sessionId = await registerSession(server);
+    const ui = await openUiEventStream(server, sessionId);
+    await waitFor(() => server.hasSessionRelay(sessionId));
+    await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId);
+    await waitFor(() => server.hasLiveWorker(sessionId));
+
+    // Network blip: the downstream drops (eviction is armed) ...
+    streams.pop()?.destroy();
+    await waitFor(() => !server.hasLiveWorker(sessionId));
+    // ... then the worker reconnects before the grace elapses.
+    await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId);
+    await waitFor(() => server.hasLiveWorker(sessionId));
+
+    // Across more than a full grace window the session is retained — so its event relay is NEVER
+    // reaped (closeSessionRelay runs only on the terminal-eviction branch) and the UI subscriber
+    // stream stays open.
+    await new Promise((resolve) => setTimeout(resolve, RECONNECT_GRACE_MS * 2));
+    expect(server.sessions.has(sessionId)).toBe(true);
+    expect(server.hasSessionRelay(sessionId)).toBe(true);
+    expect(ui.closed()).toBe(false);
   });
 });
