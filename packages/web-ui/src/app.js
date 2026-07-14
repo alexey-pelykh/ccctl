@@ -7,8 +7,9 @@
  * Vanilla ES module, no framework and no bundler. It talks to @ccctl/server
  * over three channels, all SESSION-ADDRESSED (#20) so more than one running
  * session can be carried at once:
- *   - list:       a fetch() GET of `/api/sessions` enumerates the sessions the
- *     daemon is carrying (#20); the user picks one to view + steer.
+ *   - list:       a fetch() GET of `/api/sessions`, POLLED on an interval, enumerates the
+ *     sessions the daemon is carrying (#20) and keeps each row's per-session status live as
+ *     sessions change state (#25); the user picks one to view + steer.
  *   - downstream: an EventSource (Server-Sent Events) on `/api/sessions/{id}/events`
  *     receives the control_event frames the server relays from the SELECTED session's
  *     Claude Code worker (#15) — never another session's (#20);
@@ -17,14 +18,16 @@
  *     control_request onto THAT session's worker channel (#16/#20).
  *
  * This shell is deliberately thin: every decode/classify/format decision lives
- * in the DOM-free `./transcript.js` (unit-tested), and every verb→frame decision
- * in the DOM-free `./command.js` (unit-tested). Here we only wire DOM controls to
- * those builders and apply their results to the page. Selecting a session (re)opens
- * its stream and clears the prior session's transcript; a `worker_status` frame
- * updates the CURRENT-TURN indicator in place; every other control event is
- * appended to the TRANSCRIPT; an undecodable line is surfaced verbatim rather
- * than dropped; and an accepted steer is echoed into the transcript (marked
- * outbound) so it is reflected in the viewed session.
+ * in the DOM-free `./transcript.js` (unit-tested), every verb→frame decision
+ * in the DOM-free `./command.js` (unit-tested), and every list diff / label /
+ * selection decision in the DOM-free `./sessions.js` (unit-tested). Here we only
+ * wire DOM controls to those builders and apply their results to the page. Each
+ * poll updates the picker IN PLACE (only the rows that changed) so it stays live
+ * without flicker; selecting a session (re)opens its stream and clears the prior
+ * session's transcript; a `worker_status` frame updates the CURRENT-TURN indicator
+ * in place; every other control event is appended to the TRANSCRIPT; an undecodable
+ * line is surfaced verbatim rather than dropped; and an accepted steer is echoed
+ * into the transcript (marked outbound) so it is reflected in the viewed session.
  */
 
 import { processEventData } from "./transcript.js";
@@ -37,6 +40,7 @@ import {
   redirectCommand,
   describeCommand,
 } from "./command.js";
+import { diffSessionList, nextSelection } from "./sessions.js";
 
 const statusEl = document.getElementById("status");
 const activityEl = document.getElementById("activity");
@@ -53,6 +57,18 @@ const approveButtonEl = document.getElementById("approve-button");
 let currentSessionId = null;
 /** The active EventSource for the selected session, or null when disconnected. */
 let source = null;
+/** The picker rows currently in the DOM, keyed by session id, so a poll updates them in place. */
+const sessionRows = new Map();
+/** The session summaries last applied to the picker — the "previous" side of each poll's diff. */
+let renderedSessions = [];
+/** How often the picker re-polls `/api/sessions` so each row's per-session status stays live (#25 AC3). */
+const SESSION_POLL_INTERVAL_MS = 2000;
+/** The pending next-poll timer id, or null when no poll is scheduled. */
+let pollTimer = null;
+/** Whether a session-list poll is already in flight, so a manual refresh can't stack a second poll loop. */
+let polling = false;
+/** Whether the empty-state placeholder is up, so a poll over an empty list doesn't re-render it. */
+let emptyPlaceholderShown = false;
 
 /** Build one transcript `<li>`: a bold subtype label plus an optional human summary. */
 function transcriptItem(subtype, summary) {
@@ -109,34 +125,77 @@ function handleEvent(data) {
   }
 }
 
-/** A one-line label for a session in the list: its id and its state. */
-function sessionLabel(session) {
-  const activity = session.activity && typeof session.activity.kind === "string" ? session.activity.kind : "unknown";
-  return `${session.id} — ${session.status} / ${activity}`;
+/** Build one picker row: a full-width button whose click views + steers that session. */
+function createSessionRow(sessionId, label) {
+  const li = document.createElement("li");
+  li.dataset.sessionId = sessionId;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.addEventListener("click", () => selectSession(sessionId));
+  li.appendChild(button);
+  return li;
 }
 
-/** Render the session picker; the selected session is marked so its highlight shows. */
-function renderSessionList(sessions) {
-  sessionListEl.replaceChildren();
+/**
+ * Apply the latest session list to the picker IN PLACE via the diff `./sessions.js`
+ * returns: drop vanished rows, add fresh ones, relabel only the rows whose status /
+ * activity moved, and reorder to the server's list. Updating in place (rather than
+ * rebuilding on every poll) keeps button focus and the current selection, and lets the
+ * `aria-live` list announce only real changes instead of re-reading the whole list each
+ * interval. An empty list shows a placeholder (not a tracked row).
+ */
+function applySessionList(sessions) {
   if (sessions.length === 0) {
-    const li = document.createElement("li");
-    li.textContent = "No sessions yet.";
-    sessionListEl.appendChild(li);
+    // Only (re)render the placeholder on the transition into empty, so a poll over a
+    // still-empty list doesn't re-announce "No sessions yet." to the aria-live region.
+    if (!emptyPlaceholderShown) {
+      sessionRows.clear();
+      const li = document.createElement("li");
+      li.textContent = "No sessions yet.";
+      sessionListEl.replaceChildren(li);
+      emptyPlaceholderShown = true;
+    }
+    renderedSessions = [];
     return;
   }
-  for (const session of sessions) {
-    const li = document.createElement("li");
-    li.dataset.sessionId = session.id;
-    if (session.id === currentSessionId) {
-      li.dataset.selected = "true";
-    }
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = sessionLabel(session);
-    button.addEventListener("click", () => selectSession(session.id));
-    li.appendChild(button);
+  // Coming from the empty-state placeholder (which is not a tracked row): clear it first.
+  if (emptyPlaceholderShown) {
+    sessionListEl.replaceChildren();
+    emptyPlaceholderShown = false;
+  }
+  const diff = diffSessionList(renderedSessions, sessions);
+  for (const id of diff.removed) {
+    sessionRows.get(id)?.remove();
+    sessionRows.delete(id);
+  }
+  for (const { id, label } of diff.added) {
+    const li = createSessionRow(id, label);
+    sessionRows.set(id, li);
     sessionListEl.appendChild(li);
   }
+  for (const { id, label } of diff.updated) {
+    const button = sessionRows.get(id)?.querySelector("button");
+    if (button !== null && button !== undefined) {
+      button.textContent = label;
+    }
+  }
+  // Reorder to the server's list ONLY when the DOM order actually differs — appendChild
+  // MOVES a node, so re-appending every poll would churn the list (and its aria-live
+  // announcements) even when nothing moved. New rows append at the end, which already
+  // matches the server's insertion order in the common case, so this rarely fires.
+  const domOrder = [...sessionListEl.children].map((li) => li.dataset.sessionId);
+  const orderMatches = domOrder.length === diff.order.length && domOrder.every((id, index) => id === diff.order[index]);
+  if (!orderMatches) {
+    for (const id of diff.order) {
+      const li = sessionRows.get(id);
+      if (li !== undefined) {
+        sessionListEl.appendChild(li);
+      }
+    }
+  }
+  renderedSessions = sessions;
+  markSelected();
 }
 
 /** Move the selection highlight to the current session without re-fetching the list. */
@@ -150,7 +209,7 @@ function markSelected() {
   }
 }
 
-/** Fetch and render the session list; auto-select the first on first load, drop a vanished selection. */
+/** Fetch and reconcile the session list; auto-select the first on first load, drop a vanished selection. */
 async function loadSessions() {
   let payload;
   try {
@@ -164,15 +223,17 @@ async function loadSessions() {
     return;
   }
   const sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
-  renderSessionList(sessions);
-  if (currentSessionId === null && sessions.length > 0) {
+  applySessionList(sessions);
+  const selection = nextSelection(currentSessionId, sessions);
+  if (selection.kind === "select") {
     // Nothing selected yet: view the first session so the UI is useful on first load.
-    selectSession(sessions[0].id);
-  } else if (currentSessionId !== null && !sessions.some((session) => session.id === currentSessionId)) {
+    selectSession(selection.id);
+  } else if (selection.kind === "clear") {
     // The selected session is gone: stop viewing it.
     disconnect();
     currentSessionId = null;
     statusEl.textContent = "no session selected";
+    markSelected();
   }
 }
 
@@ -251,9 +312,36 @@ function steer(command) {
   });
 }
 
-// refresh: re-list the sessions the daemon is carrying.
+/**
+ * Poll the session list now, then arm the next poll so the picker's per-session status stays live.
+ * A poll already in flight short-circuits (a manual refresh mid-fetch must not start a second poll
+ * loop); the in-flight one re-arms the timer on completion. `finally` re-arms even on an unexpected
+ * throw, so a transient failure never kills the loop.
+ */
+async function pollSessions() {
+  if (polling) {
+    return;
+  }
+  polling = true;
+  try {
+    await loadSessions();
+  } finally {
+    polling = false;
+    scheduleNextPoll();
+  }
+}
+
+/** Arm the next session-list poll — a single-shot timer re-armed after each poll (no overlap). */
+function scheduleNextPoll() {
+  pollTimer = setTimeout(pollSessions, SESSION_POLL_INTERVAL_MS);
+}
+
+// refresh: re-list now and restart the poll clock, so a manual refresh doesn't double-fetch.
 refreshSessionsEl.addEventListener("click", () => {
-  loadSessions();
+  if (pollTimer !== null) {
+    clearTimeout(pollTimer);
+  }
+  pollSessions();
 });
 
 // input: send the prompt text to the current turn.
@@ -283,4 +371,5 @@ approveButtonEl.addEventListener("click", () => {
   steer(approveCommand());
 });
 
-loadSessions();
+// List now and keep polling so the picker's per-session status stays live (#25 AC3).
+pollSessions();

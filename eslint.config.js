@@ -82,6 +82,9 @@ export default tseslint.config(
         document: "readonly",
         EventSource: "readonly",
         fetch: "readonly",
+        // Timers drive the session-list poll that keeps per-session status live (#25).
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
       },
     },
   },
