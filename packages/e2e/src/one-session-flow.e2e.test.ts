@@ -84,12 +84,13 @@ describe("ccctl e2e: one-session flow — register → server → phone view + s
       expect(server.environments.size).toBe(1);
       expect(server.environments.has(flow.environmentId)).toBe(true);
 
-      // session-create (§2) — the local server recorded exactly the one session, keyed by
-      // the wire session_id; it stays `connecting` (activity, not status, is the tri-state)
-      // and the worker's idle status derived `idle` activity (#130).
+      // session-create (§2) + worker attach (§4) — the local server recorded exactly the one
+      // session, keyed by the wire session_id; the worker held open its downstream, so the
+      // transport lifecycle advanced `connecting`→`ready` (#172), while the worker's idle status
+      // separately derived `idle` activity (the orthogonal tri-state, #130).
       expect(server.sessions.size).toBe(1);
       expect(server.sessions.has(flow.sessionId)).toBe(true);
-      expect(server.sessions.get(flow.sessionId)?.status).toBe("connecting");
+      expect(server.sessions.get(flow.sessionId)?.status).toBe("ready");
       expect(server.sessions.get(flow.sessionId)?.activity.kind).toBe("idle");
 
       // work-poll (§3) — the bridge received a SINGLE session-dispatch item over the

@@ -975,6 +975,23 @@ export function recordHeartbeat(session: Session, now: number = Date.now()): Ses
   return { ...session, lastHeartbeatAt: now };
 }
 
+/**
+ * Explicit transition — advance a session's transport lifecycle to `ready` when the
+ * worker's downstream event stream attaches (the session becomes steerable). Returns a
+ * NEW `ready` session ONLY from `connecting`; any other {@link SessionStatus} is returned
+ * UNCHANGED (no transition), so a re-attach on an already-advanced session — and a future
+ * `busy` / `closed` / `errored` — is never clobbered. Only `status` moves; the orthogonal
+ * activity / liveness dimensions are untouched. Pure: never mutates the input, so one
+ * session's attach cannot touch another's. The reverse leg (`→ closed` / `errored` on
+ * teardown / failure) is a separate transition.
+ */
+export function markSessionReady(session: Session): Session {
+  if (session.status !== "connecting") {
+    return session;
+  }
+  return { ...session, status: "ready" };
+}
+
 // --- loggable / persistable (JSON) shape + credential-omission proofs ---
 
 /** A JSON-safe value: exactly what may cross into a log line or a snapshot. */

@@ -55,6 +55,13 @@ async function registerSession(server: CcctlServer): Promise<string> {
   return ((await res.json()) as { session_id: string }).session_id;
 }
 
+/** GET the browser-facing session list — the surface that projects each session's transport `status` (#172). */
+async function listSessions(server: CcctlServer): Promise<{ id: string; status: string }[]> {
+  const res = await fetch(`${base(server)}/api/sessions`);
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { sessions: { id: string; status: string }[] }).sessions;
+}
+
 /** §4 — POST worker/register `{}` and return the minted worker_epoch. */
 async function registerWorker(server: CcctlServer, sessionId: string): Promise<number> {
   const res = await fetch(`${base(server)}${workerRegisterPath(sessionId)}`, {
@@ -216,6 +223,26 @@ describe("§4 worker events stream — GET …/worker/events/stream (held-open d
     await registerWorker(server, sessionId);
     const wrongMethod = await fetch(`${base(server)}${workerEventsStreamPath(sessionId)}`, { method: "POST" });
     expect(wrongMethod.status).toBe(405);
+  });
+});
+
+describe("§4 session.status connecting→ready — the worker downstream attach advances the transport lifecycle (#172)", () => {
+  it("lists a fresh session as `connecting` and reports `ready` once the worker holds its downstream open", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+
+    // A freshly-created session is born `connecting` — no worker downstream has attached yet.
+    const before = await listSessions(server);
+    expect(before.find((s) => s.id === sessionId)?.status).toBe("connecting");
+
+    // The worker registers and opens (attaches) its held-open downstream.
+    await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId);
+
+    // Attaching the downstream advanced the transport lifecycle to `ready`; GET /api/sessions
+    // reports it verbatim, so `ccctl attach` renders `[ready] …` (AC2/AC3).
+    const after = await listSessions(server);
+    expect(after.find((s) => s.id === sessionId)?.status).toBe("ready");
   });
 });
 

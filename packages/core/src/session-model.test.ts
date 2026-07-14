@@ -8,6 +8,7 @@ import {
   DEFAULT_HEARTBEAT_STALE_AFTER_MS,
   DEFAULT_REQUIRES_ACTION_DETAIL,
   isSessionStale,
+  markSessionReady,
   recordHeartbeat,
   sessionActivityFromFrame,
   sessionLiveness,
@@ -167,5 +168,27 @@ describe("explicit transitions (AC: per-session, one transition never mutates an
     expect(s2.lastActivityAt).toBe(T0 + 10);
     expect(s2.status).toBe("connecting");
     expect(s2.id).toBe("sess-1");
+  });
+
+  it("markSessionReady advances a fresh `connecting` session to `ready`, purely and status-only", () => {
+    const before = createSession("sess-1", T0);
+    const after = markSessionReady(before);
+    expect(after).not.toBe(before);
+    expect(after.status).toBe("ready");
+    // Only `status` moves — the orthogonal activity / liveness / timing fields are untouched.
+    expect(after).toEqual({ ...before, status: "ready" });
+    // The input is untouched (pure).
+    expect(before.status).toBe("connecting");
+  });
+
+  it("markSessionReady is a no-op (same reference) on any non-`connecting` status", () => {
+    // Already `ready` (e.g. a downstream re-attach) → returned unchanged, never re-clobbered.
+    const ready = markSessionReady(createSession("sess-1", T0));
+    expect(markSessionReady(ready)).toBe(ready);
+    // The forward-only guard also protects a future busy / closed / errored from being reset to ready.
+    for (const status of ["busy", "closed", "errored"] as const) {
+      const session = { ...createSession("sess-1", T0), status };
+      expect(markSessionReady(session)).toBe(session);
+    }
   });
 });
