@@ -47,6 +47,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { ENVIRONMENTS_BRIDGE_PATH, SESSIONS_PATH, type HostEndpoint, type Session } from "@ccctl/core";
 import {
   closeWorkerChannels,
+  DEFAULT_SESSION_EVICTION_GRACE_MS,
   DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
   handleWorkerDelivery,
   handleWorkerEvents,
@@ -173,6 +174,14 @@ export interface ServerConfig {
    */
   workerLivenessIntervalMs?: number;
   /**
+   * Grace window (ms) before a session whose worker downstream has gone null is closed and evicted
+   * from the registry (#173). Defaults to {@link DEFAULT_SESSION_EVICTION_GRACE_MS} (30s). Eviction
+   * is reconnect-safe: the downstream close only arms a check this long later, which evicts solely a
+   * session that is still downstream-null AND heartbeat-stale (a genuine reconnect is retained). A
+   * test passes a short value to exercise eviction deterministically.
+   */
+  sessionEvictionGraceMs?: number;
+  /**
    * The session launcher a `POST /api/sessions` "New session" request runs (#31) to bring up a
    * headful, locally-attachable terminal running the patched `claude`. An injected
    * {@link ISessionLauncher} port — the daemon composes the primary tmux backend (#29) with any
@@ -239,6 +248,8 @@ interface ServerState {
   readonly workPollTimeoutMs: number;
   /** Interval (ms) between per-session downstream liveness frames (§4/§5, #166). */
   readonly workerLivenessIntervalMs: number;
+  /** Grace window (ms) before a downstream-null, heartbeat-stale session is closed + evicted (#173). */
+  readonly sessionEvictionGraceMs: number;
   /** Provisional at construction; finalized with the resolved port once bound. */
   address: HostEndpoint;
 }
@@ -394,6 +405,7 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     launchedSessions: new Set<LaunchedSession>(),
     workPollTimeoutMs: config.workPollTimeoutMs ?? DEFAULT_WORK_POLL_TIMEOUT_MS,
     workerLivenessIntervalMs: config.workerLivenessIntervalMs ?? DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
+    sessionEvictionGraceMs: config.sessionEvictionGraceMs ?? DEFAULT_SESSION_EVICTION_GRACE_MS,
     address: { host, port: config.port },
   };
 

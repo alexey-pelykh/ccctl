@@ -8,6 +8,7 @@ import {
   DEFAULT_HEARTBEAT_STALE_AFTER_MS,
   DEFAULT_REQUIRES_ACTION_DETAIL,
   isSessionStale,
+  markSessionClosed,
   markSessionReady,
   recordHeartbeat,
   sessionActivityFromFrame,
@@ -189,6 +190,29 @@ describe("explicit transitions (AC: per-session, one transition never mutates an
     for (const status of ["busy", "closed", "errored"] as const) {
       const session = { ...createSession("sess-1", T0), status };
       expect(markSessionReady(session)).toBe(session);
+    }
+  });
+
+  it("markSessionClosed drives any LIVE status to the terminal `closed`, purely and status-only", () => {
+    // The reverse leg of markSessionReady (#173): a live session torn down → `closed`.
+    for (const status of ["connecting", "ready", "busy"] as const) {
+      const before = { ...createSession("sess-1", T0), status };
+      const after = markSessionClosed(before);
+      expect(after).not.toBe(before);
+      expect(after.status).toBe("closed");
+      // Only `status` moves — the orthogonal activity / liveness / timing fields are untouched.
+      expect(after).toEqual({ ...before, status: "closed" });
+      // The input is untouched (pure).
+      expect(before.status).toBe(status);
+    }
+  });
+
+  it("markSessionClosed is a no-op (same reference) on an already-terminal status", () => {
+    // A terminal state never moves: re-closing is a no-op and a distinct `errored` is never
+    // clobbered to `closed`.
+    for (const status of ["closed", "errored"] as const) {
+      const session = { ...createSession("sess-1", T0), status };
+      expect(markSessionClosed(session)).toBe(session);
     }
   });
 });
