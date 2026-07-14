@@ -243,16 +243,18 @@ export function formatAuthority(host: string, port: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// device pairing (QR onboarding, #74)
+// device pairing (QR onboarding #74) + device-token at-rest form (#84)
 //
 // Onboard a phone/tablet/laptop by scanning a terminal QR: the server mints a
 // per-device token (`mintDeviceToken`, @ccctl/server), encodes it — together with
 // the tunnel origin — into a pairing URL, and prints that URL as a QR. The scanned
 // URL carries the token in its FRAGMENT, so it is applied client-side with no
-// copy/paste and never reaches the server in the request line. Minting only + the
-// pure encode/redact contract live in this slice; durable, hashed, named persistence
-// of the minted tokens is #84 (W3-10), and server-side verification of a presented
-// token is a later credentialed-wave item — neither is introduced here.
+// copy/paste and never reaches the server in the request line. The pure encode/redact
+// contract lives here; the {@link DeviceTokenHash} brand below is the
+// at-rest form #84 (W3-10) persists in place of the raw token, and the persisted
+// {@link PairedDevice} record + {@link IDeviceStore} seam are the device-store
+// contract at the end of this file. Server-side VERIFICATION of a presented token
+// is a later credentialed-wave item — not introduced here.
 // ---------------------------------------------------------------------------
 
 /** Nominal brand for {@link DeviceToken}. */
@@ -281,6 +283,40 @@ export function deviceToken(value: string): DeviceToken {
     throw new Error("ccctl: a device token must be a non-empty string");
   }
   return value as DeviceToken;
+}
+
+/** Nominal brand for {@link DeviceTokenHash}. */
+declare const deviceTokenHashBrand: unique symbol;
+
+/**
+ * The at-rest form of a {@link DeviceToken}: a one-way hash of the minted secret, and the ONLY
+ * projection of a device token that is safe to persist (#84). A {@link PairedDevice} stores
+ * this, never the raw {@link DeviceToken} — so a leaked device store yields no usable
+ * credential. Branded distinctly from {@link DeviceToken} so the two cannot be confused at a
+ * type level: {@link PairedDevice.tokenHash} is a DeviceTokenHash, and a raw DeviceToken is NOT
+ * assignable to it, which makes "persist the hash, never the token" a compile-time guarantee at
+ * the field. Still a `string` (hence a {@link JsonValue}) because it legitimately rides a JSON
+ * snapshot at rest.
+ *
+ * Producing the hash is runtime-coupled (a `node:crypto` digest), so it lives in @ccctl/server's
+ * `hashDeviceToken` — the counterpart to `mintDeviceToken`; core owns only the brand and its
+ * non-blank constructor, exactly as it owns {@link DeviceToken} while minting lives server-side.
+ */
+export type DeviceTokenHash = string & {
+  readonly [deviceTokenHashBrand]: never;
+};
+
+/**
+ * Tag a raw string as a {@link DeviceTokenHash}, failing closed on a blank one — a blank hash is
+ * trivially not a digest, the same "blank is not configured" treatment {@link deviceToken}
+ * applies. The single place a raw string becomes a DeviceTokenHash, so every DeviceTokenHash in
+ * the system is non-blank by construction.
+ */
+export function deviceTokenHash(value: string): DeviceTokenHash {
+  if (value.trim() === "") {
+    throw new Error("ccctl: a device token hash must be a non-empty string");
+  }
+  return value as DeviceTokenHash;
 }
 
 /**
@@ -1314,3 +1350,171 @@ export interface ISessionStore {
  * breaks, `tsc` fails.
  */
 export type SessionStorePersistenceProofs = [Assert<IsJson<UnreadEntry>>, Assert<IsJson<SessionStoreSnapshot>>];
+
+// ---------------------------------------------------------------------------
+// device-store persistence — the paired-device registry seam (#84 / W3-10)
+//
+// #74 mints a per-device token and prints it as a pairing QR; this section
+// defines the CONTRACT for persisting the devices that pairing produces, so one
+// operator can manage several paired devices (phone, tablet, laptop) across a
+// daemon restart. Like the session-store seam above, it is contract-only: the
+// JSON-safe on-disk shape ({@link PairedDevice}, {@link DeviceStoreSnapshot}), the
+// {@link IDeviceStore} load/save interface, and the pure record transforms
+// ({@link pairedDevice} / {@link renameDevice} / {@link touchDevice}). The concrete
+// backend (a single-file `0600` JSON snapshot at an XDG state path) is Node-coupled
+// I/O and ships in `@ccctl/server`, exactly as the file session store does; core
+// stays runtime-agnostic (CORE-C-001).
+//
+// **No plaintext token at rest (HARD, AC1).** A {@link PairedDevice} carries a
+// {@link DeviceTokenHash} — the one-way hash of the minted secret — and has NO field
+// for the raw {@link DeviceToken}: the token is omitted by construction, so a
+// snapshot cannot carry it. The compile-time {@link DeviceStorePersistenceProofs}
+// below prove the shape is {@link JsonValue}-safe (it round-trips), but — exactly as
+// with the session store's {@link SessionIngressToken} — a DeviceToken is ITSELF a
+// JSON-safe branded string, so that proof does NOT by itself exclude it; the
+// omission-by-construction (no token field) plus a runtime at-rest grep in the server
+// backend's suite are what guarantee "never in plaintext at rest".
+//
+// **One auth model (AC3).** This is the paired-device REGISTRY, not a second auth
+// path: it persists device records and their token HASHES for a future
+// credentialed-wave verifier to consult, and introduces no request-authorization of
+// its own — the account-level mandatory local-server auth (security-posture.md) is
+// untouched.
+// ---------------------------------------------------------------------------
+
+/**
+ * The schema version stamped into every {@link DeviceStoreSnapshot}. A backend that
+ * reads a snapshot whose `version` differs fails closed rather than silently mis-reading
+ * an older shape — the same pin-and-fail-closed posture
+ * {@link SESSION_STORE_SNAPSHOT_VERSION} takes. Bumping it is a deliberate, reviewed change.
+ */
+export const DEVICE_STORE_SNAPSHOT_VERSION = 1;
+
+/**
+ * A single paired device (#84): the persisted record for one device an operator has
+ * onboarded via QR pairing (#74) — everything needed to LIST and NAME a device, and
+ * never the raw credential.
+ *
+ * Every field is {@link JsonValue}-safe (proven by {@link DeviceStorePersistenceProofs}),
+ * so a record survives a JSON snapshot round-trip unchanged. The {@link DeviceTokenHash} is
+ * the ONLY projection of the device token that is persisted — the raw {@link DeviceToken}
+ * has no field here, so it cannot reach a snapshot (AC1). All fields are `readonly`: the
+ * pure transforms below produce a NEW record rather than mutating in place.
+ */
+export interface PairedDevice {
+  /** Stable device identity, assigned once at pairing and never reused — the list/rename key. */
+  readonly id: string;
+  /** Human-readable device name ("Alex's phone"), set at pairing and mutable via {@link renameDevice}. */
+  readonly name: string;
+  /** Epoch millis when the device was paired. */
+  readonly createdAt: number;
+  /** Epoch millis of the device's most recent activity; advanced by {@link touchDevice}. */
+  readonly lastSeen: number;
+  /**
+   * The one-way hash of the device's minted {@link DeviceToken} (@ccctl/server's
+   * `hashDeviceToken`), persisted in place of the secret so the store carries no usable
+   * credential at rest (AC1). A future credentialed-wave verifier hashes a presented token
+   * and compares it against this.
+   */
+  readonly tokenHash: DeviceTokenHash;
+}
+
+/** Normalise + validate a human-readable device name, failing closed on a blank one. */
+function requireDeviceName(name: string): string {
+  const trimmed = name.trim();
+  if (trimmed === "") {
+    throw new Error("ccctl: a device name must be a non-empty string");
+  }
+  return trimmed;
+}
+
+/**
+ * Create a freshly-paired device record (#84): `createdAt` and `lastSeen` both start at `now`
+ * (pairing is the first time the device is seen), carrying the caller-assigned `id`, `name`,
+ * and the already-hashed {@link DeviceTokenHash}. Pure and `now`-injectable so a test is
+ * deterministic — the same birth-parameter idiom as {@link createSession}. Server-side, the
+ * `id` and `tokenHash` are produced with `node:crypto` (`randomUUID` + `hashDeviceToken`) and
+ * handed to this pure constructor. The `name` is trimmed and fails closed when blank — a blank
+ * human-readable name is not a name (the same "blank is not configured" guard
+ * {@link deviceToken} applies).
+ */
+export function pairedDevice(params: {
+  readonly id: string;
+  readonly name: string;
+  readonly tokenHash: DeviceTokenHash;
+  readonly now?: number;
+}): PairedDevice {
+  const { id, name, tokenHash, now = Date.now() } = params;
+  return { id, name: requireDeviceName(name), createdAt: now, lastSeen: now, tokenHash };
+}
+
+/**
+ * Rename a paired device (AC2), returning a NEW record with the updated
+ * {@link PairedDevice.name} and every other field — `id`, `createdAt`, `lastSeen`, and the
+ * {@link DeviceTokenHash} — preserved. Pure: never mutates the input, so one device's rename
+ * cannot touch another's. Trims and fails closed on a blank name, the same guard
+ * {@link pairedDevice} applies, so a rename can never blank out a device's name.
+ */
+export function renameDevice(device: PairedDevice, name: string): PairedDevice {
+  return { ...device, name: requireDeviceName(name) };
+}
+
+/**
+ * Mark a paired device as just-seen (updates {@link PairedDevice.lastSeen} to `now`),
+ * returning a NEW record with every other field preserved. Pure and `now`-injectable, the
+ * same idiom as {@link recordHeartbeat} for a session. `lastSeen` is what the device list
+ * (AC4) surfaces so an operator can tell an active device from a long-idle one.
+ */
+export function touchDevice(device: PairedDevice, now: number = Date.now()): PairedDevice {
+  return { ...device, lastSeen: now };
+}
+
+/**
+ * The complete persisted paired-device registry (#84) — every {@link PairedDevice} the hub
+ * tracks, as ONE JSON-safe snapshot an {@link IDeviceStore} loads on start and saves on
+ * change. Listing all currently-paired devices (AC4) is reading
+ * {@link DeviceStoreSnapshot.devices}.
+ *
+ * The whole shape is {@link JsonValue}-safe by construction (proven by
+ * {@link DeviceStorePersistenceProofs}): it round-trips through JSON unchanged and — since a
+ * {@link PairedDevice} carries a {@link DeviceTokenHash} and no raw token — provably carries no
+ * plaintext device credential.
+ */
+export interface DeviceStoreSnapshot {
+  /** Snapshot schema version; see {@link DEVICE_STORE_SNAPSHOT_VERSION}. */
+  readonly version: number;
+  /** The paired-device registry — every {@link PairedDevice} the hub tracks. */
+  readonly devices: readonly PairedDevice[];
+}
+
+/**
+ * The persistence seam for the paired-device registry: load the last
+ * {@link DeviceStoreSnapshot} on start, save it on change. Runtime-agnostic by design — the
+ * interface names no I/O primitive, so a backend is free to be a single-file JSON snapshot
+ * (`@ccctl/server`), a database, or an in-memory fake in a test. Mirrors {@link ISessionStore}.
+ *
+ * **Round-trip contract.** For any snapshot `s`, `await store.save(s)` then
+ * `await store.load()` yields a snapshot deep-equal to `s`. A backend that has never been
+ * saved to returns `null` from {@link IDeviceStore.load}: absence is `null`, never a
+ * fabricated empty registry — so a caller can tell "no device ever paired" from
+ * "explicitly-saved empty registry".
+ */
+export interface IDeviceStore {
+  /** Load the most recently saved snapshot, or `null` if nothing has ever been saved. */
+  load(): Promise<DeviceStoreSnapshot | null>;
+  /** Persist `snapshot` as the current paired-device registry, replacing any prior snapshot. */
+  save(snapshot: DeviceStoreSnapshot): Promise<void>;
+}
+
+/**
+ * Compile-time proof (erased at build) that the entire persisted paired-device shape is
+ * {@link JsonValue}-safe — so every snapshot round-trips through JSON unchanged (the
+ * {@link IDeviceStore} round-trip contract). As with {@link SessionStorePersistenceProofs}, a
+ * {@link DeviceTokenHash} is a JSON-safe branded string the proof does NOT exclude — that is
+ * intended: the HASH is exactly what a snapshot persists. The raw {@link DeviceToken} is absent
+ * because {@link PairedDevice} carries no such field (omission by construction, AC1) — the same
+ * distinction the session-store proof draws for {@link SessionIngressToken}, which this mirrors.
+ * Exported so it has a referent (and is therefore evaluated, not dropped as unused); if any
+ * assertion breaks, `tsc` fails.
+ */
+export type DeviceStorePersistenceProofs = [Assert<IsJson<PairedDevice>>, Assert<IsJson<DeviceStoreSnapshot>>];

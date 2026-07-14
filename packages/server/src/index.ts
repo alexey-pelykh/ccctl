@@ -170,13 +170,34 @@ export {
   XDG_STATE_HOME_ENV,
 } from "./session-store-file.js";
 
-// Re-export per-device token minting (#74 QR-pair onboarding) on the public surface — the
-// daemon (@ccctl/cli's `serve`) mints a token to encode into the pairing QR. The pure
-// encode/redact contract (DeviceToken, buildPairingUrl, loggablePairingUrl) is @ccctl/core's;
-// this is the one runtime-coupled piece, the CSPRNG mint. Ships runtime (the factory), so a
-// value export alongside its byte-count constant and injectable randomness seam. Defined and
-// unit-tested in device-pairing.ts.
-export { DEVICE_TOKEN_BYTES, mintDeviceToken, type RandomBytesSource } from "./device-pairing.js";
+// Re-export per-device token minting (#74 QR-pair onboarding) + hashing (#84) on the public
+// surface — the daemon (@ccctl/cli's `serve`) mints a token to encode into the pairing QR, and
+// hashes a minted token into its at-rest form before persisting a paired device. The pure
+// encode/redact contract (DeviceToken/DeviceTokenHash, buildPairingUrl, loggablePairingUrl) is
+// @ccctl/core's; these are the two runtime-coupled pieces — the CSPRNG mint + the node:crypto
+// digest. Ship runtime (the factories), so value exports alongside the byte-count/algorithm
+// constants and the injectable randomness seam. Defined and unit-tested in device-pairing.ts.
+export {
+  DEVICE_TOKEN_BYTES,
+  DEVICE_TOKEN_HASH_ALGORITHM,
+  hashDeviceToken,
+  mintDeviceToken,
+  type RandomBytesSource,
+} from "./device-pairing.js";
+
+// Re-export the single-file JSON-snapshot IDeviceStore backend (#84) on the public surface — the
+// concrete persistence the hub's paired-device registry survives a restart on (a `0600` snapshot
+// at an XDG state path, no plaintext token at rest). `@ccctl/core` owns the runtime-agnostic
+// IDeviceStore CONTRACT; this is its Node-coupled file backend, which the daemon selects and
+// injects. Ships runtime (the factory + path resolver), so a value export alongside its named
+// path/mode constants. Defined and unit-tested in device-store-file.ts.
+export {
+  createFileDeviceStore,
+  DEVICE_STORE_DIR_MODE,
+  DEVICE_STORE_FILE_MODE,
+  DEVICE_STORE_FILE_NAME,
+  resolveDeviceStorePath,
+} from "./device-store-file.js";
 
 /** Configuration for a ccctl server instance. */
 export interface ServerConfig {
