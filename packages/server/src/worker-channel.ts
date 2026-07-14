@@ -53,6 +53,7 @@ import {
   applyWorkerStatus,
   BRIDGE_PROTOCOL_API_VERSION,
   isWorkerStatus,
+  markSessionReady,
   recordHeartbeat,
   type ControlRequest,
   type JsonValue,
@@ -264,6 +265,13 @@ export function handleWorkerEventsStream(
   endDownstream(record);
   res.write(": ccctl worker stream\n\n");
   record.downstream = res;
+  // The downstream is attached and the session is now steerable, so advance its transport
+  // lifecycle `connecting`→`ready` (#172). `markSessionReady` is a no-op on an already-advanced
+  // session, and the reverse leg (`→closed`/`errored` on teardown) is a separate transition.
+  const session = state.sessions.get(sessionId);
+  if (session !== undefined) {
+    state.sessions.set(sessionId, markSessionReady(session));
+  }
   // Arm the per-session liveness interval (#166): a no-op `client_event` every
   // `workerLivenessIntervalMs` keeps THIS held-open downstream past the worker's ~45s
   // liveness timeout — a silent idle downstream would otherwise be reaped by the worker and
