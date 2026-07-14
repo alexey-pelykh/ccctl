@@ -20,11 +20,14 @@
  * imported: this module is served to the browser as-is (no bundler, no build), so it stays
  * dependency-free vanilla ESM. The mirrored contract (`GET /api/sessions` → `{ sessions }`):
  *
- *   SessionSummaryWire = { id: string, status: SessionStatus, activity: SessionActivity }
+ *   SessionSummaryWire = { id: string, status: SessionStatus, activity: SessionActivity,
+ *                          notificationsDegraded: boolean }
  *   SessionStatus      = "connecting" | "ready" | "busy" | "closed" | "errored"  (transport)
  *   SessionActivity    = { kind: "running" }
  *                      | { kind: "requires_action"; detail: string }
  *                      | { kind: "idle" }                                        (what the worker is doing)
+ *   notificationsDegraded — a non-prompting session's persistent degraded-notification marker
+ *                      (#26): carried on the wire; a badge to surface, not yet rendered in a row here.
  *
  * A row surfaces BOTH dimensions: the transport `status` (is the steering channel live?)
  * and the derived activity as the human "per-session status" the issue enumerates —

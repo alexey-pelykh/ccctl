@@ -266,6 +266,11 @@ export type SessionStatus = "connecting" | "ready" | "busy" | "closed" | "errore
  *
  * A `ready` + `running` session can still be `stale` (the worker stopped
  * heart-beating) — the dimensions are independent.
+ *
+ * Alongside the three transitioning dimensions is ONE static birth-property:
+ * {@link Session.notificationsDegraded}, set once at attach from the observed
+ * permission mode and never cleared. It is not a fourth dimension that moves —
+ * it is a fixed fact about how the session was created.
  */
 export interface Session {
   /**
@@ -278,6 +283,17 @@ export interface Session {
   status: SessionStatus;
   /** Activity derived from the latest `worker_status` frame. */
   activity: SessionActivity;
+  /**
+   * Life-long attach-time marker: `true` when this session was created under a
+   * non-prompting {@link PermissionMode} ({@link isNonPromptingPermissionMode}) —
+   * the worker never blocks on a decision, so it never emits `requires_action`
+   * and needs-you notifications are DEGRADED. Set ONCE at {@link createSession}
+   * from the observed mode and never cleared: a running session's mode cannot
+   * change, and every transition SPREADS the session, carrying it through
+   * unchanged — so there is no mid-run path that clears it. A prompting session
+   * (`default` / `plan`) carries `false`.
+   */
+  readonly notificationsDegraded: boolean;
   /** Epoch millis when the session was first registered. */
   readonly createdAt: number;
   /** Epoch millis of the most recent `worker_status` frame applied. */
@@ -288,15 +304,19 @@ export interface Session {
 
 /**
  * Create a freshly-registered session: `connecting` lifecycle, `idle` activity,
- * and the heartbeat clock started at `now` (registration is its first liveness
- * signal). `now` is injectable so liveness/heartbeat timing is deterministic
- * under test — never a baked-in ambient clock.
+ * its life-long {@link Session.notificationsDegraded} marker derived from
+ * `permissionMode` (a non-prompting mode ⇒ degraded), and the heartbeat clock
+ * started at `now` (registration is its first liveness signal). `permissionMode`
+ * is the mode the session is created under — a birth parameter, since a running
+ * session's mode cannot change. `now` is injectable so liveness/heartbeat timing
+ * is deterministic under test — never a baked-in ambient clock.
  */
-export function createSession(id: string, now: number = Date.now()): Session {
+export function createSession(id: string, permissionMode: PermissionMode, now: number = Date.now()): Session {
   return {
     id,
     status: "connecting",
     activity: { kind: "idle" },
+    notificationsDegraded: isNonPromptingPermissionMode(permissionMode),
     createdAt: now,
     lastActivityAt: now,
     lastHeartbeatAt: now,
@@ -573,6 +593,28 @@ export const PERMISSION_MODES: readonly PermissionMode[] = ["default", "acceptEd
 /** Runtime guard for {@link PermissionMode} — fails closed on an unknown mode (drift). */
 export function isPermissionMode(value: unknown): value is PermissionMode {
   return typeof value === "string" && (PERMISSION_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * The {@link PermissionMode}s under which the worker NEVER blocks on a decision —
+ * it auto-proceeds — so it never emits a `requires_action` `worker_status`. A
+ * session created under one of these has DEGRADED needs-you notifications: the
+ * hub has nothing to surface as "needs attention" because the worker will never
+ * ask. `acceptEdits` and `bypassPermissions` auto-accept; the PROMPTING
+ * complement — `default` (prompts per decision) and `plan` (blocks awaiting plan
+ * approval) — is deliberately absent. Pinned in one place, mirroring
+ * {@link PERMISSION_MODES}; the two sets partition {@link PERMISSION_MODES}.
+ */
+export const NON_PROMPTING_PERMISSION_MODES: readonly PermissionMode[] = ["acceptEdits", "bypassPermissions"];
+
+/**
+ * Whether `mode` is non-prompting ({@link NON_PROMPTING_PERMISSION_MODES}) — i.e.
+ * a mode whose session has degraded needs-you notifications (it never emits
+ * `requires_action`). The attach-time input to a session's life-long
+ * {@link Session.notificationsDegraded} marker.
+ */
+export function isNonPromptingPermissionMode(mode: PermissionMode): boolean {
+  return NON_PROMPTING_PERMISSION_MODES.includes(mode);
 }
 
 /** The session context a create carries: which model, and the working directory. */
@@ -1093,8 +1135,13 @@ export type BridgeCredentialJsonProofs = [
  * rather than silently mis-read an older shape — the same pin-and-fail-closed
  * posture the wire contract takes ({@link BRIDGE_PROTOCOL_API_VERSION},
  * {@link WORK_SECRET_VERSION}). Bumping it is a deliberate, reviewed change.
+ *
+ * `2` (was `1`): {@link Session} gained the life-long `notificationsDegraded`
+ * marker (#26), changing the persisted registry shape — so a pre-#26 `version: 1`
+ * snapshot, whose sessions lack the field, is fail-closed on load rather than
+ * loaded as a `Session` with an `undefined` marker.
  */
-export const SESSION_STORE_SNAPSHOT_VERSION = 1;
+export const SESSION_STORE_SNAPSHOT_VERSION = 2;
 
 /**
  * A single unread marker: a per-session {@link SessionActivity} the operator has

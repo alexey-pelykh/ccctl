@@ -194,7 +194,10 @@ export function handleSessionCreate(req: IncomingMessage, res: ServerResponse, s
       return;
     }
     const sessionId = randomUUID();
-    state.sessions.set(sessionId, createSession(sessionId));
+    // The session is marked notifications-degraded at birth from its OBSERVED
+    // permission mode (a non-prompting mode never emits `requires_action`); the
+    // marker is life-long since a running session's mode cannot change.
+    state.sessions.set(sessionId, createSession(sessionId, body.permissionMode));
     // §2→§3 wiring: enqueue the session-dispatch work item (with its minted work-secret)
     // so the worker's next poll delivers it. The account Bearer is NOT carried here — the
     // work-secret's session_ingress_token is the per-session credential, minted locally.

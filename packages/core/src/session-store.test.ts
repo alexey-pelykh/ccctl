@@ -36,15 +36,19 @@ class InMemorySessionStore implements ISessionStore {
   }
 }
 
-/** A representative session registry spanning the lifecycle/activity dimensions. */
+/**
+ * A representative session registry spanning the lifecycle/activity dimensions —
+ * plus a non-prompting (`bypassPermissions`) session, so the round-trip also proves
+ * the life-long `notificationsDegraded` marker survives JSON serialisation (#26).
+ */
 const sessions: readonly Session[] = [
-  { ...createSession("sess-running", T0), status: "ready", activity: { kind: "running" } },
+  { ...createSession("sess-running", "bypassPermissions", T0), status: "ready", activity: { kind: "running" } },
   {
-    ...createSession("sess-blocked", T0 + 5),
+    ...createSession("sess-blocked", "default", T0 + 5),
     status: "busy",
     activity: { kind: "requires_action", detail: "Approve tool use?" },
   },
-  createSession("sess-fresh", T0 + 10),
+  createSession("sess-fresh", "default", T0 + 10),
 ];
 
 /** A representative unread queue, ordered by `at`. */
@@ -104,7 +108,7 @@ describe("ISessionStore (AC: session-registry + unread-queue persistence — loa
     await store.save(snapshotFixture());
     const replacement: SessionStoreSnapshot = {
       version: SESSION_STORE_SNAPSHOT_VERSION,
-      sessions: [createSession("sess-only", T0 + 100)],
+      sessions: [createSession("sess-only", "default", T0 + 100)],
       unread: [],
     };
     await store.save(replacement);

@@ -29,15 +29,19 @@ import {
 // means no test reads a real clock (mirrors packages/core/src/session-store.test.ts).
 const T0 = 1_000_000;
 
-/** A representative session registry spanning the lifecycle/activity dimensions. */
+/**
+ * A representative session registry spanning the lifecycle/activity dimensions —
+ * plus a non-prompting (`bypassPermissions`) session, so the REAL file store's JSON
+ * round-trip exercises the life-long `notificationsDegraded: true` marker (#26).
+ */
 const sessions: readonly Session[] = [
-  { ...createSession("sess-running", T0), status: "ready", activity: { kind: "running" } },
+  { ...createSession("sess-running", "bypassPermissions", T0), status: "ready", activity: { kind: "running" } },
   {
-    ...createSession("sess-blocked", T0 + 5),
+    ...createSession("sess-blocked", "default", T0 + 5),
     status: "busy",
     activity: { kind: "requires_action", detail: "Approve tool use?" },
   },
-  createSession("sess-fresh", T0 + 10),
+  createSession("sess-fresh", "default", T0 + 10),
 ];
 
 /** A representative unread queue, ordered by `at`. */
@@ -116,7 +120,7 @@ describe("createFileSessionStore", () => {
       await store.save(snapshotFixture());
       const replacement: SessionStoreSnapshot = {
         version: SESSION_STORE_SNAPSHOT_VERSION,
-        sessions: [createSession("sess-only", T0 + 100)],
+        sessions: [createSession("sess-only", "default", T0 + 100)],
         unread: [],
       };
       await store.save(replacement);
@@ -217,7 +221,7 @@ describe("createFileSessionStore", () => {
       // The persisted hub state: a session registry entry + an unread marker. The
       // persisted types (`Session`, `UnreadEntry`) carry NO credential field — that
       // omission-by-construction is exactly what this test pins at rest.
-      const served: Session = { ...createSession("sess-served", T0), status: "ready" };
+      const served: Session = { ...createSession("sess-served", "default", T0), status: "ready" };
       const snapshot: SessionStoreSnapshot = {
         version: SESSION_STORE_SNAPSHOT_VERSION,
         sessions: [served],

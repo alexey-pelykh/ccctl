@@ -21,10 +21,11 @@
  *
  * The list is the "list" half of the walking skeleton's multi-session AC ("list + view
  * + steer each"): it surfaces each session's OWN already-modelled state (its id,
- * transport `status`, and derived `activity`) so a client can enumerate the sessions it
- * is carrying and pick one to view / steer. Per-session STATUS-tracking hardening beyond
- * this surface is a sibling item (#21); this handler only projects the state the session
- * model already holds.
+ * transport `status`, derived `activity`, and its life-long `notificationsDegraded`
+ * marker — #26) so a client can enumerate the sessions it is carrying, pick one to view
+ * / steer, and see which ones run non-prompting (their needs-you notifications are
+ * degraded). Per-session STATUS-tracking hardening beyond this surface is a sibling item
+ * (#21); this handler only projects the state the session model already holds.
  *
  * Browser-facing auth is deferred (see `event-stream.ts`) — the loopback ingress is
  * unauthenticated at this slice.
@@ -89,16 +90,29 @@ export interface SessionSummaryWire {
   readonly status: SessionStatus;
   /** The session's derived activity ({@link SessionActivity}) — running / requires_action / idle. */
   readonly activity: SessionActivity;
+  /**
+   * The session's life-long notifications-degraded marker ({@link Session.notificationsDegraded},
+   * #26): `true` for a non-prompting session (it never emits `requires_action`, so its
+   * needs-you notifications are degraded), `false` otherwise. A persistent badge the attach
+   * flow surfaces — the mode cannot change mid-run, so it never clears.
+   */
+  readonly notificationsDegraded: boolean;
 }
 
 /**
  * Project a {@link Session} to its {@link SessionSummaryWire} — the intentional list
- * face (id + status + activity), not the whole internal snapshot (the createdAt /
- * heartbeat timing fields stay server-internal). An explicit wire projection, matching
- * the codebase's explicit-DTO discipline (session-create-wire, bridge-wire).
+ * face (id + status + activity + the notifications-degraded marker), not the whole
+ * internal snapshot (the createdAt / heartbeat timing fields stay server-internal). An
+ * explicit wire projection, matching the codebase's explicit-DTO discipline
+ * (session-create-wire, bridge-wire).
  */
 function sessionSummary(session: Session): SessionSummaryWire {
-  return { id: session.id, status: session.status, activity: session.activity };
+  return {
+    id: session.id,
+    status: session.status,
+    activity: session.activity,
+    notificationsDegraded: session.notificationsDegraded,
+  };
 }
 
 /**
