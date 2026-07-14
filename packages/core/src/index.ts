@@ -1059,3 +1059,123 @@ export type BridgeCredentialJsonProofs = [
   Assert<IsJson<SessionActivity>>,
   Assert<IsJson<Session>>,
 ];
+
+// ---------------------------------------------------------------------------
+// session-store persistence — the runtime-agnostic persistence seam (W3-03)
+//
+// The hub holds its live state in memory: the session registry (every
+// {@link Session} it tracks) and the per-session *unread queue* (activity the
+// operator has not yet seen). Once more than a couple of sessions exist, losing
+// all of that to a daemon restart is a real regression — so the state needs a
+// persistence seam. This section defines the CONTRACT for that seam and nothing
+// else: the JSON-safe on-disk *shape* ({@link SessionStoreSnapshot}) plus the
+// {@link ISessionStore} load/save interface. A concrete backend (a single-file
+// `0600` JSON snapshot at an XDG state path) is deliberately NOT here — it is
+// Node-coupled I/O and ships in `@ccctl/server` (#23); a SQLite backend, should
+// it ever land, is another interface-isolated implementation. `@ccctl/core`
+// stays runtime-agnostic (CORE-C-001): pure types + `Promise`, no `fs`, no
+// `node:*`.
+//
+// **No secrets at rest (HARD, #23/SRV-C-007).** The persisted shape is built
+// only from types that are provably {@link JsonValue}-safe, so the account
+// {@link AccountBearer} — NOT a JSON value (a class with methods, not data) —
+// cannot reach a snapshot by construction: a leak is a `tsc` error, enforced at
+// compile time by {@link SessionStorePersistenceProofs} below, not a reviewer
+// miss. The scoped {@link SessionIngressToken} is a JSON-safe branded string, so
+// the proof does NOT exclude it; it stays out of a snapshot because the persisted
+// types ({@link Session}, {@link UnreadEntry}) carry no such field — the same
+// distinction {@link BridgeCredentialJsonProofs} draws.
+// ---------------------------------------------------------------------------
+
+/**
+ * The schema version stamped into every {@link SessionStoreSnapshot}. A backend
+ * that reads a snapshot whose `version` differs can fail closed (or migrate)
+ * rather than silently mis-read an older shape — the same pin-and-fail-closed
+ * posture the wire contract takes ({@link BRIDGE_PROTOCOL_API_VERSION},
+ * {@link WORK_SECRET_VERSION}). Bumping it is a deliberate, reviewed change.
+ */
+export const SESSION_STORE_SNAPSHOT_VERSION = 1;
+
+/**
+ * A single unread marker: a per-session {@link SessionActivity} the operator has
+ * not yet seen, held in the hub's unread *queue* (ordered by {@link UnreadEntry.at}).
+ * This is the persisted FACE of an unread notification — the minimal signal
+ * needed to re-render "session X needs attention" after a restart — not a full
+ * notification/dismissal model (that behaviour lives above this seam).
+ *
+ * Every field is {@link JsonValue}-safe (proven by {@link SessionStorePersistenceProofs}),
+ * so an entry survives a JSON snapshot round-trip unchanged and can carry no
+ * account credential.
+ */
+export interface UnreadEntry {
+  /** The {@link Session.id} this unread marker belongs to. */
+  readonly sessionId: string;
+  /** Epoch millis when the activity became unread — the queue's ordering key. */
+  readonly at: number;
+  /**
+   * The unseen {@link SessionActivity} (e.g. `requires_action` — the worker is
+   * waiting on the operator). Reuses the derived session activity so the unread
+   * queue and the live registry speak one vocabulary.
+   */
+  readonly activity: SessionActivity;
+}
+
+/**
+ * The complete persisted hub state — everything an {@link ISessionStore} loads
+ * on daemon start and saves on change, as ONE JSON-safe snapshot:
+ *
+ *   - {@link SessionStoreSnapshot.sessions} — the session registry.
+ *   - {@link SessionStoreSnapshot.unread} — the unread queue.
+ *
+ * The whole shape is {@link JsonValue}-safe by construction (proven by
+ * {@link SessionStorePersistenceProofs}): it round-trips through JSON unchanged
+ * and provably carries no account credential.
+ */
+export interface SessionStoreSnapshot {
+  /** Snapshot schema version; see {@link SESSION_STORE_SNAPSHOT_VERSION}. */
+  readonly version: number;
+  /** The session registry — every {@link Session} the hub tracks. */
+  readonly sessions: readonly Session[];
+  /** The unread queue — unseen per-session activity, ordered by {@link UnreadEntry.at}. */
+  readonly unread: readonly UnreadEntry[];
+}
+
+/**
+ * The persistence seam for the hub's state: load the last {@link SessionStoreSnapshot}
+ * on start, save it on change. Runtime-agnostic by design — the interface names
+ * no I/O primitive, so a backend is free to be a single-file JSON snapshot
+ * (`@ccctl/server`, #23), a SQLite database, or an in-memory fake in a test.
+ *
+ * **Round-trip contract.** For any snapshot `s`, `await store.save(s)` followed
+ * by `await store.load()` yields a snapshot deep-equal to `s` — the shape is
+ * JSON-safe, so a serialising backend preserves it exactly. A backend that has
+ * never been saved to returns `null` from {@link ISessionStore.load}: absence is
+ * `null`, never a fabricated empty snapshot, so a caller can tell "fresh daemon"
+ * from "explicitly-saved empty state".
+ *
+ * Both operations are async so a backend may do real I/O; `@ccctl/core` awaits
+ * the contract, never a concrete runtime.
+ */
+export interface ISessionStore {
+  /**
+   * Load the most recently saved snapshot, or `null` if nothing has ever been
+   * saved (a fresh daemon with no prior state).
+   */
+  load(): Promise<SessionStoreSnapshot | null>;
+  /** Persist `snapshot` as the current hub state, replacing any prior snapshot. */
+  save(snapshot: SessionStoreSnapshot): Promise<void>;
+}
+
+/**
+ * Compile-time proof (erased at build) that the entire persisted shape is
+ * {@link JsonValue}-safe — so the account {@link AccountBearer}, which is NOT a
+ * JSON value, cannot reach a snapshot by construction (#23's "no secrets at
+ * rest"), and every snapshot round-trips through JSON unchanged (the
+ * {@link ISessionStore} round-trip contract). The scoped {@link SessionIngressToken}
+ * is a JSON-safe string the proof does NOT exclude; it is absent from a snapshot
+ * because the persisted types carry no such field — the same distinction
+ * {@link BridgeCredentialJsonProofs} draws, which this mirrors. Exported so it has
+ * a referent (and is therefore evaluated, not dropped as unused); if any assertion
+ * breaks, `tsc` fails.
+ */
+export type SessionStorePersistenceProofs = [Assert<IsJson<UnreadEntry>>, Assert<IsJson<SessionStoreSnapshot>>];
