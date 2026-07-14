@@ -84,6 +84,24 @@
         border: 1px solid #f59e0b;
         border-radius: 0.25rem;
       }
+      /* The operator's paired-device list (#85). Each row is one device; the current device
+         is called out in running-green (the page's "this is live / yours" hue) and bold. */
+      #device-list {
+        list-style: none;
+        padding: 0;
+      }
+      #device-list li {
+        padding: 0.25rem 0;
+        border-bottom: 1px solid #eee;
+      }
+      #device-list li[data-current="true"] {
+        font-weight: 700;
+        color: #047857;
+      }
+      /* A failed device list (e.g. before the server wires GET /api/devices): an inline red row. */
+      #device-list li[data-error="true"] {
+        color: #b91c1c;
+      }
       #events {
         list-style: none;
         padding: 0;
@@ -155,6 +173,18 @@
       <div class="steer-actions">
         <button id="approve-button" type="button">Approve</button>
       </div>
+      <!-- The operator's PAIRED DEVICES (#85): a management surface listing each paired device
+           (phone / tablet / laptop) by name + last-seen (AC1), with the current device clearly
+           marked (AC2). Each row is keyed by device id — the entry point a per-device revoke
+           (W6-19, AC3) will hang off. Fetched from `GET /api/devices` on load + manual Refresh;
+           the route and its server-set `current` marker land with the credentialed wave (#84 built
+           the device store; the server-side token verification that computes `current` is deferred).
+           Not `aria-live`: it refreshes only on explicit user action, so — unlike the auto-polled
+           session list — it needn't re-announce the whole list each time. -->
+      <section id="devices">
+        <h2>Devices <button id="refresh-devices" type="button">Refresh</button></h2>
+        <ul id="device-list"></ul>
+      </section>
     </main>
     <!-- Zero-build: plain ES modules, no framework and no bundler. -->
     <script type="module" src="./src/app.js"></script>

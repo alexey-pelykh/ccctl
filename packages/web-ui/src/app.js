@@ -47,6 +47,7 @@ import {
 import { diffSessionList, nextSelection, notificationsDegraded } from "./sessions.js";
 import { connectionHealth } from "./connection.js";
 import { applyPairingToken, authHeader } from "./pairing.js";
+import { DEVICES_PATH, deviceLabel, isCurrentDevice, isRenderableDevice } from "./devices.js";
 
 const connectionEl = document.getElementById("connection");
 const statusEl = document.getElementById("status");
@@ -59,6 +60,8 @@ const promptInputEl = document.getElementById("prompt-input");
 const redirectFormEl = document.getElementById("redirect-form");
 const redirectInputEl = document.getElementById("redirect-input");
 const approveButtonEl = document.getElementById("approve-button");
+const deviceListEl = document.getElementById("device-list");
+const refreshDevicesEl = document.getElementById("refresh-devices");
 
 /** The session currently viewed + steered, or null when none is selected. */
 let currentSessionId = null;
@@ -422,6 +425,70 @@ function scheduleNextPoll() {
   pollTimer = setTimeout(pollSessions, SESSION_POLL_INTERVAL_MS);
 }
 
+/**
+ * Build one device row: a `<li>` keyed by device id — the stable identity a per-device revoke
+ * (W6-19, AC3) will hang off — carrying the device's label (name + last-seen, AC1). The current
+ * device (AC2) is marked with a `data-current` flag (styled distinctly) plus an appended
+ * "· this device" note, so it reads as the current one to sighted and screen-reader users alike.
+ */
+function createDeviceRow(device) {
+  const li = document.createElement("li");
+  li.dataset.deviceId = device.id;
+  li.textContent = deviceLabel(device);
+  if (isCurrentDevice(device)) {
+    li.dataset.current = "true";
+    const note = document.createElement("span");
+    note.dataset.currentNote = "true";
+    note.textContent = " · this device";
+    li.appendChild(note);
+  }
+  return li;
+}
+
+/**
+ * Render the paired-device list (AC1/AC2), or a placeholder when no device is paired. Only
+ * renderable devices (an object with a usable string id — the row key + revoke target, AC3) are
+ * rows; a malformed wire element is dropped rather than allowed to throw (so one bad element
+ * never blanks the whole list) or key a row `data-device-id="undefined"`.
+ */
+function applyDeviceList(devices) {
+  const rows = devices.filter(isRenderableDevice);
+  if (rows.length === 0) {
+    const li = document.createElement("li");
+    li.textContent = "No paired devices.";
+    deviceListEl.replaceChildren(li);
+    return;
+  }
+  deviceListEl.replaceChildren(...rows.map(createDeviceRow));
+}
+
+/**
+ * Fetch the paired-device list and render it. Fetched on load + manual Refresh — devices change
+ * rarely (pair / rename / revoke), so this surface is not auto-polled like the live session list.
+ * A failure surfaces as an inline error row rather than a thrown rejection; until the server wires
+ * `GET /api/devices` (a later credentialed-wave item that also computes the `current` marker), that
+ * error row IS the honest walking-skeleton state — exactly as `pairing.js` applies a token ahead of
+ * server-side enforcement.
+ */
+async function loadDevices() {
+  let payload;
+  try {
+    const response = await fetch(DEVICES_PATH, { headers: authHeader(localStorage) });
+    if (!response.ok) {
+      throw new Error(`list failed (${response.status})`);
+    }
+    payload = await response.json();
+  } catch (error) {
+    const li = document.createElement("li");
+    li.dataset.error = "true";
+    li.textContent = `could not list devices: ${error.message}`;
+    deviceListEl.replaceChildren(li);
+    return;
+  }
+  const devices = Array.isArray(payload?.devices) ? payload.devices : [];
+  applyDeviceList(devices);
+}
+
 // refresh: re-list now and restart the poll clock, so a manual refresh doesn't double-fetch.
 refreshSessionsEl.addEventListener("click", () => {
   if (pollTimer !== null) {
@@ -457,6 +524,11 @@ approveButtonEl.addEventListener("click", () => {
   steer(approveCommand());
 });
 
+// devices: re-list the operator's paired devices on demand (#85).
+refreshDevicesEl.addEventListener("click", () => {
+  loadDevices();
+});
+
 // Apply a scanned QR-pair token (#74) BEFORE the first request: read it from the URL fragment,
 // persist it, and scrub it from the URL so the secret does not linger in the address bar / history.
 // A returning paired device reuses its stored token; every fetch above then carries it as an
@@ -468,3 +540,6 @@ renderConnection();
 
 // List now and keep polling so the picker's per-session status stays live (#25 AC3).
 pollSessions();
+
+// List the operator's paired devices (#85); re-listed on demand via the Devices Refresh button.
+loadDevices();
