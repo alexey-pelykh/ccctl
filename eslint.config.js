@@ -85,6 +85,13 @@ export default tseslint.config(
         // Timers drive the session-list poll that keeps per-session status live (#25).
         setTimeout: "readonly",
         clearTimeout: "readonly",
+        // QR-pair onboarding (#74) reads the token from the URL fragment, persists it, and
+        // scrubs it from the URL: `URLSearchParams` parses the fragment, `location`/`history`
+        // strip it, and `localStorage` keeps the device paired across reloads.
+        URLSearchParams: "readonly",
+        location: "readonly",
+        history: "readonly",
+        localStorage: "readonly",
       },
     },
   },
