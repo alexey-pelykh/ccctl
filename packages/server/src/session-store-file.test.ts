@@ -6,11 +6,15 @@ import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  AccountBearer,
   createSession,
   SESSION_STORE_SNAPSHOT_VERSION,
+  sessionIngressToken,
+  WORK_SECRET_VERSION,
   type Session,
   type SessionStoreSnapshot,
   type UnreadEntry,
+  type WorkSecret,
 } from "@ccctl/core";
 import {
   CCCTL_STATE_DIR,
@@ -171,6 +175,67 @@ describe("createFileSessionStore", () => {
       await createFileSessionStore(filePath).save(snapshotFixture());
       const parsed = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
       expect(Object.keys(parsed).sort()).toEqual(["sessions", "unread", "version"]);
+    });
+
+    // The load-bearing SRV-C-007 at-rest check the core suite already anticipates
+    // ("mirroring the server's `not.toContain(ACCOUNT_BEARER)` at-rest check",
+    // packages/core/src/session-store.test.ts): grep the ACTUAL on-disk bytes for the
+    // LITERAL secret VALUES — the account Bearer AND the session-ingress token — not
+    // merely the credential-shaped FIELD WORDS the sibling test above scans for.
+    //
+    // This is the runtime guard the compile-time `SessionStorePersistenceProofs`
+    // canNOT be. That proof excludes the account `AccountBearer` (it is not a
+    // `JsonValue`, so a leak into a snapshot is a `tsc` error) — but a
+    // `SessionIngressToken` is a JSON-safe branded string the proof does NOT exclude.
+    // So a future JSON-safe `Session`/`UnreadEntry` field carrying an ingress credential
+    // would compile clean; a LITERAL-value at-rest grep — not a field-word scan, and not
+    // the type proof — is the technique that can catch that class of leak. This test pins
+    // the invariant at its source: the persisted projection of a real session carries
+    // NEITHER literal. Both credential classes on the bridge's two-credential boundary are
+    // covered, exactly as the AC requires.
+    it("persists a session served by a live account Bearer + ingress token, yet writes NEITHER literal to disk", async () => {
+      // A distinctive literal per credential class — the genuine values the two
+      // credential holders carry (asserted below), so the on-disk grep targets the
+      // real secret strings, not arbitrary bytes.
+      const ACCOUNT_BEARER = "oauth-account-secret-DO-NOT-PERSIST";
+      const SESSION_INGRESS_TOKEN = "session-ingress-token-DO-NOT-PERSIST";
+
+      // Positive control: each literal goes into the real holder it lives in — the
+      // account OAuth Bearer (§1/§2) and the locally-minted per-session ingress token
+      // (carried in the §3 work-secret, presented on §4/§5) — and the holder is
+      // asserted to retain it. That fixes the grep's targets as genuine, in-process
+      // secret values; it does NOT wire them into the snapshot (the types cannot).
+      const accountBearer = new AccountBearer(ACCOUNT_BEARER);
+      const workSecret: WorkSecret = {
+        version: WORK_SECRET_VERSION,
+        session_ingress_token: sessionIngressToken(SESSION_INGRESS_TOKEN),
+        api_base_url: "http://127.0.0.1:0",
+      };
+      expect(accountBearer.reveal()).toBe(ACCOUNT_BEARER);
+      expect(workSecret.session_ingress_token).toBe(SESSION_INGRESS_TOKEN);
+
+      // The persisted hub state: a session registry entry + an unread marker. The
+      // persisted types (`Session`, `UnreadEntry`) carry NO credential field — that
+      // omission-by-construction is exactly what this test pins at rest.
+      const served: Session = { ...createSession("sess-served", T0), status: "ready" };
+      const snapshot: SessionStoreSnapshot = {
+        version: SESSION_STORE_SNAPSHOT_VERSION,
+        sessions: [served],
+        unread: [{ sessionId: served.id, at: T0 + 1, activity: { kind: "idle" } }],
+      };
+
+      const store = createFileSessionStore(filePath);
+      await store.save(snapshot);
+
+      // Degenerate-subject guard: prove the file actually holds the session, so "zero
+      // occurrences" is a real absence — not a vacuous grep over an empty file.
+      expect(await store.load()).toEqual(snapshot);
+
+      // The AC grep: the LITERAL account Bearer and the LITERAL session-ingress token
+      // each appear ZERO times in the on-disk snapshot.
+      const onDisk = await readFile(filePath, "utf8");
+      expect(onDisk).not.toContain(ACCOUNT_BEARER);
+      expect(onDisk).not.toContain(SESSION_INGRESS_TOKEN);
     });
   });
 
