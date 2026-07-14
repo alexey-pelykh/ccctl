@@ -347,7 +347,7 @@ describe("worker_status frames + PUT status gate (§4/§5 per-session status)", 
   });
 
   it("applyWorkerStatus folds a PUT status into a NEW session (idle = ready for a turn), never mutating the input", () => {
-    const session = createSession("sess-1", 1_000);
+    const session = createSession("sess-1", "default", 1_000);
     const running = applyWorkerStatus(session, "running", undefined, 2_000);
     expect(running).not.toBe(session);
     expect(session.activity).toEqual({ kind: "idle" }); // input untouched

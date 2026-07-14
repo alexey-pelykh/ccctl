@@ -7,9 +7,12 @@ import {
   createSession,
   DEFAULT_HEARTBEAT_STALE_AFTER_MS,
   DEFAULT_REQUIRES_ACTION_DETAIL,
+  isNonPromptingPermissionMode,
   isSessionStale,
   markSessionClosed,
   markSessionReady,
+  NON_PROMPTING_PERMISSION_MODES,
+  PERMISSION_MODES,
   recordHeartbeat,
   sessionActivityFromFrame,
   sessionLiveness,
@@ -70,15 +73,16 @@ describe("sessionActivityFromFrame (AC: tri-state derivation)", () => {
 
 describe("session identity (AC: identity is the register-response session id)", () => {
   it("createSession keys the session on the given id", () => {
-    expect(createSession("sess-1", T0).id).toBe("sess-1");
+    expect(createSession("sess-1", "default", T0).id).toBe("sess-1");
   });
 
-  it("a fresh session starts idle with the heartbeat clock at `now`", () => {
-    const session = createSession("sess-1", T0);
+  it("a fresh session starts idle with the heartbeat clock at `now` (prompting mode ⇒ notifications not degraded)", () => {
+    const session = createSession("sess-1", "default", T0);
     expect(session).toEqual({
       id: "sess-1",
       status: "connecting",
       activity: { kind: "idle" },
+      notificationsDegraded: false,
       createdAt: T0,
       lastActivityAt: T0,
       lastHeartbeatAt: T0,
@@ -90,14 +94,14 @@ describe("session identity (AC: identity is the register-response session id)", 
       sessionId: "sess-from-create",
       wsUrl: "wss://127.0.0.1:8787/v1/sessions/sess-from-create/ws",
     };
-    const session = createSession(response.sessionId, T0);
+    const session = createSession(response.sessionId, "default", T0);
     expect(session.id).toBe("sess-from-create");
     expect(session.createdAt).toBe(T0);
   });
 });
 
 describe("liveness / staleness (AC: missed-heartbeat window marks the session stale)", () => {
-  const session = createSession("sess-1", T0);
+  const session = createSession("sess-1", "default", T0);
 
   it("is live while the heartbeat is fresh", () => {
     expect(isSessionStale(session, T0)).toBe(false);
@@ -131,7 +135,7 @@ describe("liveness / staleness (AC: missed-heartbeat window marks the session st
 
 describe("explicit transitions (AC: per-session, one transition never mutates another)", () => {
   it("applyWorkerStatusFrame returns a NEW session with the derived activity and advanced lastActivityAt", () => {
-    const before = createSession("sess-1", T0);
+    const before = createSession("sess-1", "default", T0);
     const after = applyWorkerStatusFrame(before, statusFrame({ status: "running" }), T0 + 10);
     expect(after).not.toBe(before);
     expect(after.activity).toEqual({ kind: "running" });
@@ -142,14 +146,14 @@ describe("explicit transitions (AC: per-session, one transition never mutates an
   });
 
   it("applyWorkerStatusFrame is a no-op (same reference) on a non-`worker_status` frame", () => {
-    const before = createSession("sess-1", T0);
+    const before = createSession("sess-1", "default", T0);
     const other: ControlFrame = { type: "control_event", subtype: "message", payload: {} };
     expect(applyWorkerStatusFrame(before, other, T0 + 10)).toBe(before);
   });
 
   it("a transition on one session never mutates another session", () => {
-    const a = createSession("sess-a", T0);
-    const b = createSession("sess-b", T0);
+    const a = createSession("sess-a", "default", T0);
+    const b = createSession("sess-b", "default", T0);
     const bSnapshot = structuredClone(b);
 
     applyWorkerStatusFrame(a, statusFrame({ status: "requires_action", detail: "Approve?" }), T0 + 1);
@@ -160,7 +164,7 @@ describe("explicit transitions (AC: per-session, one transition never mutates an
   });
 
   it("transitions compose independently across the three orthogonal dimensions", () => {
-    const s0 = createSession("sess-1", T0);
+    const s0 = createSession("sess-1", "default", T0);
     const s1 = applyWorkerStatusFrame(s0, statusFrame({ status: "running" }), T0 + 10);
     const s2 = recordHeartbeat(s1, T0 + 20);
     // Activity from the frame, liveness from the heartbeat, lifecycle untouched.
@@ -172,7 +176,7 @@ describe("explicit transitions (AC: per-session, one transition never mutates an
   });
 
   it("markSessionReady advances a fresh `connecting` session to `ready`, purely and status-only", () => {
-    const before = createSession("sess-1", T0);
+    const before = createSession("sess-1", "default", T0);
     const after = markSessionReady(before);
     expect(after).not.toBe(before);
     expect(after.status).toBe("ready");
@@ -184,11 +188,11 @@ describe("explicit transitions (AC: per-session, one transition never mutates an
 
   it("markSessionReady is a no-op (same reference) on any non-`connecting` status", () => {
     // Already `ready` (e.g. a downstream re-attach) → returned unchanged, never re-clobbered.
-    const ready = markSessionReady(createSession("sess-1", T0));
+    const ready = markSessionReady(createSession("sess-1", "default", T0));
     expect(markSessionReady(ready)).toBe(ready);
     // The forward-only guard also protects a future busy / closed / errored from being reset to ready.
     for (const status of ["busy", "closed", "errored"] as const) {
-      const session = { ...createSession("sess-1", T0), status };
+      const session = { ...createSession("sess-1", "default", T0), status };
       expect(markSessionReady(session)).toBe(session);
     }
   });
@@ -196,7 +200,7 @@ describe("explicit transitions (AC: per-session, one transition never mutates an
   it("markSessionClosed drives any LIVE status to the terminal `closed`, purely and status-only", () => {
     // The reverse leg of markSessionReady (#173): a live session torn down → `closed`.
     for (const status of ["connecting", "ready", "busy"] as const) {
-      const before = { ...createSession("sess-1", T0), status };
+      const before = { ...createSession("sess-1", "default", T0), status };
       const after = markSessionClosed(before);
       expect(after).not.toBe(before);
       expect(after.status).toBe("closed");
@@ -211,8 +215,73 @@ describe("explicit transitions (AC: per-session, one transition never mutates an
     // A terminal state never moves: re-closing is a no-op and a distinct `errored` is never
     // clobbered to `closed`.
     for (const status of ["closed", "errored"] as const) {
-      const session = { ...createSession("sess-1", T0), status };
+      const session = { ...createSession("sess-1", "default", T0), status };
       expect(markSessionClosed(session)).toBe(session);
     }
+  });
+});
+
+describe("isNonPromptingPermissionMode (AC: non-prompting modes → notifications degraded)", () => {
+  it("classifies acceptEdits and bypassPermissions as non-prompting (they auto-proceed)", () => {
+    expect(isNonPromptingPermissionMode("acceptEdits")).toBe(true);
+    expect(isNonPromptingPermissionMode("bypassPermissions")).toBe(true);
+  });
+
+  it("classifies default and plan as prompting (default prompts per decision; plan blocks on plan approval)", () => {
+    expect(isNonPromptingPermissionMode("default")).toBe(false);
+    expect(isNonPromptingPermissionMode("plan")).toBe(false);
+  });
+
+  it("the non-prompting and prompting sets PARTITION every pinned permission mode", () => {
+    // Every pinned mode is classified exactly once. A mode added to PERMISSION_MODES without
+    // being triaged (prompting vs non-prompting) breaks this — catching classification drift.
+    const nonPrompting = PERMISSION_MODES.filter((m) => isNonPromptingPermissionMode(m));
+    const prompting = PERMISSION_MODES.filter((m) => !isNonPromptingPermissionMode(m));
+    expect([...nonPrompting].sort()).toEqual([...NON_PROMPTING_PERMISSION_MODES].sort());
+    expect(prompting).toEqual(["default", "plan"]);
+    expect(nonPrompting.length + prompting.length).toBe(PERMISSION_MODES.length);
+  });
+});
+
+describe("createSession notifications-degraded marker (AC: set at attach from the observed mode, life-long)", () => {
+  it("marks a session created under a non-prompting mode notifications-degraded", () => {
+    for (const mode of ["acceptEdits", "bypassPermissions"] as const) {
+      expect(createSession("sess-np", mode, T0).notificationsDegraded).toBe(true);
+    }
+  });
+
+  it("leaves a session created under a prompting mode NOT degraded — it carries no marker", () => {
+    for (const mode of ["default", "plan"] as const) {
+      expect(createSession("sess-p", mode, T0).notificationsDegraded).toBe(false);
+    }
+  });
+
+  it("derives the marker for EVERY pinned mode from isNonPromptingPermissionMode", () => {
+    for (const mode of PERMISSION_MODES) {
+      expect(createSession("sess-x", mode, T0).notificationsDegraded).toBe(isNonPromptingPermissionMode(mode));
+    }
+  });
+
+  it("keeps the marker life-long: no transition clears a degraded session's marker", () => {
+    // A non-prompting session marked at birth stays degraded through EVERY transition —
+    // activity, heartbeat, ready, close — since a running session's mode cannot change and
+    // each transition spreads the session forward unchanged on this axis.
+    const born = createSession("sess-np", "bypassPermissions", T0);
+    expect(born.notificationsDegraded).toBe(true);
+    const running = applyWorkerStatusFrame(born, statusFrame({ status: "running" }), T0 + 1);
+    const beaten = recordHeartbeat(running, T0 + 2);
+    const ready = markSessionReady(beaten);
+    const closed = markSessionClosed(ready);
+    for (const s of [running, beaten, ready, closed]) {
+      expect(s.notificationsDegraded).toBe(true);
+    }
+  });
+
+  it("keeps a prompting session UNmarked through every transition", () => {
+    const born = createSession("sess-p", "default", T0);
+    const acted = applyWorkerStatusFrame(born, statusFrame({ status: "requires_action" }), T0 + 1);
+    const ready = markSessionReady(acted);
+    expect(born.notificationsDegraded).toBe(false);
+    expect(ready.notificationsDegraded).toBe(false);
   });
 });

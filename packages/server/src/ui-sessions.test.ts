@@ -27,15 +27,15 @@ function base(server: CcctlServer): string {
   return `http://${host}:${port}`;
 }
 
-/** Create a §2 session and return its id. */
-async function createSession(server: CcctlServer): Promise<string> {
+/** Create a §2 session under `permissionMode` (default: `default`) and return its id. */
+async function createSession(server: CcctlServer, permissionMode = "default"): Promise<string> {
   const res = await fetch(`${base(server)}${SESSIONS_PATH}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${ACCOUNT_BEARER}` },
     body: JSON.stringify({
       session_context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
       source: "ui",
-      permission_mode: "default",
+      permission_mode: permissionMode,
     }),
   });
   return ((await res.json()) as { session_id: string }).session_id;
@@ -45,6 +45,7 @@ interface SessionSummary {
   readonly id: string;
   readonly status: string;
   readonly activity: SessionActivity;
+  readonly notificationsDegraded: boolean;
 }
 
 async function listSessions(server: CcctlServer): Promise<SessionSummary[]> {
@@ -87,10 +88,12 @@ describe("GET /api/sessions — session list (#20)", () => {
 
     const sessions = await listSessions(server);
     expect(sessions.map((s) => s.id)).toEqual([first, second]);
-    // A freshly-created session is `connecting` transport-wise and `idle` activity-wise.
+    // A freshly-created session is `connecting` transport-wise and `idle` activity-wise, and
+    // — created under `default` (a prompting mode) — carries no notifications-degraded marker.
     for (const summary of sessions) {
       expect(summary.status).toBe("connecting");
       expect(summary.activity).toEqual({ kind: "idle" });
+      expect(summary.notificationsDegraded).toBe(false);
     }
   });
 
@@ -118,6 +121,49 @@ describe("GET /api/sessions — session list (#20)", () => {
     expect(busySummary?.activity).toEqual({ kind: "running" });
     // The untouched session keeps its own idle activity — status is never confused across sessions.
     expect(quietSummary?.activity).toEqual({ kind: "idle" });
+  });
+
+  it("attaches (lists) a non-prompting session and carries the persistent degraded-notification marker (#26)", async () => {
+    const server = await startTestServer();
+    // A non-prompting session never emits `requires_action`, so its needs-you notifications
+    // are degraded — but it attaches anyway (it is not refused) and carries the marker.
+    for (const mode of ["acceptEdits", "bypassPermissions"] as const) {
+      const id = await createSession(server, mode);
+      const summary = (await listSessions(server)).find((s) => s.id === id);
+      expect(summary).toBeDefined(); // the attach on-ramp lists it — not refused
+      expect(summary?.notificationsDegraded).toBe(true);
+    }
+  });
+
+  it("attaches a prompting session with NO degraded marker (#26)", async () => {
+    const server = await startTestServer();
+    for (const mode of ["default", "plan"] as const) {
+      const id = await createSession(server, mode);
+      const summary = (await listSessions(server)).find((s) => s.id === id);
+      expect(summary?.notificationsDegraded).toBe(false);
+    }
+  });
+
+  it("keeps the degraded marker persistent as the session runs on — a status update never clears it (#26)", async () => {
+    const server = await startTestServer();
+    const id = await createSession(server, "bypassPermissions");
+    // Drive the worker forward (register + a `running` status) to simulate a long-lived run;
+    // the marker is set once at attach and no mid-run path clears it.
+    await fetch(`${base(server)}${workerRegisterPath(id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const putStatus = await fetch(`${base(server)}${workerChannelPath(id)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_status: "running", worker_epoch: 1 }),
+    });
+    expect(putStatus.status).toBe(200);
+
+    const summary = (await listSessions(server)).find((s) => s.id === id);
+    expect(summary?.notificationsDegraded).toBe(true);
+    expect(summary?.activity).toEqual({ kind: "running" });
   });
 
   it("rejects an unsupported method on /api/sessions (405)", async () => {
