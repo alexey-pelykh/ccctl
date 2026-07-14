@@ -41,14 +41,22 @@
 
 import { Command } from "commander";
 import {
+  buildPairingUrl,
   formatAuthority,
   isPermissionMode,
+  loggablePairingUrl,
   PERMISSION_MODES,
   type HostEndpoint,
   type PermissionMode,
   type SessionActivity,
 } from "@ccctl/core";
-import { DEFAULT_HOST, requireLocalServerAuth, resolveBindHost, type SessionLaunchOptions } from "@ccctl/server";
+import {
+  DEFAULT_HOST,
+  mintDeviceToken,
+  requireLocalServerAuth,
+  resolveBindHost,
+  type SessionLaunchOptions,
+} from "@ccctl/server";
 import type { TunnelKind } from "@ccctl/tunnel-adapters";
 import { defaultDependencies, type CliDependencies } from "./dependencies.js";
 import type { SteerCommand } from "./session-client.js";
@@ -85,17 +93,31 @@ function serverUrl(host: string, port: number): string {
 }
 
 /**
- * Establish `local` through the chosen tunnel and report the public host the patched
- * worker's `--sdk-url` allowlist must then permit — the single place that renders the
- * "reachable via" line, shared by `serve --tunnel` and the standalone `tunnel` verb.
+ * Establish `local` through the chosen tunnel and report it to the operator: first the
+ * "reachable via" line the patched worker's `--sdk-url` allowlist needs, then the QR-pair
+ * onboarding block (#74) — mint a per-device token, encode the tunnel origin + token into a
+ * scannable QR, and print a REDACTED pairing-URL hint. The token leaves ONLY on the QR
+ * (scanned by the phone) and over the operator's own tunnel; the printed hint is redacted, so
+ * the raw token is never logged in plaintext. The single place that reports a freshly-exposed
+ * tunnel, shared by `serve --tunnel` and the standalone `tunnel` verb — both make the loopback
+ * server reachable off-box, so both are device-onboarding moments.
  */
-async function establishAndReport(
-  adapters: CliDependencies["adapters"],
-  kind: TunnelKind,
-  local: HostEndpoint,
-): Promise<void> {
-  const established = await adapters[kind]().establish(local);
+async function establishAndReport(deps: CliDependencies, kind: TunnelKind, local: HostEndpoint): Promise<void> {
+  const established = await deps.adapters[kind]().establish(local);
   console.log(`ccctl: reachable via ${established.kind} at ${established.publicHost}`);
+
+  // Mint a fresh per-device token and print it as a QR the phone scans to open the UI already
+  // authenticated (no copy/paste). `publicHost` is the tunnel's reachable host — a bare host on
+  // 443 — so the pairing URL carries no port; the token rides the URL fragment, so it is applied
+  // client-side and never reaches the server in the request line. Durable persistence of the
+  // minted token is #84; server-side verification is a later credentialed-wave item.
+  const token = mintDeviceToken();
+  const pairingUrl = buildPairingUrl({ host: established.publicHost, token });
+  console.log("ccctl: scan to pair a device (opens the UI already authenticated):");
+  console.log(deps.renderQr(pairingUrl));
+  // Print the URL redacted — the QR is the token's only intended exit surface, so the plaintext
+  // token never lands in the terminal scrollback or a captured log.
+  console.log(`ccctl: pairing URL — ${loggablePairingUrl(pairingUrl)}`);
 }
 
 /**
@@ -257,7 +279,7 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
         // listening socket would otherwise keep the process alive with the exit code set but never
         // applied. `--tunnel` is atomic: both come up, or it fails clean.
         try {
-          await establishAndReport(deps.adapters, kind, server.address);
+          await establishAndReport(deps, kind, server.address);
         } catch (error) {
           await server.close();
           throw error;
@@ -279,7 +301,7 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       const host = resolveBindHost(options.host);
       const port = parsePort(options.port);
 
-      await establishAndReport(deps.adapters, kind, { host, port });
+      await establishAndReport(deps, kind, { host, port });
     });
 
   // --- launch: drive a UC2 "New session" launch on a running daemon -----------------

@@ -16,6 +16,7 @@
  */
 
 import { spawn } from "node:child_process";
+import qrcodeTerminal from "qrcode-terminal";
 import {
   createFallbackSessionLauncher,
   createTmuxSessionLauncher,
@@ -58,6 +59,13 @@ export interface CliDependencies {
    * so `serve` is exercised without a real tmux or a spawned worker, the same as the seams above.
    */
   readonly launcher: ISessionLauncher;
+  /**
+   * Render a scannable terminal QR of `text` — the QR-pair onboarding block `serve` / `tunnel`
+   * print after a tunnel is up (#74) — {@link defaultRenderQr} (a zero-dependency `qrcode-terminal`)
+   * in production. Behind a seam so those verbs are exercised with a fake that just captures the
+   * encoded payload (no real QR drawn), the same determinism discipline as the seams above.
+   */
+  readonly renderQr: (text: string) => string;
 }
 
 /**
@@ -99,12 +107,29 @@ export function defaultRunPatcher(args: readonly string[]): Promise<void> {
   });
 }
 
-/** The production seams: the real daemon, the real tunnel adapters, the real patcher delegation, the real session client, and the real session launcher. */
+/**
+ * The default `renderQr`: a compact, scannable terminal QR via the zero-dependency
+ * `qrcode-terminal` (#74). `small` packs the code with unicode half-blocks — half the height
+ * and no ANSI color — so it fits an 80-column terminal without wrapping (a wrapped QR is
+ * unscannable) and survives being piped to a log. The library invokes the callback
+ * synchronously, so the rendered string is captured and returned rather than printed here —
+ * the `serve` / `tunnel` verbs own the surrounding onboarding lines.
+ */
+export function defaultRenderQr(text: string): string {
+  let rendered = "";
+  qrcodeTerminal.generate(text, { small: true }, (qrcode) => {
+    rendered = qrcode;
+  });
+  return rendered;
+}
+
+/** The production seams: the real daemon, the real tunnel adapters, the real patcher delegation, the real session client, the real session launcher, and the real terminal-QR renderer. */
 export const defaultDependencies: CliDependencies = {
   startServer,
   adapters: ADAPTERS,
   runPatcher: defaultRunPatcher,
   sessionClient: defaultSessionClient,
+  renderQr: defaultRenderQr,
   // Compose the tmux backend (#29) behind the fallback launcher composite (#31) — the documented
   // composition-root shape, forward-compatible with the owned-pty fallback (#30) when it lands —
   // driving the production `remote-control` worker-argv builder (#157) on the CONFIGURED binary

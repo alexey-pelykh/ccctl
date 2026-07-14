@@ -170,6 +170,14 @@ export {
   XDG_STATE_HOME_ENV,
 } from "./session-store-file.js";
 
+// Re-export per-device token minting (#74 QR-pair onboarding) on the public surface — the
+// daemon (@ccctl/cli's `serve`) mints a token to encode into the pairing QR. The pure
+// encode/redact contract (DeviceToken, buildPairingUrl, loggablePairingUrl) is @ccctl/core's;
+// this is the one runtime-coupled piece, the CSPRNG mint. Ships runtime (the factory), so a
+// value export alongside its byte-count constant and injectable randomness seam. Defined and
+// unit-tested in device-pairing.ts.
+export { DEVICE_TOKEN_BYTES, mintDeviceToken, type RandomBytesSource } from "./device-pairing.js";
+
 /** Configuration for a ccctl server instance. */
 export interface ServerConfig {
   /** Loopback port the local HTTP server binds to. `0` selects an ephemeral port. */

@@ -41,6 +41,7 @@ import {
   describeCommand,
 } from "./command.js";
 import { diffSessionList, nextSelection, notificationsDegraded } from "./sessions.js";
+import { applyPairingToken, authHeader } from "./pairing.js";
 
 const statusEl = document.getElementById("status");
 const activityEl = document.getElementById("activity");
@@ -249,7 +250,7 @@ function markSelected() {
 async function loadSessions() {
   let payload;
   try {
-    const response = await fetch(SESSIONS_PATH);
+    const response = await fetch(SESSIONS_PATH, { headers: authHeader(localStorage) });
     if (!response.ok) {
       throw new Error(`list failed (${response.status})`);
     }
@@ -284,6 +285,10 @@ function disconnect() {
 /** Subscribe to a session's downstream control-event stream. */
 function connect(sessionId) {
   statusEl.textContent = "connecting…";
+  // The downstream is an EventSource, which cannot carry an Authorization header; applying the
+  // paired token to the SSE stream (a query token would land in the server log, so not that)
+  // is deferred to the later credentialed-wave item that also adds server-side enforcement (#74
+  // applies the token to the fetch legs above; ingress is unauthenticated at this slice).
   source = new EventSource(sessionEventsPath(sessionId));
 
   source.addEventListener("open", () => {
@@ -329,7 +334,7 @@ async function sendSteer(command) {
   }
   const response = await fetch(sessionCommandPath(currentSessionId), {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...authHeader(localStorage) },
     body: JSON.stringify(command),
   });
   if (!response.ok) {
@@ -406,6 +411,12 @@ redirectFormEl.addEventListener("submit", (event) => {
 approveButtonEl.addEventListener("click", () => {
   steer(approveCommand());
 });
+
+// Apply a scanned QR-pair token (#74) BEFORE the first request: read it from the URL fragment,
+// persist it, and scrub it from the URL so the secret does not linger in the address bar / history.
+// A returning paired device reuses its stored token; every fetch above then carries it as an
+// Authorization: Bearer header.
+applyPairingToken({ location, history, storage: localStorage });
 
 // List now and keep polling so the picker's per-session status stays live (#25 AC3).
 pollSessions();

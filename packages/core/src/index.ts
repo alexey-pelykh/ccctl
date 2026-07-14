@@ -243,6 +243,94 @@ export function formatAuthority(host: string, port: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// device pairing (QR onboarding, #74)
+//
+// Onboard a phone/tablet/laptop by scanning a terminal QR: the server mints a
+// per-device token (`mintDeviceToken`, @ccctl/server), encodes it — together with
+// the tunnel origin — into a pairing URL, and prints that URL as a QR. The scanned
+// URL carries the token in its FRAGMENT, so it is applied client-side with no
+// copy/paste and never reaches the server in the request line. Minting only + the
+// pure encode/redact contract live in this slice; durable, hashed, named persistence
+// of the minted tokens is #84 (W3-10), and server-side verification of a presented
+// token is a later credentialed-wave item — neither is introduced here.
+// ---------------------------------------------------------------------------
+
+/** Nominal brand for {@link DeviceToken}. */
+declare const deviceTokenBrand: unique symbol;
+
+/**
+ * A per-device access token minted for QR-pair onboarding (#74) — the credential a
+ * paired device presents to reach the tunnel-exposed UI, distinct per device and minted
+ * server-side (@ccctl/server's `mintDeviceToken`). Branded so it cannot be confused with
+ * an arbitrary string or another token family ({@link SessionIngressToken} /
+ * {@link AccountBearer}), a compile-time distinctness — yet still a `string` because it
+ * legitimately travels to the device inside the pairing QR / URL fragment.
+ */
+export type DeviceToken = string & {
+  readonly [deviceTokenBrand]: never;
+};
+
+/**
+ * Tag a raw string as a {@link DeviceToken}, failing closed on a blank one — an empty or
+ * whitespace-only token is trivially not a secret, the same "blank is not configured"
+ * treatment the local-server-auth guard applies. The single place a raw string becomes a
+ * DeviceToken, so every DeviceToken in the system is non-blank by construction.
+ */
+export function deviceToken(value: string): DeviceToken {
+  if (value.trim() === "") {
+    throw new Error("ccctl: a device token must be a non-empty string");
+  }
+  return value as DeviceToken;
+}
+
+/**
+ * The URL-fragment parameter the pairing URL carries the {@link DeviceToken} in. A
+ * FRAGMENT (`#…`), deliberately never a query (`?…`): the browser strips a fragment before
+ * sending the request, so the token never rides the HTTP request line and therefore never
+ * lands in the server's access log — the "never logged in plaintext" guarantee (#74). The
+ * web UI reads it from `location.hash` on load (its own `pairing.js` pins the same literal).
+ */
+export const PAIRING_TOKEN_PARAM = "ccctl_token";
+
+/** The placeholder {@link loggablePairingUrl} substitutes for the token when projecting a pairing URL to a loggable form. */
+export const PAIRING_TOKEN_REDACTED = "REDACTED";
+
+/**
+ * Build the QR-pair onboarding URL a device scans: the tunnel-exposed origin with the
+ * {@link DeviceToken} in the URL fragment ({@link PAIRING_TOKEN_PARAM}). `host` (+ optional
+ * `port`) is the TUNNEL's reachable endpoint — never loopback, since the token is only ever
+ * carried over the operator's own tunnel (#74) — and an IPv6 host is bracketed the one
+ * canonical way ({@link formatAuthority}). The token rides the fragment so it is applied
+ * client-side without a manual copy and never reaches the server in the request line;
+ * `encodeURIComponent` keeps a URL-reserved character in the token from breaking the URL.
+ * `scheme` defaults to `https` (a tunnel exposes TLS).
+ */
+export function buildPairingUrl(params: {
+  readonly host: string;
+  readonly port?: number;
+  readonly token: DeviceToken;
+  readonly scheme?: string;
+}): string {
+  const { host, port, token, scheme = "https" } = params;
+  // With a port, delegate to the canonical authority formatter; without one, apply the same
+  // IPv6-bracketing rule sans `:port` (a tunnel host is typically a MagicDNS name reached on 443).
+  const authority = port === undefined ? (host.includes(":") ? `[${host}]` : host) : formatAuthority(host, port);
+  return `${scheme}://${authority}/#${PAIRING_TOKEN_PARAM}=${encodeURIComponent(token)}`;
+}
+
+/**
+ * Project a pairing URL to a loggable form: the fragment's token value is replaced with
+ * {@link PAIRING_TOKEN_REDACTED}, everything else preserved — so an operator log or error that
+ * echoes "the pairing URL" carries the origin and the parameter name but never the raw token
+ * (#74). The QR is the only surface the token is meant to leave on; a URL with no pairing
+ * fragment is returned unchanged. Matches the {@link loggableSessionCreateRequest} family: the
+ * one projection from a secret-bearing value to a safe-to-log one.
+ */
+export function loggablePairingUrl(url: string): string {
+  return url.replace(new RegExp(`(#${PAIRING_TOKEN_PARAM}=)[^&]*`), `$1${PAIRING_TOKEN_REDACTED}`);
+}
+
+// ---------------------------------------------------------------------------
 // session / state model
 // ---------------------------------------------------------------------------
 

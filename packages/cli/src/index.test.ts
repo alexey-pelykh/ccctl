@@ -60,6 +60,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
   list: ReturnType<typeof vi.fn>;
   steer: ReturnType<typeof vi.fn>;
   launcher: ISessionLauncher;
+  renderQr: ReturnType<typeof vi.fn>;
 } {
   // A fake bind: echo the requested host, and resolve `--port 0` to a concrete ephemeral
   // port so a test can prove `server.address` (not the requested port) is what's reported.
@@ -109,8 +110,12 @@ function makeDeps(options: FakeDepsOptions = {}): {
       } satisfies LaunchedSession),
     ),
   };
+  // The terminal-QR renderer the onboarding block calls. A fake that echoes its input inside a
+  // marker, so an assertion can prove both WHAT was encoded (the pairing URL passed in) and that
+  // the rendered block reached the terminal — without drawing a real QR.
+  const renderQr = vi.fn((text: string) => `<<QR:${text}>>`);
   return {
-    deps: { startServer, adapters, runPatcher, sessionClient, launcher },
+    deps: { startServer, adapters, runPatcher, sessionClient, launcher, renderQr },
     startServer,
     establish,
     runPatcher,
@@ -119,6 +124,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
     list,
     steer,
     launcher,
+    renderQr,
   };
 }
 
@@ -289,6 +295,66 @@ describe("ccctl serve --tunnel — composes daemon + tunnel (AC4)", () => {
     const { deps, close } = makeDeps();
     await buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
     expect(close).not.toHaveBeenCalled();
+  });
+});
+
+describe("QR-pair onboarding — mint a per-device token + print a terminal QR (#74)", () => {
+  /** The one pairing URL the onboarding block passed to `renderQr` (asserts exactly one QR was drawn). */
+  function encodedPairingUrl(renderQr: ReturnType<typeof vi.fn>): string {
+    expect(renderQr).toHaveBeenCalledTimes(1);
+    return String(renderQr.mock.calls[0][0]);
+  }
+
+  it("serve --tunnel: renders a QR of the tunnel origin with a minted token in the URL fragment (AC1)", async () => {
+    process.env[LOCAL_SERVER_AUTH_ENV] = "test-secret";
+    const { deps, renderQr } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
+    const url = encodedPairingUrl(renderQr);
+    // The QR encodes the tunnel's public origin with the token in the FRAGMENT — never a query.
+    expect(url).toMatch(/^https:\/\/oracle-node\.tailnet\.ts\.net\/#ccctl_token=[A-Za-z0-9_-]+$/);
+    expect(url).not.toContain("?");
+    // The rendered QR block reaches the terminal (the fake echoes its input inside the marker).
+    expect(loggedText()).toContain(`<<QR:${url}>>`);
+    expect(loggedText()).toContain("scan to pair a device");
+  });
+
+  it("serve --tunnel: prints the pairing URL REDACTED — the raw token is never logged in plaintext (AC4)", async () => {
+    process.env[LOCAL_SERVER_AUTH_ENV] = "test-secret";
+    const { deps, renderQr } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
+    const token = encodedPairingUrl(renderQr).split("ccctl_token=")[1];
+    // The human-readable hint names the URL with the token redacted…
+    expect(loggedText()).toContain("pairing URL — https://oracle-node.tailnet.ts.net/#ccctl_token=REDACTED");
+    // …and the raw secret appears ONLY inside the QR payload (a scannable image in production),
+    // never on a plaintext log line.
+    const plaintextLines = logSpy.mock.calls.map((call) => String(call[0])).filter((line) => !line.startsWith("<<QR:"));
+    expect(plaintextLines.some((line) => line.includes(token))).toBe(false);
+  });
+
+  it("serve WITHOUT a tunnel: prints no pairing QR — the token only ever travels over the tunnel (AC4)", async () => {
+    process.env[LOCAL_SERVER_AUTH_ENV] = "test-secret";
+    const { deps, renderQr } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve"], { from: "user" });
+    expect(renderQr).not.toHaveBeenCalled();
+    expect(loggedText()).not.toContain("scan to pair");
+  });
+
+  it("tunnel: exposing an already-running server is also an onboarding moment — it prints a pairing QR", async () => {
+    const { deps, renderQr } = makeDeps();
+    await buildProgram(deps).parseAsync(["tunnel", "tailscale"], { from: "user" });
+    expect(encodedPairingUrl(renderQr)).toMatch(
+      /^https:\/\/oracle-node\.tailnet\.ts\.net\/#ccctl_token=[A-Za-z0-9_-]+$/,
+    );
+  });
+
+  it("mints a DISTINCT token per invocation — distinct per device (AC3)", async () => {
+    const first = makeDeps();
+    const second = makeDeps();
+    await buildProgram(first.deps).parseAsync(["tunnel", "tailscale"], { from: "user" });
+    await buildProgram(second.deps).parseAsync(["tunnel", "tailscale"], { from: "user" });
+    const tokenOf = (renderQr: ReturnType<typeof vi.fn>): string =>
+      String(renderQr.mock.calls[0][0]).split("ccctl_token=")[1];
+    expect(tokenOf(first.renderQr)).not.toBe(tokenOf(second.renderQr));
   });
 });
 
