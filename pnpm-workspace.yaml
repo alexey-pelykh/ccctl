@@ -7,3 +7,11 @@ autoInstallPeers: true
 linkWorkspacePackages: true
 allowBuilds:
   esbuild: true
+  # node-pty (#30, the owned-pty launcher fallback) is a native module. Its build is NOT
+  # allowed here: node-pty ships prebuilt binaries for darwin + win32 (loaded with no compile),
+  # so those platforms work out of the box, and CI + typecheck need only its shipped `.d.ts`
+  # (the backend's unit tests drive an injected fake spawner and never load the native binding).
+  # It ships NO Linux prebuild, so a Linux operator who actually needs the pty fallback must
+  # flip this to `true` (compiling node-pty from source) — the daemon-wiring item that deploys
+  # the launcher owns that call. The backend itself is functional via any injected spawner.
+  node-pty: false
