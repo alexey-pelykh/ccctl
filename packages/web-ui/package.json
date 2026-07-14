@@ -16,7 +16,7 @@
   "scripts": {
     "clean": "rm -rf dist",
     "build": "rm -rf dist && mkdir -p dist && cp index.html dist/ && cp -r src dist/ && find dist/src -name '*.test.js' -delete",
-    "typecheck": "node --check src/app.js && node --check src/transcript.js && node --check src/command.js && node --check src/sessions.js && node --check src/pairing.js",
+    "typecheck": "node --check src/app.js && node --check src/transcript.js && node --check src/command.js && node --check src/sessions.js && node --check src/connection.js && node --check src/pairing.js",
     "test": "vitest run --passWithNoTests",
     "lint": "eslint src/",
     "dev": "echo \"serve this directory statically, e.g. npx serve .\""
