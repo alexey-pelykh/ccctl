@@ -147,6 +147,27 @@ export {
   type TmuxSessionLauncherConfig,
 } from "./session-launcher-tmux.js";
 
+// Re-export the owned-pty launcher backend (#30) on the public surface — the PORTABLE FALLBACK
+// ISessionLauncher backend: an owned `node-pty` running the patched `claude`, for environments where
+// the tmux backend (#29) is unavailable. Its attachability is DEGRADED (TerminalAttachment.attachable
+// = false), surfaced honestly to the operator rather than hidden. The daemon composes it BEHIND the
+// tmux primary via createFallbackSessionLauncher (#31), so a "New session" lands on the pty when tmux
+// rejects. Ships runtime (the factory + default spawner), so a value export alongside its config/seam
+// types and geometry defaults. The shared `WorkerCommandFactory` seam is already re-exported above via
+// the tmux backend. Defined in session-launcher-pty.ts.
+export {
+  createPtySessionLauncher,
+  defaultPtySpawner,
+  DEFAULT_PTY_TERM_NAME,
+  DEFAULT_PTY_COLS,
+  DEFAULT_PTY_ROWS,
+  DEGRADED_ATTACH_HINT,
+  type OwnedPty,
+  type PtySpawner,
+  type PtySpawnOptions,
+  type PtySessionLauncherConfig,
+} from "./session-launcher-pty.js";
+
 // Re-export the fallback launcher composite (#31) on the public surface. The daemon composes
 // the primary tmux backend (#29) with any fallback (#30) behind ONE ISessionLauncher port via
 // this, then injects the result as ServerConfig.launcher — so a "New session" request lands on
