@@ -52,7 +52,9 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   applyWorkerStatus,
   BRIDGE_PROTOCOL_API_VERSION,
+  isSessionStale,
   isWorkerStatus,
+  markSessionClosed,
   markSessionReady,
   recordHeartbeat,
   type ControlRequest,
@@ -82,6 +84,26 @@ const MAX_WORKER_BODY_BYTES = 1024 * 1024;
 export const DEFAULT_WORKER_LIVENESS_INTERVAL_MS = 20_000;
 
 /**
+ * Default grace window (ms) before a session whose worker downstream has gone null is CLOSED and
+ * evicted from the registry (#173).
+ *
+ * A worker dropping its held-open downstream is NORMAL on a transient reconnect — it re-registers
+ * with a fresh downstream after a network blip — so a null downstream ALONE must never evict
+ * (reconnect-safety). Eviction is instead **liveness-driven** (issue #173's recommended policy,
+ * leaning on the #41 heartbeat): the downstream close only ARMS a check this many ms later, and the
+ * check evicts ONLY when the downstream is STILL null AND no heartbeat has landed within the window
+ * ({@link isSessionStale}) — i.e. the worker has genuinely gone silent, not merely dropped its
+ * stream. A still-beating worker (downstream dropped but heartbeats continuing) is retained.
+ *
+ * 30s matches {@link DEFAULT_HEARTBEAT_STALE_AFTER_MS}: a session with no downstream and no
+ * heartbeat for a full staleness window is presumed terminally gone. Comfortably longer than a
+ * worker's reconnect/liveness cycle, so a genuine reconnect re-registers well before the window
+ * lapses. Overridable per server ({@link ServerConfig.sessionEvictionGraceMs}); a test passes a
+ * short value to exercise eviction deterministically.
+ */
+export const DEFAULT_SESSION_EVICTION_GRACE_MS = 30_000;
+
+/**
  * The live per-session worker channel: its current epoch, its held-open downstream
  * SSE (or `null` when the worker has not opened / has dropped the stream), and the
  * next downstream `client_event` sequence number.
@@ -100,6 +122,14 @@ export interface WorkerChannelRecord {
    * and on shutdown — so no frame is ever written to a reaped stream and no interval dangles.
    */
   livenessTimer: ReturnType<typeof setInterval> | null;
+  /**
+   * The armed grace-delayed **eviction check** (#173), scheduled when the downstream goes null to
+   * decide — one grace window later — whether the session is terminally gone (→ closed + evicted)
+   * or merely reconnecting (retained); `null` when no check is pending. Cleared on reconnect
+   * (re-register / reopen) and on shutdown via {@link endDownstream}, so a pending eviction never
+   * fires against a session whose worker came back or a server that is shutting down.
+   */
+  evictionTimer: ReturnType<typeof setTimeout> | null;
 }
 
 /** The per-server state the worker channel reads and updates. */
@@ -115,6 +145,14 @@ export interface WorkerChannelState {
    * timer deterministically.
    */
   readonly workerLivenessIntervalMs: number;
+  /**
+   * Grace window (ms) before a downstream-null session is closed + evicted (#173). Resolved once at
+   * server start ({@link ServerConfig.sessionEvictionGraceMs} ??
+   * {@link DEFAULT_SESSION_EVICTION_GRACE_MS}); doubles as the staleness window the eviction check
+   * measures the heartbeat gap against ({@link isSessionStale}). A test passes a short value to
+   * exercise eviction deterministically.
+   */
+  readonly sessionEvictionGraceMs: number;
   /**
    * The per-session UI Server-Sent Events relays. Every payload read off a session's
    * upstream `worker/events` leg (§5) is fanned out to the UI clients subscribed to THAT
@@ -218,6 +256,7 @@ export function handleWorkerRegister(
     downstream: null,
     nextSeq: prev?.nextSeq ?? 1,
     livenessTimer: null,
+    evictionTimer: null,
   });
   writeJson(res, 200, { worker_epoch: epoch });
 }
@@ -292,6 +331,13 @@ export function handleWorkerEventsStream(
     if (record.downstream === res) {
       record.downstream = null;
       record.livenessTimer = null;
+      // The worker dropped its LIVE downstream. That is NORMAL on a transient reconnect (it
+      // re-registers / reopens with a fresh downstream after a network blip), so a null downstream
+      // alone must NOT evict (#173 reconnect-safety). Arm a grace-delayed liveness check that
+      // evicts ONLY a terminally-gone session — downstream still null AND heartbeat lapsed (#41
+      // staleness) — and RETAINS a still-beating one. Cleared on reconnect / shutdown via
+      // `endDownstream`, and neutralized by an identity guard if the record was superseded.
+      scheduleEviction(state, sessionId, record);
     }
   });
 }
@@ -560,18 +606,97 @@ function clearLivenessTimer(record: WorkerChannelRecord): void {
 }
 
 /**
- * End a record's held-open downstream and clear its armed liveness timer (#166) — the single
- * teardown every downstream-ending path routes through: a supersede (a re-register in
- * {@link handleWorkerRegister}, a duplicate open in {@link handleWorkerEventsStream}) and shutdown
- * ({@link closeWorkerChannels}). Ending the stream and clearing its timer are kept inseparable here
- * so no new downstream inherits a stale interval and no timer is left to dangle. Leaves
- * `record.downstream` set for the caller to null or reassign.
+ * Clear a record's armed grace-delayed eviction check (#173), if any, and null the field.
+ * Idempotent — safe on a record with no pending eviction. Routed through {@link endDownstream} so a
+ * reconnect (re-register / reopen) or shutdown cancels a pending eviction the SAME way it tears the
+ * downstream down — a returning worker's session is never evicted out from under it.
+ */
+function clearEvictionTimer(record: WorkerChannelRecord): void {
+  if (record.evictionTimer !== null) {
+    clearTimeout(record.evictionTimer);
+    record.evictionTimer = null;
+  }
+}
+
+/**
+ * End a record's held-open downstream and clear its armed timers — the liveness interval (#166) AND
+ * any pending eviction check (#173) — the single teardown every downstream-ending path routes
+ * through: a supersede (a re-register in {@link handleWorkerRegister}, a duplicate open in
+ * {@link handleWorkerEventsStream}) and shutdown ({@link closeWorkerChannels}). Ending the stream
+ * and clearing its timers are kept inseparable here so no new downstream inherits a stale interval,
+ * no timer is left to dangle, and a reconnect cancels a pending eviction. Leaves `record.downstream`
+ * set for the caller to null or reassign.
  */
 function endDownstream(record: WorkerChannelRecord): void {
   clearLivenessTimer(record);
+  clearEvictionTimer(record);
   if (record.downstream !== null) {
     record.downstream.end();
   }
+}
+
+/**
+ * Arm the grace-delayed eviction check (#173) for a record whose downstream just went null. The
+ * one-shot fires after {@link WorkerChannelState.sessionEvictionGraceMs}; `.unref()` so a pending
+ * check alone never blocks process exit. Stored on {@link WorkerChannelRecord.evictionTimer} so a
+ * reconnect / reopen / shutdown clears it through {@link endDownstream}. Re-armed by
+ * {@link considerEviction} while a beating-but-downstream-less worker keeps the session alive.
+ */
+function scheduleEviction(state: WorkerChannelState, sessionId: string, record: WorkerChannelRecord): void {
+  const timer = setTimeout(() => {
+    considerEviction(state, sessionId, record);
+  }, state.sessionEvictionGraceMs);
+  timer.unref();
+  record.evictionTimer = timer;
+}
+
+/**
+ * The grace-delayed eviction DECISION (#173): CLOSE + evict a terminally-gone session, RETAIN a
+ * transiently-reconnecting or still-beating one. Fires one grace window after the downstream went
+ * null ({@link scheduleEviction}). Evicts ONLY when ALL of the following hold — otherwise it
+ * retains (re-arming when the worker is merely beating without a downstream, so a later silence is
+ * still caught):
+ *   - the record is still the session's CURRENT channel — a re-register swapped in a fresh record,
+ *     so this stale closure bails and lets the new registration own the session's lifecycle;
+ *   - the downstream is still null — a reopened downstream means the worker is back → retain;
+ *   - the session still exists — a prior pass already evicted it → nothing to do;
+ *   - the session is STALE — no heartbeat within the grace window ({@link isSessionStale}). A fresh
+ *     heartbeat means the worker is alive though its downstream dropped, so a null downstream ALONE
+ *     never evicts (the reconnect-safety AC).
+ * On eviction it drives the session to its terminal `closed` state ({@link markSessionClosed}, the
+ * reverse leg of #172's `connecting`→`ready`) and deletes BOTH the session and its worker channel,
+ * so `GET /api/sessions` ("`ccctl attach`") stops listing it and the registry does not grow
+ * unbounded across worker exits.
+ */
+function considerEviction(state: WorkerChannelState, sessionId: string, record: WorkerChannelRecord): void {
+  record.evictionTimer = null; // this one-shot has fired.
+  // A re-register replaced the record: this closure is stale — the fresh registration owns the
+  // session now, so never let it evict a reconnected session.
+  if (state.workerChannels.get(sessionId) !== record) {
+    return;
+  }
+  // The worker reopened its downstream — it is back. Retain.
+  if (record.downstream !== null) {
+    return;
+  }
+  const session = state.sessions.get(sessionId);
+  if (session === undefined) {
+    return;
+  }
+  // Downstream still null but the worker is still heart-beating — alive, just without a downstream.
+  // A null downstream alone must NOT evict (#173): retain, and re-check after another grace window
+  // so a subsequent silence is still caught.
+  if (!isSessionStale(session, Date.now(), state.sessionEvictionGraceMs)) {
+    scheduleEviction(state, sessionId, record);
+    return;
+  }
+  // Terminally gone: no downstream and no heartbeat for a full grace window. Drive to the terminal
+  // `closed` lifecycle (the reverse leg of #172's `connecting`→`ready`), retire the record's timers,
+  // then evict from BOTH maps so `GET /api/sessions` ("ccctl attach") stops listing it.
+  endDownstream(record); // canonical record teardown — clears any residual timers before dropping it.
+  state.sessions.set(sessionId, markSessionClosed(session));
+  state.sessions.delete(sessionId);
+  state.workerChannels.delete(sessionId);
 }
 
 /**

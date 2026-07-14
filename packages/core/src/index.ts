@@ -992,6 +992,23 @@ export function markSessionReady(session: Session): Session {
   return { ...session, status: "ready" };
 }
 
+/**
+ * Explicit transition — drive a session's transport lifecycle to its TERMINAL `closed`
+ * state (the reverse leg of {@link markSessionReady}), applied when the worker has
+ * terminally exited and the session is being torn down. Returns a NEW `closed` session
+ * from any LIVE status (`connecting` / `ready` / `busy`); an ALREADY-terminal session
+ * (`closed` / `errored`) is returned UNCHANGED (same reference) — a terminal state never
+ * moves, so re-closing is a no-op and a distinct `errored` is never clobbered to `closed`.
+ * Only `status` moves; the orthogonal activity / liveness dimensions are untouched. Pure:
+ * never mutates the input, so one session's teardown cannot touch another's.
+ */
+export function markSessionClosed(session: Session): Session {
+  if (session.status === "closed" || session.status === "errored") {
+    return session;
+  }
+  return { ...session, status: "closed" };
+}
+
 // --- loggable / persistable (JSON) shape + credential-omission proofs ---
 
 /** A JSON-safe value: exactly what may cross into a log line or a snapshot. */

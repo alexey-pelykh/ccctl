@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import {
+  DEFAULT_HEARTBEAT_STALE_AFTER_MS,
   DEFAULT_REQUIRES_ACTION_DETAIL,
   SESSIONS_PATH,
   workerChannelPath,
@@ -14,7 +15,7 @@ import {
   workerRegisterPath,
 } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
-import { DEFAULT_WORKER_LIVENESS_INTERVAL_MS } from "./worker-channel.js";
+import { DEFAULT_SESSION_EVICTION_GRACE_MS, DEFAULT_WORKER_LIVENESS_INTERVAL_MS } from "./worker-channel.js";
 
 const ACCOUNT_BEARER = "oauth-account-secret-worker-abc123";
 
@@ -723,5 +724,106 @@ describe("§4 worker downstream liveness — periodic no-op client_event frames 
     // window with margin for jitter — so an idle session holds without a hand-tuned config.
     expect(DEFAULT_WORKER_LIVENESS_INTERVAL_MS).toBeGreaterThanOrEqual(20_000);
     expect(DEFAULT_WORKER_LIVENESS_INTERVAL_MS).toBeLessThanOrEqual(30_000);
+  });
+});
+
+// --- #173: evict terminally-closed sessions from the in-memory registry ---
+
+/**
+ * Start a server whose #173 eviction grace is SHORT, so the grace-delayed check fires within a test
+ * window. The liveness interval stays at its (long) default — irrelevant to eviction and it must not
+ * flap the short grace.
+ */
+async function startEvictionServer(sessionEvictionGraceMs: number): Promise<CcctlServer> {
+  const server = await startServer({ port: 0, host: DEFAULT_HOST, sessionEvictionGraceMs });
+  started.push(server);
+  return server;
+}
+
+/** §4 — POST a worker heartbeat, refreshing the session's liveness (200). */
+async function postHeartbeat(server: CcctlServer, sessionId: string): Promise<void> {
+  const res = await fetch(`${base(server)}${workerHeartbeatPath(sessionId)}`, { method: "POST" });
+  expect(res.status).toBe(200);
+}
+
+describe("§4 worker session eviction — a terminally-gone worker's session is closed + evicted, reconnect-safe (#173)", () => {
+  const GRACE_MS = 40;
+
+  it("evicts a session whose worker terminally exited — closed + removed from the registry after the grace window, so `ccctl attach` stops listing it (AC1, AC3, AC4)", async () => {
+    const server = await startEvictionServer(GRACE_MS);
+    const sessionId = await registerSession(server);
+    await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId);
+    await waitFor(() => server.hasLiveWorker(sessionId));
+    // While the worker holds its downstream, the session is tracked and attach lists it.
+    expect(server.sessions.has(sessionId)).toBe(true);
+    expect((await listSessions(server)).map((session) => session.id)).toContain(sessionId);
+
+    // The worker terminally exits: its held-open downstream closes and NO heartbeat follows, so the
+    // session goes downstream-null AND heartbeat-stale.
+    streams.pop()?.destroy();
+
+    // After the grace window the terminally-gone session is closed and evicted from the registry.
+    await waitFor(() => !server.sessions.has(sessionId));
+    expect(server.hasLiveWorker(sessionId)).toBe(false);
+    // `GET /api/sessions` ("ccctl attach") no longer lists the exited-worker session (AC3).
+    expect(await listSessions(server)).toEqual([]);
+  });
+
+  it("does NOT evict a transiently-reconnecting worker — downstream nulled, then re-registered + reopened, is retained (AC2, AC4)", async () => {
+    // A generous grace so the reconnect comfortably completes before the check could ever fire —
+    // real-timer + real-HTTP test, so the window is sized well above a loopback round-trip.
+    const RECONNECT_GRACE_MS = 300;
+    const server = await startEvictionServer(RECONNECT_GRACE_MS);
+    const sessionId = await registerSession(server);
+    await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId);
+    await waitFor(() => server.hasLiveWorker(sessionId));
+
+    // Network blip: the downstream drops (eviction is armed) ...
+    streams.pop()?.destroy();
+    await waitFor(() => !server.hasLiveWorker(sessionId));
+    // ... then the worker reconnects — re-registers with a fresh epoch and reopens its downstream.
+    await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId);
+    await waitFor(() => server.hasLiveWorker(sessionId));
+
+    // Across more than a full grace window the reconnected session is RETAINED — the re-register
+    // cleared the pending eviction (and an identity guard neutralizes any stale one).
+    await new Promise((resolve) => setTimeout(resolve, RECONNECT_GRACE_MS * 2));
+    expect(server.sessions.has(sessionId)).toBe(true);
+    expect(server.hasLiveWorker(sessionId)).toBe(true);
+    expect((await listSessions(server)).map((session) => session.id)).toContain(sessionId);
+  });
+
+  it("does NOT evict a session whose downstream dropped while the worker keeps heart-beating — a null downstream ALONE never evicts (AC2 reconnect-safety)", async () => {
+    // Grace comfortably wider than the beat cadence below, so every eviction check finds a fresh
+    // heartbeat and re-arms rather than evicting — no timing-race against the check.
+    const BEATING_GRACE_MS = 120;
+    const server = await startEvictionServer(BEATING_GRACE_MS);
+    const sessionId = await registerSession(server);
+    await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId);
+    await waitFor(() => server.hasLiveWorker(sessionId));
+
+    // The downstream drops but the worker is alive — the eviction check is armed on a null downstream.
+    streams.pop()?.destroy();
+    await waitFor(() => !server.hasLiveWorker(sessionId));
+
+    // Heartbeats keep landing (well within each grace window) across several grace windows: the
+    // heartbeat gate keeps the session live even though its downstream stays null — a null downstream
+    // alone never evicts, so the check re-arms instead of deleting.
+    for (let beat = 0; beat < 6; beat++) {
+      await new Promise((resolve) => setTimeout(resolve, BEATING_GRACE_MS / 3));
+      await postHeartbeat(server, sessionId);
+    }
+    expect(server.sessions.has(sessionId)).toBe(true);
+    expect(server.hasLiveWorker(sessionId)).toBe(false); // still downstream-null, yet retained.
+  });
+
+  it("aligns the default eviction grace with a full heartbeat-staleness window — a session silent that long is presumed gone", () => {
+    // Grace == staleness window: a session with no downstream and no heartbeat for one staleness
+    // window is terminally gone. The knob is injectable, so this is a documented design value.
+    expect(DEFAULT_SESSION_EVICTION_GRACE_MS).toBe(DEFAULT_HEARTBEAT_STALE_AFTER_MS);
   });
 });
