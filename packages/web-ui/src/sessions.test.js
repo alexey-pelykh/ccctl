@@ -2,11 +2,18 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { describe, it, expect } from "vitest";
-import { ACTIVITY_LABELS, activityLabel, sessionLabel, diffSessionList, nextSelection } from "./sessions.js";
+import {
+  ACTIVITY_LABELS,
+  activityLabel,
+  sessionLabel,
+  notificationsDegraded,
+  diffSessionList,
+  nextSelection,
+} from "./sessions.js";
 
-/** A `SessionSummaryWire` fixture — the `GET /api/sessions` row shape. */
+/** A `SessionSummaryWire` fixture — the `GET /api/sessions` row shape; a prompting (non-degraded) row. */
 function summary(id, status, activity) {
-  return { id, status, activity };
+  return { id, status, activity, notificationsDegraded: false };
 }
 
 describe("activityLabel", () => {
@@ -47,6 +54,28 @@ describe("sessionLabel", () => {
 
   it("defends a missing status so a partial row still labels", () => {
     expect(sessionLabel({ id: "sess-5", activity: { kind: "running" } })).toBe("sess-5 — unknown · running");
+  });
+});
+
+describe("notificationsDegraded", () => {
+  it("degrades only on a literal true — the #26 life-long marker the badge (#27) surfaces", () => {
+    expect(notificationsDegraded({ id: "s", notificationsDegraded: true })).toBe(true);
+    expect(notificationsDegraded({ id: "s", notificationsDegraded: false })).toBe(false);
+  });
+
+  it("reads a missing / non-boolean marker as not-degraded, so a partial or pre-#26 row shows no badge", () => {
+    // A row that predates #26 (or any partial projection) omits the field entirely.
+    expect(notificationsDegraded({ id: "s" })).toBe(false);
+    // Strictly boolean: a truthy non-boolean must not light the badge.
+    expect(notificationsDegraded({ id: "s", notificationsDegraded: "true" })).toBe(false);
+    expect(notificationsDegraded({ id: "s", notificationsDegraded: 1 })).toBe(false);
+  });
+
+  it("never throws on a shapeless value", () => {
+    expect(notificationsDegraded(undefined)).toBe(false);
+    expect(notificationsDegraded(null)).toBe(false);
+    expect(notificationsDegraded("nope")).toBe(false);
+    expect(notificationsDegraded(["notificationsDegraded"])).toBe(false);
   });
 });
 

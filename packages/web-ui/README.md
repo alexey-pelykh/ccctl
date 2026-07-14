@@ -14,14 +14,18 @@ more than one session can be carried at once. `GET /api/sessions` lists the carr
 sessions and the UI picks one to view + steer; the selected session drives the
 zero-build transport pair:
 
-- **List + select (#20; live status #25):** a `fetch` GET of `/api/sessions`
-  enumerates the sessions the daemon is carrying (id + transport status + activity).
+- **List + select (#20; live status #25; degraded badge #27):** a `fetch` GET of
+  `/api/sessions` enumerates the sessions the daemon is carrying (id + transport
+  status + activity + the notifications-degraded marker).
   The list is **polled on an interval** and reconciled **in place** — only the rows
   whose status / activity changed are relabelled — so each session's per-session
   status (running / idle / awaiting-input) stays live as sessions change state,
-  without flicker or losing focus / the current selection. Picking one (re)opens its
-  stream and clears the prior session's transcript — the view + steer below apply to
-  the selected session, and never bleed across sessions.
+  without flicker or losing focus / the current selection. A session carrying the
+  life-long **notifications-degraded** marker (#26 — a non-prompting session whose
+  needs-you notifications never fire) stands a persistent badge on its row (#27); a
+  prompting session shows none. Picking one (re)opens its stream and clears the prior
+  session's transcript — the view + steer below apply to the selected session, and
+  never bleed across sessions.
 - **Downstream (implemented, #15; per-session #20):** an `EventSource` subscribes to
   the selected session's SSE stream at `GET /api/sessions/{id}/events`. Each
   `control_event` frame is decoded and routed — a `worker_status` frame updates the
@@ -43,5 +47,9 @@ The `@ccctl/core` frame shapes are **mirrored, not imported** — this UI is ser
 to the browser as-is, so `src/*.js` stays dependency-free vanilla ESM. The
 downstream rendering logic in `src/transcript.js`, the upstream steer-building
 logic in `src/command.js` and the session-list diff / label / selection logic in
-`src/sessions.js` are all unit-tested (`vitest`); the DOM shell in `src/app.js` is
-thin glue, exercised end-to-end by the e2e harness.
+`src/sessions.js` are all unit-tested (`vitest`), and the e2e harness imports the
+first two to drive the real decode / steer path against a real daemon. The DOM
+shell in `src/app.js` is thin glue that is **not** directly exercised: it reads the
+DOM at module load and the repo ships no DOM driver, so it is verified by
+inspection. That is the split the modules exist to enable — every decision lives in
+a DOM-free module that a test can reach, leaving `app.js` with only the glue.
