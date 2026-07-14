@@ -44,6 +44,20 @@
         font-weight: 700;
         border-color: #1d4ed8;
       }
+      /* A non-prompting session's notifications-degraded badge (#26/#27); amber, the same
+         attention hue as the requires_action activity. The full-width row button pushes it
+         onto its own line; the left margin matches the button's own text inset. */
+      #session-list [data-badge="notifications-degraded"] {
+        display: inline-block;
+        margin: 0.2rem 0 0 0.6rem;
+        padding: 0.05rem 0.4rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: #b45309;
+        background: #fef3c7;
+        border: 1px solid #f59e0b;
+        border-radius: 0.25rem;
+      }
       #events {
         list-style: none;
         padding: 0;

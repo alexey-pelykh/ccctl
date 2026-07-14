@@ -40,7 +40,7 @@ import {
   redirectCommand,
   describeCommand,
 } from "./command.js";
-import { diffSessionList, nextSelection } from "./sessions.js";
+import { diffSessionList, nextSelection, notificationsDegraded } from "./sessions.js";
 
 const statusEl = document.getElementById("status");
 const activityEl = document.getElementById("activity");
@@ -125,8 +125,36 @@ function handleEvent(data) {
   }
 }
 
-/** Build one picker row: a full-width button whose click views + steers that session. */
-function createSessionRow(sessionId, label) {
+/**
+ * A standing "notifications degraded" badge for a non-prompting session (#26/#27). It is a
+ * SIBLING of the row button, never a child of it: a poll relabels a row via
+ * `button.textContent = label`, which would wipe a badge nested inside the button — as a
+ * sibling it survives every relabel. It carries an id so the button can point at it as its
+ * accessible description ({@link createSessionRow}).
+ */
+function createDegradedBadge(sessionId) {
+  const badge = document.createElement("span");
+  badge.id = `degraded-${sessionId}`;
+  badge.dataset.badge = "notifications-degraded";
+  badge.textContent = "notifications degraded";
+  badge.title =
+    "This session runs in a non-prompting mode (acceptEdits / bypassPermissions); it won't raise needs-you notifications.";
+  return badge;
+}
+
+/**
+ * Build one picker row: a full-width button whose click views + steers that session, plus —
+ * for a session carrying the degraded-notification marker (#26) — a standing badge (#27).
+ *
+ * The badge must sit OUTSIDE the button to survive a poll's relabel (see
+ * {@link createDegradedBadge}), which also keeps it out of the button's accessible NAME — so a
+ * screen-reader user tabbing the picker would hear the row but never the badge, and the
+ * `aria-live` list would announce it only once at insertion. That is the one-time-transient
+ * reading the marker is meant NOT to have, so the button points at the badge via
+ * `aria-describedby`: focusing the row announces name + description, every time, for as long as
+ * the session lives. (Session ids are server-minted UUIDs — valid, unique `id` tokens.)
+ */
+function createSessionRow(sessionId, label, degraded) {
   const li = document.createElement("li");
   li.dataset.sessionId = sessionId;
   const button = document.createElement("button");
@@ -134,6 +162,11 @@ function createSessionRow(sessionId, label) {
   button.textContent = label;
   button.addEventListener("click", () => selectSession(sessionId));
   li.appendChild(button);
+  if (degraded) {
+    const badge = createDegradedBadge(sessionId);
+    li.appendChild(badge);
+    button.setAttribute("aria-describedby", badge.id);
+  }
   return li;
 }
 
@@ -165,12 +198,15 @@ function applySessionList(sessions) {
     emptyPlaceholderShown = false;
   }
   const diff = diffSessionList(renderedSessions, sessions);
+  // The degraded marker is per-session and life-long, so it is read at row birth (below),
+  // not carried through the label diff — a status/activity change never toggles the badge.
+  const byId = new Map(sessions.map((session) => [session.id, session]));
   for (const id of diff.removed) {
     sessionRows.get(id)?.remove();
     sessionRows.delete(id);
   }
   for (const { id, label } of diff.added) {
-    const li = createSessionRow(id, label);
+    const li = createSessionRow(id, label, notificationsDegraded(byId.get(id)));
     sessionRows.set(id, li);
     sessionListEl.appendChild(li);
   }

@@ -27,7 +27,8 @@
  *                      | { kind: "requires_action"; detail: string }
  *                      | { kind: "idle" }                                        (what the worker is doing)
  *   notificationsDegraded — a non-prompting session's persistent degraded-notification marker
- *                      (#26): carried on the wire; a badge to surface, not yet rendered in a row here.
+ *                      (#26): carried on the wire and read by {@link notificationsDegraded} into the
+ *                      standing per-row badge the shell renders (#27).
  *
  * A row surfaces BOTH dimensions: the transport `status` (is the steering channel live?)
  * and the derived activity as the human "per-session status" the issue enumerates —
@@ -81,6 +82,25 @@ export function activityLabel(activity) {
 export function sessionLabel(session) {
   const status = typeof session.status === "string" ? session.status : "unknown";
   return `${session.id} — ${status} · ${activityLabel(session.activity)}`;
+}
+
+/**
+ * Whether a session carries the "notifications degraded" marker (#26) — a non-prompting
+ * session (`acceptEdits` / `bypassPermissions`) never blocks on a decision, so it never
+ * emits `requires_action` and its needs-you notifications never fire; a badge stands in
+ * their place (#27). A dimension distinct from {@link sessionLabel}: the label carries the
+ * live status/activity, this the marker, which is set once at attach and never cleared —
+ * a fact about how the session was created, not a state that moves.
+ *
+ * Strict and defensive: only a literal `true` degrades (a truthy non-boolean does not), and
+ * a missing field or shapeless value reads as not-degraded — so a partial or pre-#26 row
+ * never shows a spurious badge, and this never throws.
+ *
+ * @param {{ notificationsDegraded?: unknown }} session - a `SessionSummaryWire`, or any value.
+ * @returns {boolean}
+ */
+export function notificationsDegraded(session) {
+  return session?.notificationsDegraded === true;
 }
 
 /**
