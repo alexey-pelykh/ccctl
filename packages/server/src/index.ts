@@ -79,6 +79,12 @@ import {
 } from "./ui-session-launch.js";
 import { DEFAULT_REGISTRATION_TIMEOUT_MS, type PendingLaunch } from "./pending-launch.js";
 import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
+import {
+  reconcileRecordedLaunches,
+  rehydrateRetainedSessions,
+  type ProcessLivenessProbe,
+  type RecordedLaunch,
+} from "./session-reconcile.js";
 import { writeError } from "./http-response.js";
 import {
   DEFAULT_WORK_POLL_TIMEOUT_MS,
@@ -219,6 +225,25 @@ export {
   XDG_STATE_HOME_ENV,
 } from "./session-store-file.js";
 
+// Re-export the orphan-reaper's CALLER-FACING contract (#34) — the INPUTS to the across-restart
+// reconciliation the daemon runs before serving, so a recorded launched-session handle whose surface died
+// while the daemon was down is evicted and one still alive is retained/rehydrated. The `ccctl` CLI's
+// `serve` composes those inputs (the recorded handles loaded from the store + a backend-specific liveness
+// probe) and passes them as ServerConfig, depending on the pinned `LaunchMarker` / `RecordedLaunch` /
+// `ProcessLivenessProbe` contract rather than re-transcribing it. `asLaunchMarker` ships runtime and is a
+// value export because it is the ONE way to mint the branded marker — without it no caller could build a
+// RecordedLaunch at all. The reconcile/rehydrate functions and their `ReconcileOutcome`/`ReconcileState`
+// types stay INTERNAL: startServer runs them off ServerConfig and nothing outside calls them, exactly as
+// the sibling pending-launch registry keeps trackPendingLaunch/claimPendingLaunch/PendingLaunchState off
+// this surface (a later need can add an export; un-shipping one is breaking). Defined and unit-tested in
+// session-reconcile.ts.
+export {
+  asLaunchMarker,
+  type LaunchMarker,
+  type ProcessLivenessProbe,
+  type RecordedLaunch,
+} from "./session-reconcile.js";
+
 // Re-export per-device token minting (#74 QR-pair onboarding) + hashing (#84) on the public
 // surface — the daemon (@ccctl/cli's `serve`) mints a token to encode into the pairing QR, and
 // hashes a minted token into its at-rest form before persisting a paired device. The pure
@@ -291,6 +316,25 @@ export interface ServerConfig {
    * passes a short value to exercise eviction deterministically; a slow host can raise it.
    */
   registrationTimeoutMs?: number;
+  /**
+   * The launched-session handles a PREVIOUS daemon recorded, loaded on this start so the orphan-reaper
+   * (#34) can reconcile them against live processes BEFORE serving: a recorded handle whose surface is
+   * still alive is rehydrated into the registry, one whose surface died while the daemon was down is
+   * evicted. Reconciliation is keyed on each handle's {@link RecordedLaunch.marker} (a durable
+   * launch-marker, never a raw PID) and runs only when a {@link ServerConfig.livenessProbe} is also
+   * configured — without a probe there is no way to tell alive from dead, and a reaper that cannot
+   * verify does not resurrect. Absent (the default): nothing to reconcile — a fresh registry. Loading
+   * these from the persisted store is the marker-persistence plumbing still deferred (session-reconcile.ts).
+   */
+  recordedLaunches?: readonly RecordedLaunch[];
+  /**
+   * The READ-ONLY liveness probe the orphan-reaper (#34) decides {@link ServerConfig.recordedLaunches}
+   * by — given a handle's launch-marker, is the surface it names still up? Injected because "is this
+   * process alive" is a backend-specific, host-touching question (the tmux backend answers it from one
+   * `tmux list-windows`); a test passes a fake. It has no verb but liveness, so the reaper cannot kill a
+   * live process (AC4). Absent (the default): the reaper does not run, and no recorded handle is rehydrated.
+   */
+  livenessProbe?: ProcessLivenessProbe;
 }
 
 /** A running ccctl server: the relay between the environments-bridge worker and the UI. */
@@ -540,6 +584,19 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     sessionEvictionGraceMs: config.sessionEvictionGraceMs ?? DEFAULT_SESSION_EVICTION_GRACE_MS,
     address: { host, port: config.port },
   };
+
+  // Orphan-reaper (#34): BEFORE the listener opens, reconcile the handles a previous daemon recorded
+  // launching against the surfaces still live on this host — one that outlived the daemon (a tmux window
+  // the operator may have taken over) is rehydrated into the registry, one that died while the daemon was
+  // down is evicted. Records only: the probe is read-only, so no live process is ever killed. Runs
+  // synchronously here, ahead of createServer/listen, so the registry is reconciled before the server can
+  // answer a single request (AC1/AC5). Gated on a probe being configured — without one, alive cannot be
+  // told from dead, so nothing is rehydrated (a reaper that cannot verify does not resurrect). A no-op on
+  // a fresh daemon and until the marker-persistence that FILLS recordedLaunches lands (session-reconcile.ts).
+  if (config.livenessProbe !== undefined) {
+    const { retained } = reconcileRecordedLaunches(config.recordedLaunches ?? [], config.livenessProbe);
+    rehydrateRetainedSessions(state, retained);
+  }
 
   const httpServer = createServer((req, res) => {
     try {
