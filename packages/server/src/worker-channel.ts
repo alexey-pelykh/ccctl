@@ -43,6 +43,15 @@
  * Activity — a status change off idle, or a turn injected down the channel — resets it. This is the
  * SEPARATE informational class the blocking needs-you (`requires_action`) trigger is NOT.
  *
+ * **Needs-input notification (#43).** The BLOCKING counterpart to the idle nudge: when a session
+ * TRANSITIONS into `requires_action` — the needs-you signal ({@link isInputAwaited}) — the server raises
+ * a per-session "needs input" notification NAMING it onto the same UI relay ({@link reconcileNeedsInput}
+ * decides it off the observed status on both the §4 and §5 legs; {@link needsInputEvent} builds it),
+ * carrying the human-ready detail of what it awaits. Composed with liveness (a heartbeat-stale awaiter is
+ * eviction's job, not a nudge) and — via the registry-absence of a closed session — lifecycle. This is
+ * the blocking class ("it is waiting on you") the idle nudge ("you left this sitting") is not; the two
+ * are discriminated by their event `type`.
+ *
  * **Turn injection** ({@link injectUserTurn}) pushes a `client_event` frame down the
  * held-open downstream. The event name is `client_event`; the `data` is
  * `{ sequence_num, event_id, event_type: "message", payload }`, and `payload.type`
@@ -65,6 +74,7 @@ import {
   applyWorkerStatus,
   applyWorkerStatusFrame,
   BRIDGE_PROTOCOL_API_VERSION,
+  isInputAwaited,
   isSessionStale,
   isWorkerStatus,
   markSessionReady,
@@ -150,6 +160,16 @@ export const DEFAULT_SESSION_IDLE_THRESHOLD_MS = 120_000;
  * mistaken for a transcript frame.
  */
 export const SESSION_IDLE_EVENT_TYPE = "ccctl_session_idle";
+
+/**
+ * The `type` discriminant of the blocking "needs input" notification (#43) the server broadcasts onto a
+ * session's UI stream when it TRANSITIONS into `requires_action` — the needs-you signal (`@ccctl/core`
+ * § {@link isInputAwaited}). The blocking counterpart of {@link SESSION_IDLE_EVENT_TYPE}: same `ccctl_`
+ * namespace (so it never collides with a real worker `stream-json` payload — the UI transcript decoder
+ * keys on `control_event` and surfaces everything else verbatim), same per-session relay, distinguished
+ * from the informational idle nudge by this `type`.
+ */
+export const SESSION_NEEDS_INPUT_EVENT_TYPE = "ccctl_session_needs_input";
 
 /**
  * The live per-session worker channel: its current epoch, its held-open downstream
@@ -483,6 +503,9 @@ function foldWorkerStatus(state: WorkerChannelState, sessionId: string, payload:
     // frame (it advances `lastActivityAt`), so `next !== session` is exactly "a status frame applied";
     // a non-status payload leaves the session untouched and rightly skips the reconcile.
     reconcileIdleTimer(state, sessionId, next);
+    // The blocking sibling (#43): raise the "needs input" notification on a transition INTO
+    // `requires_action`. `session` is the PRIOR state, so the transition is decided against it.
+    reconcileNeedsInput(state, sessionId, session, next);
   }
 }
 
@@ -548,6 +571,9 @@ export function handleWorkerStatus(
       // The §4 gate is the other place `idle` is observed (#41) — reconcile the idle timer off the
       // resulting activity exactly as the §5 leg does, so one derivation governs both legs.
       reconcileIdleTimer(state, sessionId, next);
+      // ... and the same for the blocking needs-input notification (#43): one derivation, both legs.
+      // `session` is the PRIOR state, so a bare `requires_action` re-affirmation is not a transition.
+      reconcileNeedsInput(state, sessionId, session, next);
     }
     writeJson(res, 200, {});
   });
@@ -840,6 +866,47 @@ function reconcileIdleTimer(state: WorkerChannelState, sessionId: string, sessio
 }
 
 /**
+ * Raise the blocking "needs input" notification (#43) when a session TRANSITIONS into `requires_action`
+ * — the single seam both the §4 status gate ({@link handleWorkerStatus}) and the §5 events leg
+ * ({@link foldWorkerStatus}) route their observed status through, so "notify on the move into awaiting"
+ * holds once for both legs, exactly as {@link reconcileIdleTimer} does for idle. Composes the canonical
+ * needs-you trigger (`@ccctl/core` {@link isInputAwaited}) — reused, never re-derived — with two more
+ * dimensions the single-DIMENSION trigger deliberately does not see:
+ *
+ *   - **TRANSITION, not level.** Emits only on the move INTO `requires_action` (`prev` was NOT already
+ *     awaiting), so a §4 bare re-affirmation of `requires_action`, or a redundant §5 frame, never
+ *     re-notifies. The blocking analogue of the idle timer's arm-once "one continuous stretch" guard: a
+ *     session sitting in `requires_action` is one blocking event, not one per frame.
+ *   - **LIVENESS.** "Needs input" means awaiting AND alive — a heartbeat-stale awaiter is eviction's job
+ *     (#173), not a nudge, so a `requires_action` whose heartbeat has lapsed is suppressed
+ *     ({@link isSessionStale}, the same {@link WorkerChannelState.sessionEvictionGraceMs} staleness
+ *     window {@link fireIdleEvent} uses — one rule governs both).
+ *
+ * The LIFECYCLE half of the composition (`@ccctl/core` § `isInputAwaited`: a session gone *closed* must
+ * not notify) needs no explicit check here — a closed / stopped / evicted session is DELETED from the
+ * registry (`session-close.ts` § `closeSession`), so the caller's `session !== undefined` guard plus
+ * this seam's synchronous execution mean a closed session can never reach the emit. The same
+ * registry-absence invariant {@link fireIdleEvent} leans on (`session === undefined` → nothing to nudge).
+ *
+ * Broadcast onto the session's OWN per-session relay (#20), so it inherently reaches only that session's
+ * subscribers and NAMES the session in the payload besides — the unambiguous identification the AC asks
+ * for, never a generic "a session needs you".
+ */
+function reconcileNeedsInput(state: WorkerChannelState, sessionId: string, prev: Session, next: Session): void {
+  if (isInputAwaited(prev.activity)) {
+    return; // already awaiting — a re-affirmation, not a fresh transition; do not re-notify.
+  }
+  const { activity } = next;
+  if (!isInputAwaited(activity)) {
+    return; // did not enter the blocking needs-you state.
+  }
+  if (isSessionStale(next, Date.now(), state.sessionEvictionGraceMs)) {
+    return; // awaiting but heartbeat-stale — eviction's job (#173), not a nudge.
+  }
+  broadcastEvent(state.eventRelays, sessionId, needsInputEvent(sessionId, activity.detail));
+}
+
+/**
  * Fire the "idle > X" informational event (#41): the one-shot armed by {@link armIdleTimer} has elapsed,
  * so raise the event naming the session onto its UI stream — but only if it is STILL genuinely idle and
  * alive. Nulls the field first (the one-shot is spent), then fails closed on each way the world may have
@@ -882,6 +949,19 @@ function fireIdleEvent(state: WorkerChannelState, sessionId: string, record: Wor
  */
 function idleEvent(sessionId: string, thresholdMs: number): JsonValue {
   return { type: SESSION_IDLE_EVENT_TYPE, session_id: sessionId, idle_threshold_ms: thresholdMs };
+}
+
+/**
+ * The blocking "needs input" notification payload (#43): a {@link SESSION_NEEDS_INPUT_EVENT_TYPE}-typed
+ * object that NAMES the session (AC1/AC3) and carries the human-ready `detail` the `requires_action`
+ * frame captured — already normalized to one bounded, displayable line at the core model boundary
+ * (`@ccctl/core` § `displayableDetail`: zero-width / control characters stripped, clamped to
+ * `MAX_REQUIRES_ACTION_DETAIL_LENGTH`), so the notification inherits that guarantee rather than
+ * re-sanitizing worker-supplied text here. A {@link JsonValue}, so it rides the same per-session UI relay
+ * as a verbatim worker payload — the blocking sibling of {@link idleEvent}, discriminated by its `type`.
+ */
+function needsInputEvent(sessionId: string, detail: string): JsonValue {
+  return { type: SESSION_NEEDS_INPUT_EVENT_TYPE, session_id: sessionId, detail };
 }
 
 /**

@@ -1185,8 +1185,16 @@ export function sessionActivityFromStatus(status: WorkerStatus, detail?: string)
  * never emits `requires_action` ({@link Session.notificationsDegraded}), so this naturally returns
  * `false` for it — no suppression gate needed. Keeping this one derivation single-sourced is what lets
  * #43 compose the notification without re-deriving (and possibly re-sourcing) the trigger.
+ *
+ * Returns a TYPE GUARD narrowing to the `requires_action` {@link SessionActivity} member, not a bare
+ * `boolean`: the composing emitter (#43) branches on this predicate AND then reads the `detail` off the
+ * same value for the notification message, so the guard hands it the narrowed member type-safely rather
+ * than forcing a second, drift-prone `kind` re-check. Boolean-compatible, so existing conditional /
+ * `expect(…)` callers are unaffected.
  */
-export function isInputAwaited(activity: SessionActivity): boolean {
+export function isInputAwaited(
+  activity: SessionActivity,
+): activity is Extract<SessionActivity, { kind: "requires_action" }> {
   return activity.kind === "requires_action";
 }
 

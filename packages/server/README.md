@@ -59,7 +59,15 @@ permission mode, #26). Downstream, every payload a session's
 worker POSTs up `worker/events` (§5) fans out to the clients subscribed to THAT
 session's **Server-Sent Events** stream at `GET /api/sessions/{id}/events` — and only
 them — each event carrying a per-session `Last-Event-ID`-compatible id so a
-reconnecting client reconciles the gap it missed. Upstream, the browser steers a
+reconnecting client reconciles the gap it missed. The server also RAISES two of its own
+session-naming events onto that same stream: a **blocking needs-input notification**
+([#43](https://github.com/alexey-pelykh/ccctl/issues/43)) the moment a session enters
+`requires_action` — carrying the human-ready detail of what it awaits — and an
+**informational idle nudge** ([#41](https://github.com/alexey-pelykh/ccctl/issues/41))
+once a session has sat idle past its threshold. Both are `ccctl_`-namespaced (so the
+browser's decoder never mistakes them for a worker transcript frame) and both name the
+session in the payload, so a consumer identifies WHICH session needs attention — never a
+generic "a session needs you". Upstream, the browser steers a
 chosen session with a `fetch` **POST** to `/api/sessions/{id}/command`: a `prompt`
 becomes a `{ type: "user" }` turn injected on that session's worker downstream, any
 other verb a `control_request` — both pushed as a `client_event` frame. Naming the
