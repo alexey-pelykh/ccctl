@@ -1219,11 +1219,30 @@ describe("§4/§5 per-session idle timer — raises an 'idle > X' informational 
     expect(idleEvents(ui)).toEqual([]);
   });
 
-  it("defaults the idle threshold well above the liveness/eviction windows (a lull, not a per-turn nudge)", () => {
-    // The nudge is for a session an operator has LEFT idle — deliberately far above the 20s/30s
+  it("defaults the idle threshold to 2 min — above the liveness/eviction windows (a lull, not a per-turn nudge) (#42 AC1)", () => {
+    // The nudge is for a session an operator has LEFT idle — deliberately above the 20s/30s
     // liveness/eviction windows (which bound a worker presumed GONE), so it never fires right after a
-    // turn settles to idle.
-    expect(DEFAULT_SESSION_IDLE_THRESHOLD_MS).toBe(300_000);
+    // turn settles to idle. #42 sets the configurable default to a short 2-min window.
+    expect(DEFAULT_SESSION_IDLE_THRESHOLD_MS).toBe(120_000);
     expect(DEFAULT_SESSION_IDLE_THRESHOLD_MS).toBeGreaterThan(DEFAULT_SESSION_EVICTION_GRACE_MS);
+  });
+
+  it("REJECTS a config-time sessionIdleThresholdMs that is not a positive integer — the override fails closed (#42 AC2)", async () => {
+    // AC2 makes the threshold overridable at config time; a mistyped override (NaN from an unset
+    // env var, or a non-positive value) handed to setTimeout would fire the nudge immediately instead of
+    // after the lull, so startServer refuses it at boot rather than silently misfiring — mirroring maxSessions.
+    for (const sessionIdleThresholdMs of [Number.NaN, 0, -1, 2.5, Number.POSITIVE_INFINITY]) {
+      await expect(startServer({ port: 0, host: DEFAULT_HOST, sessionIdleThresholdMs })).rejects.toThrow(
+        /sessionIdleThresholdMs must be a positive integer/,
+      );
+    }
+  });
+
+  it("names the offending idle-threshold value, so the operator can see what their config resolved to (#42 AC2)", async () => {
+    // `NaN` is invisible in a config file — it is what a bad `Number(…)` PRODUCED. Echoing it back is
+    // what turns "the daemon won't start" into "my env var is unset".
+    await expect(startServer({ port: 0, host: DEFAULT_HOST, sessionIdleThresholdMs: Number.NaN })).rejects.toThrow(
+      /NaN/,
+    );
   });
 });

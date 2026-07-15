@@ -356,10 +356,16 @@ export interface ServerConfig {
   /**
    * Threshold (ms) a session may stay continuously idle — observed `worker_status: idle`, still
    * heartbeat-live — before the server raises the "idle > X" informational event that names it (#41).
-   * Defaults to {@link DEFAULT_SESSION_IDLE_THRESHOLD_MS} (5 min), deliberately well above the
-   * liveness/eviction windows so the nudge fires only after a genuine lull, not after every turn settles.
-   * Activity — a status change off idle, or an injected turn — resets the per-session timer. A test
-   * passes a short value to exercise it deterministically.
+   * The config-time knob (#42): defaults to {@link DEFAULT_SESSION_IDLE_THRESHOLD_MS} (2 min),
+   * deliberately well above the liveness/eviction windows so the nudge fires only after a genuine lull,
+   * not after every turn settles. Activity — a status change off idle, or an injected turn — resets the
+   * per-session timer.
+   *
+   * MUST be a positive integer (ms) when set — {@link startServer} REJECTS anything else rather than
+   * degrading to the default, mirroring {@link ServerConfig.maxSessions}: a `NaN` (what `Number(…)` of an
+   * unset/mistyped env var yields) or a non-positive value handed to `setTimeout` would fire the nudge
+   * immediately and repeatedly instead of after the lull, so a bad override fails closed at boot rather
+   * than silently misfiring. A test passes a short (positive-integer) value to exercise it deterministically.
    */
   sessionIdleThresholdMs?: number;
   /**
@@ -734,6 +740,18 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
       new Error(
         `ccctl: maxSessions must be a positive integer (got \`${String(config.maxSessions)}\`) — ` +
           "it is the ceiling on live sessions, and a cap that is not a counting number cannot bound anything",
+      ),
+    );
+  }
+  // The idle-threshold config-time override (#42) fails closed the same way maxSessions does: a `NaN`
+  // (what `Number(…)` of an unset/mistyped env var yields) or a non-positive value handed to `setTimeout`
+  // would fire the "idle > X" nudge immediately and repeatedly rather than after the lull, so a mistyped
+  // override is refused at the door instead of silently defeating the timer.
+  if (config.sessionIdleThresholdMs !== undefined && !isPositiveInteger(config.sessionIdleThresholdMs)) {
+    return Promise.reject(
+      new Error(
+        `ccctl: sessionIdleThresholdMs must be a positive integer (got \`${String(config.sessionIdleThresholdMs)}\`) — ` +
+          "it is the ms a session may sit idle before the nudge, and a non-positive/NaN value would fire it immediately, not after the lull",
       ),
     );
   }
