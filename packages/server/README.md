@@ -67,7 +67,13 @@ session-naming events onto that same stream: a **blocking needs-input notificati
 once a session has sat idle past its threshold. Both are `ccctl_`-namespaced (so the
 browser's decoder never mistakes them for a worker transcript frame) and both name the
 session in the payload, so a consumer identifies WHICH session needs attention — never a
-generic "a session needs you". Upstream, the browser steers a
+generic "a session needs you". These are the two firewalled **notification classes**
+([#44](https://github.com/alexey-pelykh/ccctl/issues/44)): each payload also carries its
+`notification_class` and the handling policy that rides with it — the needs-input
+notification is **blocking** (high-urgency, re-nudgeable, never batched), the idle nudge
+**informational** (quiet, batchable, never re-nudged) — so a consumer keys its handling on
+the class instead of re-deriving urgency from the event type, and an informational event can
+never escalate into or masquerade as the blocking class. Upstream, the browser steers a
 chosen session with a `fetch` **POST** to `/api/sessions/{id}/command`: a `prompt`
 becomes a `{ type: "user" }` turn injected on that session's worker downstream, any
 other verb a `control_request` — both pushed as a `client_event` frame. Naming the
