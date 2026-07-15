@@ -268,3 +268,52 @@ describe("createPtySessionLauncher (#30 owned-pty backend)", () => {
     await expect(launcher.launch(OPTIONS)).rejects.toThrow(/non-empty worker command/);
   });
 });
+
+// The owned pty's liveness reading (#35). Only TWO of the four readings are reachable here, and that
+// is a property of this backend rather than a gap: `taken-over` needs a surface an operator can reach,
+// and this one is explicitly not attachable; `unknown` needs a host to interrogate, and this backend
+// owns its child and watches it exit directly.
+describe("createPtySessionLauncher liveness (#35)", () => {
+  it("reads a running pty as `alive-server-owned` — the server owns this child", async () => {
+    const { pty } = makeFakePty();
+    const launcher = createPtySessionLauncher({ workerCommand, spawn: recordingSpawner(pty).spawn });
+
+    const session = await launcher.launch(OPTIONS);
+
+    await expect(session.liveness()).resolves.toBe("alive-server-owned");
+  });
+
+  it("reads a pty whose child already exited as `exited` (AC4)", async () => {
+    const { pty, fireExit } = makeFakePty();
+    const launcher = createPtySessionLauncher({ workerCommand, spawn: recordingSpawner(pty).spawn });
+    const session = await launcher.launch(OPTIONS);
+
+    fireExit(); // the worker exited on its own
+
+    await expect(session.liveness()).resolves.toBe("exited");
+  });
+
+  it("reads `exited` after its own close() reaped the child — probe and teardown cannot disagree", async () => {
+    const { pty } = makeFakePty();
+    const launcher = createPtySessionLauncher({ workerCommand, spawn: recordingSpawner(pty).spawn });
+    const session = await launcher.launch(OPTIONS);
+
+    await session.close();
+
+    // Both read the same `exited` flag, so a second teardown pass over this handle sees a surface that
+    // is gone (a no-op) rather than one it thinks it still owns.
+    await expect(session.liveness()).resolves.toBe("exited");
+  });
+
+  it("never reports `taken-over` — an unattachable surface cannot be taken over", async () => {
+    // The reading follows the degradation this backend already reports: `attachable: false` means there
+    // is no way for an operator to reach this pty except through the ccctl UI, which IS the server.
+    const { pty } = makeFakePty();
+    const launcher = createPtySessionLauncher({ workerCommand, spawn: recordingSpawner(pty).spawn });
+
+    const session = await launcher.launch(OPTIONS);
+
+    expect(session.attachment.attachable).toBe(false);
+    expect(await session.liveness()).not.toBe("taken-over");
+  });
+});

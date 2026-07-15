@@ -54,6 +54,7 @@ import {
   type ISessionLauncher,
   type LaunchedSession,
   type SessionLaunchOptions,
+  type SurfaceLiveness,
 } from "./session-launcher.js";
 
 /** The default tmux binary — a bare name resolved on `PATH`; override for a pinned path. */
@@ -84,6 +85,30 @@ export const DEFAULT_WORKER_WINDOW_NAME = "claude";
  * attach hint; the `session:index` is captured alongside it only because it is what a human reads.
  */
 const TMUX_TARGET_FORMAT = "#{window_id} #{session_name}:#{window_index}";
+
+/**
+ * The `-F` format the LIVENESS probe (#35) enumerates every window with: the window's durable id, the
+ * session it currently lives in, and whether that session has a client attached. Those three fields
+ * are exactly what "is this surface still up, and is it still OURS?" decomposes into for a tmux
+ * window — see {@link readWindowLiveness} for how each is read.
+ *
+ * Measured against a real tmux (3.7b), because the alternative spelling of this probe is a trap:
+ *
+ *   list-windows -a -F '…'      → rc=0, one line per window, every window on the server ✓
+ *   list-windows -t @99         → rc=1, `can't find window: @99`                        ✓ fails closed
+ *   display-message -p -t @99   → **rc=0, and an EMPTY expansion**                      ✗
+ *
+ * That last line is why this probe enumerates rather than targets: `display-message` against a window
+ * that does not exist SUCCEEDS and prints an empty string, so a probe built on it cannot tell "the
+ * window is gone" from "tmux answered nothing" — and would have to guess, at a call site whose wrong
+ * guess kills the operator's session. Enumerating asks one question tmux answers unambiguously (which
+ * windows exist), and absence from that list is a fact rather than an inference.
+ *
+ * `-a` (all sessions, not just ours) is load-bearing for the same reason: a window an operator MOVED
+ * out of the ccctl session is still alive and must be found, so that it can be reported `taken-over`
+ * rather than mistaken for gone.
+ */
+const TMUX_LIVENESS_FORMAT = "#{window_id} #{session_name} #{session_attached}";
 
 /**
  * Escape a value tmux will FORMAT-EXPAND before it uses it — `#` is tmux's format sigil, and `##` is
@@ -218,6 +243,71 @@ export function defaultWorkerBinaryProbe(command: string, cwd: string): boolean 
       return false;
     }
   });
+}
+
+/**
+ * Read ONE window's {@link SurfaceLiveness} out of a {@link TMUX_LIVENESS_FORMAT} enumeration (#35) —
+ * the pure half of the tmux liveness probe, so what "still server-owned" MEANS for a tmux window is a
+ * function over tmux's own output rather than something buried in a promise chain.
+ *
+ * The three answers this backend can give, and what each is read from:
+ *
+ *   - **`exited`** — `windowId` is absent from the enumeration. tmux listed every window it has and
+ *     ours was not among them, so it is gone (the worker exited, the operator closed it).
+ *   - **`taken-over`** — the window is alive, but it is no longer ccctl's to reap. TWO ways, both of
+ *     which mean a human took it:
+ *       1. it is in a DIFFERENT session than the one this backend launches into — the operator moved
+ *          it out (`move-window`) into their own workspace, which is a takeover stated as plainly as
+ *          tmux lets one state it;
+ *       2. its session has a client ATTACHED (`#{session_attached}` ≠ 0) — someone is sitting at that
+ *          session right now. This backend's own attach hint is `select-window -t @id ; attach -t
+ *          ccctl`, so attaching to the shared ccctl session IS the takeover this rule exists for.
+ *   - **`alive-server-owned`** — the window is in our session and nothing is attached to it. Nobody is
+ *     there; it is still ours, and teardown may reap it.
+ *
+ * **Why session-level attachment, and not `#{window_active_clients}`.** tmux can report which clients
+ * are VIEWING one specific window, which is narrower and tempting: it would let teardown reap the
+ * other windows of a session the operator is attached to. It is rejected deliberately. A client
+ * attached to the ccctl session but currently looking at window B has not stopped owning window A —
+ * they are one `C-b n` away from it, and may have been driving it a minute ago. That is precisely an
+ * AMBIGUOUS case, and the ambiguous case is biased toward not killing (`session-release.ts`). The
+ * accepted cost is stated rather than hidden: an operator who leaves a client attached to the ccctl
+ * session keeps ALL of its windows through a teardown. They are windows in a session that operator is
+ * sitting in, one keystroke from closing — which is the cheap side of this trade, against destroying
+ * work that has no undo.
+ *
+ * **Parsed from the OUTSIDE IN, because a tmux session name may contain spaces.** The id is the first
+ * field and the attach count is the LAST; everything between them is the session name, however many
+ * spaces it has (`tmux new-session -s 'my session'` is legal). Destructuring the first three
+ * whitespace-separated fields instead would shift every field right of a spaced name — and that
+ * misparse has a kill in it: a window sitting in a session named `ccctl 0` would read as
+ * `("ccctl", "0")`, i.e. our session, unattached, ours to reap. Contrived, but this function's whole
+ * job is to be right when something is contrived, so it reads the fields where tmux actually puts them.
+ *
+ * Every unreadable field then falls to the safe side: a malformed line will not match `windowId` (and
+ * so cannot make a live window look dead — it reads `exited`, and teardown of an already-gone surface
+ * is a harmless no-op), and a session name or attach count that is not exactly ours / not exactly `0`
+ * reads as `taken-over` rather than as ours to kill.
+ */
+export function readWindowLiveness(enumeration: string, windowId: string, sessionName: string): SurfaceLiveness {
+  for (const line of enumeration.split("\n")) {
+    const fields = line.trim().split(/\s+/);
+    if (fields[0] !== windowId) {
+      continue;
+    }
+    // From the outside in: `@id <session name, possibly spaced> <attached>`. A line too short to hold
+    // all three yields a session/attach pair that cannot equal ours — which reads `taken-over`, the
+    // safe side.
+    const session = fields.slice(1, -1).join(" ");
+    const attached = fields.length > 1 ? fields[fields.length - 1] : "";
+    if (session !== sessionName || attached !== "0") {
+      // Moved out of our session, or a client is attached to the session holding it — a human has it.
+      return "taken-over";
+    }
+    return "alive-server-owned";
+  }
+  // tmux listed every window it has, and ours was not one of them.
+  return "exited";
 }
 
 /** The promisified `execFile` — resolves `{ stdout, stderr }`, rejects on non-zero exit / spawn failure. */
@@ -359,6 +449,33 @@ export function createTmuxSessionLauncher(config: TmuxSessionLauncherConfig): IS
           // `session:index` is not used here — it is what a human recognizes, but it goes stale the
           // moment any window before it closes.
           hint: `${tmuxBin} select-window -t ${windowId} \\; attach -t ${sessionName}`,
+        },
+        async liveness(): Promise<SurfaceLiveness> {
+          // ONE enumeration of every window tmux has, then a pure read of ours out of it
+          // ({@link readWindowLiveness}) — see {@link TMUX_LIVENESS_FORMAT} for why this asks
+          // `list-windows` rather than targeting the window with `display-message` (which SUCCEEDS,
+          // with an empty answer, against a window that does not exist).
+          //
+          // Probed live at each teardown rather than captured at launch: the whole question is
+          // whether something CHANGED since launch — the operator attached, or moved the window out,
+          // or it died — and a value captured at launch could only ever say what was true then.
+          try {
+            return readWindowLiveness(
+              await runner(["list-windows", "-a", "-F", TMUX_LIVENESS_FORMAT]),
+              windowId,
+              sessionName,
+            );
+          } catch {
+            // tmux could not be asked at all: no server is running (rc=1), the binary is gone, the
+            // socket is unreachable. We do not know what became of this window, and `unknown` is the
+            // honest word for that — the release rule reads it as do-not-kill, which is the safe
+            // direction (`session-release.ts`). Deliberately NOT narrowed further: tmux reports these
+            // as a non-zero exit plus stderr prose, and classifying by parsing prose is exactly what
+            // this backend refuses to do everywhere else (see the `backend-unavailable` catch in
+            // `launch`). A dead tmux server has taken our window with it, so the cost of the cautious
+            // answer here is a handle held to shutdown, not a real leak.
+            return "unknown";
+          }
         },
         async close(): Promise<void> {
           if (closed) {

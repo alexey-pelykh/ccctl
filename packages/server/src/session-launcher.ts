@@ -79,8 +79,58 @@ export interface TerminalAttachment {
 }
 
 /**
+ * What one READING of a launched surface says about it (#35) — the answer the safe-teardown rule
+ * (`session-release.ts`) decides by before it may close anything. Four values, because teardown has
+ * three distinct dispositions and one of them must be reachable without certainty:
+ *
+ *   - `alive-server-owned` — the surface is up and STILL THIS SERVER'S: nobody took it over, so
+ *     tearing it down destroys nothing but what we ourselves brought up.
+ *   - `taken-over` — the surface is up but the OPERATOR has it: they attached at their own desk and
+ *     are driving it by hand. Killing it destroys live human work, which is the one thing teardown
+ *     must never do (`SRV-B-003`).
+ *   - `exited` — the surface is already gone (the worker exited, the operator closed the window).
+ *     Teardown is a no-op: there is nothing left to close and nothing to be sorry about.
+ *   - `unknown` — the backend could not tell. A FIRST-CLASS answer, not a failure to paper over:
+ *     a probe that cannot see the surface must be able to SAY so, because the alternative is
+ *     guessing, and one of the two guesses kills live work.
+ *
+ * **Why this is not the boolean {@link ProcessLivenessProbe} the orphan-reaper (#34) uses.** That
+ * probe decides whether to retain or evict a RECORD, and a record has no stake: get it wrong and a
+ * row is wrong. This reading decides whether to KILL, so "alive" is not one state but two — alive
+ * and ours, alive and theirs — and the difference between them is the entire safety property. A
+ * boolean cannot carry it, and `unknown` has nowhere to live in one at all.
+ *
+ * **`taken-over` is about SERVER OWNERSHIP, not tmux's attach state.** The word the AC uses for it
+ * is "detached", meaning detached from THIS SERVER's ownership — the operator has taken the surface
+ * over. It is the opposite of tmux's own "detached session" (which has no client and, for the tmux
+ * backend, is precisely the still-ours case). The vocabulary here is ccctl's, deliberately, so the
+ * rule reads as what it decides rather than as one backend's jargon.
+ */
+export type SurfaceLiveness = "alive-server-owned" | "taken-over" | "exited" | "unknown";
+
+/** The pinned {@link SurfaceLiveness} set, in one place, for the release rule's decision map and the tests. */
+export const SURFACE_LIVENESS_READINGS: readonly SurfaceLiveness[] = [
+  "alive-server-owned",
+  "taken-over",
+  "exited",
+  "unknown",
+];
+
+/**
+ * Runtime guard for {@link SurfaceLiveness} — fails closed on anything outside the pinned set, exactly
+ * as {@link isLaunchFailureCode} does for the other closed set that crosses this port. Structural
+ * rather than by identity, so a reading that crossed a module boundary is still recognized; but a word
+ * this server does not know is NOT one it will act on — the release rule reads it as `unknown`
+ * ({@link releaseLaunchedSession}), which is the do-not-kill side.
+ */
+export function isSurfaceLiveness(value: unknown): value is SurfaceLiveness {
+  return typeof value === "string" && (SURFACE_LIVENESS_READINGS as readonly string[]).includes(value);
+}
+
+/**
  * A handle to one launched session's terminal surface. Owns that surface's lifecycle:
- * {@link LaunchedSession.attachment} tells the operator how to reach it, and
+ * {@link LaunchedSession.attachment} tells the operator how to reach it,
+ * {@link LaunchedSession.liveness} reports whether it is still up and still ours (#35), and
  * {@link LaunchedSession.close} tears it down (for the owned pty, #30: close the file
  * descriptor and reap the child). Mirrors the e2e `PatchedWorkerHandle`.
  */
@@ -88,8 +138,37 @@ export interface LaunchedSession {
   /** How the operator attaches to this surface (and whether they fully can). */
   readonly attachment: TerminalAttachment;
   /**
+   * Read this surface's {@link SurfaceLiveness} — is it still up, and is it still THIS SERVER'S
+   * (#35)? The oracle every teardown consults before it may close anything
+   * ({@link releaseLaunchedSession}); by itself it changes nothing.
+   *
+   * **On the handle, because only the backend can answer it.** "Is my surface taken over" is not a
+   * fact about processes in general — it is a fact about THIS backend's surface, readable only in
+   * that backend's own terms (a tmux window's session attach-state; an owned pty's child exit). The
+   * backend already holds what it needs to answer, which is also why this needs no durable
+   * launch-marker: teardown runs WITHIN the process that launched the surface and still holds this
+   * handle, unlike the across-restart orphan-reaper (#34), which has lost its handles and must
+   * correlate by a {@link LaunchMarker} instead.
+   *
+   * **REQUIRED, not optional, and that is a safety choice.** An optional probe has no safe default:
+   * absent-reads-as-alive silently kills the operator's session (the bug this exists to fix), and
+   * absent-reads-as-unknown silently leaks every surface on every shutdown. So every backend must
+   * answer, and `tsc` — not a doc comment — is what holds a backend to it.
+   *
+   * MAY reject: a probe that throws is read as `unknown` by {@link releaseLaunchedSession}, which is
+   * the safe direction, so a backend never has to invent an answer to avoid throwing. Returning
+   * `unknown` explicitly is preferred where the backend knows it cannot see.
+   */
+  liveness(): Promise<SurfaceLiveness>;
+  /**
    * Tear down the launched surface — release its resources and reap any child process.
    * Safe to call more than once (idempotent); resolves once teardown is complete.
+   *
+   * The raw MECHANISM, unconditional by design: it closes whatever it is pointed at, asking
+   * nothing. The POLICY that decides whether it may be called at all — probe
+   * {@link LaunchedSession.liveness} first, and never kill a surface the operator took over — lives
+   * in exactly one place, {@link releaseLaunchedSession} (#35). Server teardown paths go through
+   * that; a direct `close()` is the unguarded edge and is reserved for the rule itself.
    */
   close(): Promise<void>;
 }

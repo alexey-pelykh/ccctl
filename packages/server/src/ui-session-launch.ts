@@ -72,6 +72,7 @@ import {
   type SessionLaunchOptions,
   type TerminalAttachment,
 } from "./session-launcher.js";
+import { releaseLaunchedSession } from "./session-release.js";
 import { UI_SESSIONS_PATH } from "./ui-sessions.js";
 
 /**
@@ -265,7 +266,7 @@ export interface LaunchOutcome {
  *
  * The guards run BEFORE the launcher, in cheapest-first order, so a refused launch spawns nothing
  * at all and touches no state. On success — and only then — the handle is recorded (so
- * {@link closeLaunchedSessions} tears the terminal down on shutdown) and the `registering` session
+ * {@link releaseLaunchedSessions} tears the terminal down on shutdown) and the `registering` session
  * + its eviction timer are armed ({@link trackPendingLaunch}). Mirrors the {@link injectUserTurn}
  * shared-core seam (one behavior, two entry points).
  *
@@ -346,25 +347,40 @@ export function handleSessionLaunch(req: IncomingMessage, res: ServerResponse, s
 }
 
 /**
- * Tear down everything the launch subsystem owns — invoked on shutdown alongside the worker-channel
+ * Release everything the launch subsystem owns — invoked on shutdown alongside the worker-channel
  * and SSE teardown in `index.ts`. Two halves, in this order:
  *
  *   1. DISARM every pending eviction ({@link clearPendingLaunches}) — a timer left armed past
- *      shutdown would fire against a dead server's state, and would double-close a terminal step 2
- *      is about to close anyway.
- *   2. CLOSE every launched terminal — including the still-`registering` ones, whose surfaces are
- *      just as real as a live session's. Best-effort and fire-and-forget: each
- *      {@link LaunchedSession.close} is idempotent and swallows its own errors (a window the
- *      operator already closed), so a stray reject here must never break `close()`.
+ *      shutdown would fire against a dead server's state, and would double-release a terminal step 2
+ *      is about to handle anyway.
+ *   2. RELEASE every launched terminal — including the still-`registering` ones, whose surfaces are
+ *      just as real as a live session's. Through {@link releaseLaunchedSession} (#35), never
+ *      `close()` directly: shutting the daemon down must not kill a session the operator has taken
+ *      over at their desk, so each surface is PROBED and only torn down if it is still this server's.
+ *      A taken-over surface (and one whose liveness could not be read) is left running — the operator
+ *      keeps working, and ccctl simply exits without it.
  *
- * Clears both collections, so a second shutdown is a no-op.
+ * "ccctl simply exits without it" is true of the TMUX backend on its own terms — that window lives in
+ * a separate tmux server and never held this process open. For the OWNED-PTY backend it is true only
+ * because that backend's `liveness()` is TOTAL: it answers `alive-server-owned` or `exited` and
+ * nothing else, so its child is always reaped here. A pty left running would be an un-reaped child on
+ * an open fd, and the shape of that dependency is worth knowing before touching either side — it is
+ * stated at the pty probe itself (`session-launcher-pty.ts` § `liveness`).
+ *
+ * Fire-and-forget, exactly as before: {@link releaseLaunchedSession} resolves rather than rejecting
+ * (it swallows a `close()` that lost a race to an already-gone window), so a stray reject can never
+ * break `close()`. Named `release…` rather than `close…` because that is now what it does — a name
+ * that promised an unconditional close would be a lie about the rule this function's whole purpose is
+ * to obey.
+ *
+ * Clears both collections, so a second shutdown is a no-op. The handles are dropped even for the
+ * surfaces left running: the server is going away, so it is not going to re-probe them — they are the
+ * operator's now, which is the point.
  */
-export function closeLaunchedSessions(state: SessionLaunchState): void {
+export function releaseLaunchedSessions(state: SessionLaunchState): void {
   clearPendingLaunches(state);
   for (const launched of state.launchedSessions) {
-    void launched.close().catch(() => {
-      // Swallow: teardown is best-effort; the terminal may already be gone.
-    });
+    void releaseLaunchedSession(launched);
   }
   state.launchedSessions.clear();
 }

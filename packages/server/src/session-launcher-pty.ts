@@ -47,6 +47,7 @@ import {
   type ISessionLauncher,
   type LaunchedSession,
   type SessionLaunchOptions,
+  type SurfaceLiveness,
 } from "./session-launcher.js";
 // The worker-argv seam is shared by every backend (turn one launch's options into the patched
 // worker's argv); it is defined once alongside the first backend (tmux, #29) and imported here as
@@ -283,6 +284,33 @@ export function createPtySessionLauncher(config: PtySessionLauncherConfig): ISes
           // terminal (unlike a tmux window) — surfaced honestly rather than hidden.
           attachable: false,
           hint: DEGRADED_ATTACH_HINT,
+        },
+        liveness(): Promise<SurfaceLiveness> {
+          // An owned pty has exactly TWO liveness readings, and that is a consequence of the
+          // degradation this backend already reports rather than a gap in the probe. `taken-over`
+          // means the operator reached the surface and took it from the server — and there IS no way
+          // to reach this one: it is not attachable ({@link TerminalAttachment.attachable} `false`,
+          // {@link DEGRADED_ATTACH_HINT}), so it can only ever be driven through the ccctl UI, which
+          // is the server driving it. Nobody can take over a surface they cannot attach to. And
+          // `unknown` never applies either: this backend OWNS the child and observes its exit
+          // directly through {@link OwnedPty.onExit} — there is no host to interrogate, nothing to
+          // fail, and so nothing to be uncertain about.
+          //
+          // Read from the SAME `exited` flag `close()` already trusts to decide whether the child
+          // still needs signalling, so the probe and the teardown can never disagree about whether
+          // this pty is up.
+          //
+          // **This totality is LOAD-BEARING for shutdown, so do not "improve" it into an `unknown`.**
+          // Every reading here is one the release rule (`session-release.ts`) either tears down or
+          // treats as already-gone — so an owned pty is ALWAYS reaped at shutdown. That is what makes
+          // `releaseLaunchedSessions`' "a surface left running is simply left to the operator"
+          // (`ui-session-launch.ts`) safe to say: a LEFT-RUNNING pty would be an un-reaped child with
+          // an open (never `unref`ed) pty fd, which is a leak the tmux backend cannot have — its
+          // window lives in a separate tmux server, ours does not. The trap is that `unknown` is the
+          // SAFE answer everywhere else in this rule, so adding a `catch { return "unknown" }` here to
+          // "harden" the probe would look like an improvement while quietly stranding a child on every
+          // exit. If this backend ever gains a reading it cannot make, `unref()` the pty first.
+          return Promise.resolve(exited ? "exited" : "alive-server-owned");
         },
         async close(): Promise<void> {
           if (closed) {

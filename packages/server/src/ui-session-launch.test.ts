@@ -12,6 +12,7 @@ import {
   type ISessionLauncher,
   type LaunchedSession,
   type SessionLaunchOptions,
+  type SurfaceLiveness,
 } from "./session-launcher.js";
 
 // The "New session" launch path (#31) and its failure handling (#33), exercised END TO END through
@@ -52,15 +53,24 @@ afterAll(() => {
   rmSync(fixtureRoot, { recursive: true, force: true });
 });
 
-/** A recording fake launcher: resolves with a tagged handle, remembers launches, counts closes. */
+/**
+ * A recording fake launcher: resolves with a tagged handle, remembers launches, counts closes.
+ *
+ * Every handle it hands out reports the launcher's CURRENT `liveness` reading, which a test can flip
+ * at any time (`launcher.liveness = "taken-over"`) — that is how "the operator attached to it AFTER it
+ * was launched" is expressed, which is the whole hazard #35 addresses. Defaults to
+ * `alive-server-owned`: an ordinary launched surface nobody has touched, which teardown may reap.
+ */
 function fakeLauncher(hint = "tmux attach -t ccctl:1", attachable = true) {
   const launches: SessionLaunchOptions[] = [];
   let closes = 0;
+  const state = { liveness: "alive-server-owned" as SurfaceLiveness };
   const launcher: ISessionLauncher = {
     launch(options: SessionLaunchOptions): Promise<LaunchedSession> {
       launches.push(options);
       return Promise.resolve({
         attachment: { attachable, hint },
+        liveness: (): Promise<SurfaceLiveness> => Promise.resolve(state.liveness),
         close: (): Promise<void> => {
           closes += 1;
           return Promise.resolve();
@@ -68,7 +78,15 @@ function fakeLauncher(hint = "tmux attach -t ccctl:1", attachable = true) {
       });
     },
   };
-  return { launcher, launches, closeCount: (): number => closes };
+  return {
+    launcher,
+    launches,
+    closeCount: (): number => closes,
+    /** Flip what every handle from this launcher reports — e.g. the operator just took the session over. */
+    setLiveness: (liveness: SurfaceLiveness): void => {
+      state.liveness = liveness;
+    },
+  };
 }
 
 /** A launcher that always rejects with `error` — the "no surface could be brought up" family (#33). */
@@ -667,5 +685,36 @@ describe("CcctlServer.launchSession (programmatic)", () => {
     expect(closeCount()).toBe(0);
     await server.close();
     expect(closeCount()).toBe(2);
+  });
+
+  // Rule: A taken-over session is not killed — WIRED THROUGH shutdown (#35 AC2).
+  //
+  // The rule itself is pinned hermetically in `session-release.test.ts`; this proves the daemon's
+  // shutdown path actually GOES through it. Without the wiring, `session-release.ts` is a correct
+  // rule nothing consults, and shutdown still kills the operator's session.
+  it("does NOT kill a session the operator took over, on close() (#35)", async () => {
+    const { launcher, closeCount, setLiveness } = fakeLauncher();
+    const server = await startServer({ port: 0, host: DEFAULT_HOST, launcher, registrationTimeoutMs: 60_000 });
+    await server.launchSession({ cwd: CWD, permissionMode: "default" });
+    // The operator sat down at their desk, attached to the surface, and is now driving it by hand.
+    setLiveness("taken-over");
+
+    await server.close();
+
+    // ccctl exited without it. The operator keeps working.
+    expect(closeCount()).toBe(0);
+  });
+
+  it("does NOT kill a surface whose liveness could not be read, on close() (#35 AC5)", async () => {
+    const { launcher, closeCount, setLiveness } = fakeLauncher();
+    const server = await startServer({ port: 0, host: DEFAULT_HOST, launcher, registrationTimeoutMs: 60_000 });
+    await server.launchSession({ cwd: CWD, permissionMode: "default" });
+    // The backend cannot see its own surface (tmux went away mid-shutdown). A leaked terminal is the
+    // accepted cost; killing something that might be the operator's is not.
+    setLiveness("unknown");
+
+    await server.close();
+
+    expect(closeCount()).toBe(0);
   });
 });

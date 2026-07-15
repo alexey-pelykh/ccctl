@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { describe, expect, it } from "vitest";
-import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
+import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions, SurfaceLiveness } from "./session-launcher.js";
 
 // #28 ships the launcher PORT only — no backend (tmux #29 / owned-pty #30 follow). These
 // tests lock the interface as a tested contract by standing up minimal in-memory launchers
@@ -13,11 +13,14 @@ import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "./
 class FakeTmuxLauncher implements ISessionLauncher {
   lastOptions: SessionLaunchOptions | null = null;
   closeCount = 0;
+  /** The reading its handle reports — settable, since a tmux window's is the one that really varies (#35). */
+  liveness: SurfaceLiveness = "alive-server-owned";
 
   launch(options: SessionLaunchOptions): Promise<LaunchedSession> {
     this.lastOptions = options;
     return Promise.resolve({
       attachment: { attachable: true, hint: "tmux attach -t ccctl:1" },
+      liveness: (): Promise<SurfaceLiveness> => Promise.resolve(this.liveness),
       close: (): Promise<void> => {
         this.closeCount += 1;
         return Promise.resolve();
@@ -31,6 +34,7 @@ class FakePtyLauncher implements ISessionLauncher {
   launch(_options: SessionLaunchOptions): Promise<LaunchedSession> {
     return Promise.resolve({
       attachment: { attachable: false, hint: "owned pty: attach is degraded — no shared terminal to join" },
+      liveness: (): Promise<SurfaceLiveness> => Promise.resolve("alive-server-owned"),
       close: (): Promise<void> => Promise.resolve(),
     });
   }

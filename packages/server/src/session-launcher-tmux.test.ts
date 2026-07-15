@@ -9,6 +9,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   createTmuxSessionLauncher,
   defaultWorkerBinaryProbe,
+  readWindowLiveness,
   type TmuxRunner,
   type WorkerBinaryProbe,
   type WorkerCommandFactory,
@@ -30,12 +31,20 @@ function makeFakeRunner(config?: {
   readonly sessionExists?: boolean;
   /** What `new-window -P -F` prints: `"<window-id> <session>:<index>"`. Default: `"@1 ccctl:1"`. */
   readonly newWindowTarget?: string;
+  /**
+   * What `list-windows -a -F` prints for the liveness probe (#35) — one `"<id> <session> <attached>"`
+   * line per window. Default: the launched `@1` alive in a detached `ccctl` session (still ours).
+   * The shape is transcribed from a REAL tmux 3.7b (see `session-launcher-tmux.ts` §
+   * `TMUX_LIVENESS_FORMAT`), not invented here.
+   */
+  readonly listWindows?: string;
   /** Inject a failure for calls matching a subcommand (e.g. simulate tmux absent / window gone). */
   readonly failSubcommand?: { readonly sub: string; readonly error: Error };
 }): { readonly runner: TmuxRunner; readonly calls: readonly string[][] } {
   const calls: string[][] = [];
   const sessionExists = config?.sessionExists ?? false;
   const target = config?.newWindowTarget ?? "@1 ccctl:1";
+  const listWindows = config?.listWindows ?? "@1 ccctl 0";
   const runner: TmuxRunner = (args: readonly string[]): Promise<string> => {
     calls.push([...args]);
     const sub = args[0];
@@ -47,6 +56,9 @@ function makeFakeRunner(config?: {
     }
     if (sub === "new-window") {
       return Promise.resolve(target);
+    }
+    if (sub === "list-windows") {
+      return Promise.resolve(listWindows);
     }
     // new-session / kill-window / anything else: succeed with no output.
     return Promise.resolve("");
@@ -83,6 +95,12 @@ const TMUX_INSTALLED = ((): boolean => {
 
 const REAL_TMUX_SESSION = `ccctl-it-${process.pid}`;
 
+/** The session whose sole job is to hold a tmux window that ATTACHES to {@link REAL_TMUX_SESSION} (#35). */
+const OUTER_TMUX_SESSION = `ccctl-it-outer-${process.pid}`;
+
+/** A session standing in for the operator's OWN workspace — somewhere to `move-window` a surface to (#35). */
+const ELSEWHERE_TMUX_SESSION = `ccctl-it-elsewhere-${process.pid}`;
+
 // `.native` is load-bearing, and the first run of the node-based fixture worker below proved why: on
 // macOS `tmpdir()` is `/var/folders/…`, a symlink to `/private/var/folders/…`, and the worker's
 // `getcwd(3)` reports the latter. Canonicalizing the root makes the launch cwd the same spelling the
@@ -95,10 +113,12 @@ afterAll(() => {
   if (!TMUX_INSTALLED) {
     return;
   }
-  try {
-    execFileSync("tmux", ["kill-session", "-t", REAL_TMUX_SESSION], { stdio: "ignore" });
-  } catch {
-    // The session may never have been created, or already be gone — teardown is best-effort.
+  for (const session of [OUTER_TMUX_SESSION, ELSEWHERE_TMUX_SESSION, REAL_TMUX_SESSION]) {
+    try {
+      execFileSync("tmux", ["kill-session", "-t", session], { stdio: "ignore" });
+    } catch {
+      // The session may never have been created, or already be gone — teardown is best-effort.
+    }
   }
   rmSync(realTmuxRoot, { recursive: true, force: true });
 });
@@ -141,6 +161,46 @@ describe.skipIf(!TMUX_INSTALLED)("createTmuxSessionLauncher against a REAL tmux"
       .toString()
       .trim()
       .split("\n");
+  }
+
+  /** The durable `@id` of the window launched under `project` — the handle its liveness is keyed on (#35). */
+  function windowIdNamed(project: string): string {
+    const line = execFileSync("tmux", ["list-windows", "-a", "-F", "#{window_name} #{window_id}"])
+      .toString()
+      .trim()
+      .split("\n")
+      .find((entry) => entry.startsWith(`${project} `));
+    if (line === undefined) {
+      throw new Error(`ccctl test: no real tmux window named \`${project}\``);
+    }
+    return line.split(" ")[1] ?? "";
+  }
+
+  /**
+   * Wait until tmux reports {@link REAL_TMUX_SESSION} as attached (or not) — polled, because a client
+   * attaching is a THIRD process handshaking with the tmux server, so it is not observable the instant
+   * `new-session` returns. Polling tmux's own answer beats sleeping a guess: it fails fast and loud on
+   * a real regression instead of going flaky under load.
+   */
+  async function waitForAttachState(attached: boolean): Promise<void> {
+    const want = attached ? "1" : "0";
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const reading = execFileSync("tmux", [
+        "display-message",
+        "-p",
+        "-t",
+        REAL_TMUX_SESSION,
+        "-F",
+        "#{session_attached}",
+      ])
+        .toString()
+        .trim();
+      if (reading === want) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`ccctl test: tmux never reported session_attached=${want}`);
   }
 
   it("boots the worker in the cwd it was launched at, even when the path contains a tmux format", async () => {
@@ -210,6 +270,90 @@ describe.skipIf(!TMUX_INSTALLED)("createTmuxSessionLauncher against a REAL tmux"
 
     await live.close();
   });
+
+  // The LIVENESS probe (#35) against the real binary — and this is the half that most needs it. The
+  // fake runner above can only replay a string I wrote; it agrees with whatever I believed
+  // `#{session_attached}` means. Only tmux can say. This is the same lesson the escaping test above
+  // learned the hard way: a fully green suite proved nothing until the real binary was given a chance
+  // to disagree.
+  describe("liveness (#35)", () => {
+    /** A launcher on the real ccctl test session, launching a worker that just lingers. */
+    function realLauncher(): ReturnType<typeof createTmuxSessionLauncher> {
+      return createTmuxSessionLauncher({
+        sessionName: REAL_TMUX_SESSION,
+        workerCommand: (): readonly string[] => [process.execPath, "-e", "setTimeout(() => {}, 10000);"],
+      });
+    }
+
+    it("reads a launched, unattached window as `alive-server-owned` — nobody has taken it", async () => {
+      const launched = await realLauncher().launch({ cwd: realTmuxRoot, permissionMode: "default", project: "owned" });
+
+      // Ground truth: tmux really does report `#{session_attached}` as `0` for a session no client is
+      // on. If it did not, this reads `taken-over` and teardown would never reap anything again.
+      await expect(launched.liveness()).resolves.toBe("alive-server-owned");
+
+      await launched.close();
+    });
+
+    it("reads a window whose session an operator has ATTACHED to as `taken-over` (AC2)", async () => {
+      const launched = await realLauncher().launch({
+        cwd: realTmuxRoot,
+        permissionMode: "default",
+        project: "attached",
+      });
+      expect(await launched.liveness()).toBe("alive-server-owned");
+
+      // The operator sits down and attaches to the ccctl session. Staged with tmux itself as the pty —
+      // `tmux attach` needs a terminal, and an outer tmux window IS one, which keeps this portable (no
+      // node-pty, no platform-specific `script`). `TMUX=` is load-bearing: tmux refuses to nest a
+      // client into a window that already has one, and unsetting it is how you say "yes, really".
+      execFileSync("tmux", [
+        "new-session",
+        "-d",
+        "-s",
+        OUTER_TMUX_SESSION,
+        `TMUX= tmux attach -t ${REAL_TMUX_SESSION}`,
+      ]);
+      await waitForAttachState(true);
+
+      // THE SCENARIO: "a launched session the operator has attached to and is driving locally".
+      await expect(launched.liveness()).resolves.toBe("taken-over");
+
+      // …and when they detach, they have handed it back: the surface is the server's to reap again.
+      execFileSync("tmux", ["kill-session", "-t", OUTER_TMUX_SESSION]);
+      await waitForAttachState(false);
+      await expect(launched.liveness()).resolves.toBe("alive-server-owned");
+
+      await launched.close();
+    });
+
+    it("reads a window the operator MOVED out of the ccctl session as `taken-over`", async () => {
+      const launched = await realLauncher().launch({ cwd: realTmuxRoot, permissionMode: "default", project: "moved" });
+      const windowId = windowIdNamed("moved");
+
+      // `move-window` into the operator's own workspace — a takeover stated about as plainly as tmux
+      // lets one state it. The window is alive and findable (`-a` spans every session), but it is not
+      // in ours, so it is not ours to reap.
+      execFileSync("tmux", ["new-session", "-d", "-s", ELSEWHERE_TMUX_SESSION, "-n", "keep", "sleep 10"]);
+      execFileSync("tmux", ["move-window", "-s", windowId, "-t", `${ELSEWHERE_TMUX_SESSION}:`]);
+
+      await expect(launched.liveness()).resolves.toBe("taken-over");
+
+      execFileSync("tmux", ["kill-session", "-t", ELSEWHERE_TMUX_SESSION]);
+    });
+
+    it("reads a window that is gone as `exited` — absence from the enumeration is the fact", async () => {
+      const launched = await realLauncher().launch({ cwd: realTmuxRoot, permissionMode: "default", project: "gone" });
+      const windowId = windowIdNamed("gone");
+
+      // The operator closed the window (or the worker exited on its own).
+      execFileSync("tmux", ["kill-window", "-t", windowId]);
+
+      await expect(launched.liveness()).resolves.toBe("exited");
+      // And teardown of it is the AC4 no-op: it completes, without error.
+      await expect(launched.close()).resolves.toBeUndefined();
+    });
+  });
 });
 
 describe("createTmuxSessionLauncher (#29 tmux backend)", () => {
@@ -250,6 +394,96 @@ describe("createTmuxSessionLauncher (#29 tmux backend)", () => {
     // if tmux has renumbered it since launch. `attach -t ccctl:3` would be a stale coordinate.
     expect(session.attachment.attachable).toBe(true);
     expect(session.attachment.hint).toBe("tmux select-window -t @7 \\; attach -t ccctl");
+  });
+
+  // The liveness probe's WIRING (#35): the argv it asks tmux, that it keys on the window this launch
+  // actually opened, and how it behaves when tmux cannot be asked at all. What the readings MEAN is
+  // `readWindowLiveness`'s own block below; that they are true of a real tmux is the fenced block above.
+  describe("liveness (#35)", () => {
+    it("enumerates windows with `list-windows -a`, and asks tmux nothing else", async () => {
+      const { runner, calls } = makeFakeRunner({ newWindowTarget: "@7 ccctl:3" });
+      const launcher = createTmuxSessionLauncher({ runner, workerCommand, workerBinaryProbe: workerBinaryFound });
+      const session = await launcher.launch({ cwd: "/repo", permissionMode: "default" });
+
+      await session.liveness();
+
+      // `-a` spans every session, so a window the operator MOVED out of ours is still found (and read
+      // as taken-over) rather than mistaken for gone. `display-message -t @7` is the shape NOT taken:
+      // against a missing window it exits 0 with an empty answer, which cannot be told from "tmux said
+      // nothing" — see `TMUX_LIVENESS_FORMAT`.
+      expect(callsFor(calls, "list-windows")).toEqual([
+        ["list-windows", "-a", "-F", "#{window_id} #{session_name} #{session_attached}"],
+      ]);
+      // A probe is a READ. It must never reach for a destructive verb.
+      expect(callsFor(calls, "kill-window")).toEqual([]);
+    });
+
+    it("keys the reading on THIS launch's window id, not on another window in the same session", async () => {
+      // `@7` is ours and quietly detached; `@1` is a sibling ccctl window whose session line says
+      // attached. A probe that read the first line, or "any ccctl window", answers `taken-over` and
+      // teardown never reaps anything again.
+      const { runner } = makeFakeRunner({
+        newWindowTarget: "@7 ccctl:3",
+        listWindows: "@1 ccctl 1\n@7 ccctl 0",
+      });
+      const launcher = createTmuxSessionLauncher({ runner, workerCommand, workerBinaryProbe: workerBinaryFound });
+      const session = await launcher.launch({ cwd: "/repo", permissionMode: "default" });
+
+      await expect(session.liveness()).resolves.toBe("alive-server-owned");
+    });
+
+    it("reads OUR configured session name, not the hardcoded default", async () => {
+      // A launcher configured onto a non-default session must not read every window in it as moved-out.
+      const { runner } = makeFakeRunner({ newWindowTarget: "@7 work:1", listWindows: "@7 work 0" });
+      const launcher = createTmuxSessionLauncher({
+        runner,
+        workerCommand,
+        workerBinaryProbe: workerBinaryFound,
+        sessionName: "work",
+      });
+      const session = await launcher.launch({ cwd: "/repo", permissionMode: "default" });
+
+      await expect(session.liveness()).resolves.toBe("alive-server-owned");
+    });
+
+    it("answers `unknown` when tmux cannot be asked at all — never `alive-server-owned` (AC5)", async () => {
+      // No tmux server is running (a real `list-windows` exits 1 there), the binary is gone, the socket
+      // is unreachable. We do not know what became of this window — and a probe that cannot see must
+      // never be optimized into permission to kill.
+      const { runner } = makeFakeRunner({
+        failSubcommand: { sub: "list-windows", error: new Error("no server running on /tmp/tmux-501/default") },
+      });
+      const launcher = createTmuxSessionLauncher({ runner, workerCommand, workerBinaryProbe: workerBinaryFound });
+      const session = await launcher.launch({ cwd: "/repo", permissionMode: "default" });
+
+      // It RESOLVES `unknown` rather than rejecting: the reading is the backend's honest answer, not an
+      // error for the release rule to interpret.
+      await expect(session.liveness()).resolves.toBe("unknown");
+    });
+
+    it("re-probes on every call — a reading is never cached from launch", async () => {
+      // The whole question is whether something CHANGED since launch (the operator attached, the window
+      // died). A value captured at launch could only ever say what was true then.
+      const readings = ["@7 ccctl 0", "@7 ccctl 1"];
+      let call = 0;
+      const runner: TmuxRunner = (args: readonly string[]): Promise<string> => {
+        if (args[0] === "list-windows") {
+          const reading = readings[call] ?? "";
+          call += 1;
+          return Promise.resolve(reading);
+        }
+        if (args[0] === "has-session") {
+          return Promise.resolve("");
+        }
+        return Promise.resolve(args[0] === "new-window" ? "@7 ccctl:3" : "");
+      };
+      const launcher = createTmuxSessionLauncher({ runner, workerCommand, workerBinaryProbe: workerBinaryFound });
+      const session = await launcher.launch({ cwd: "/repo", permissionMode: "default" });
+
+      expect(await session.liveness()).toBe("alive-server-owned");
+      // The operator attached in between.
+      expect(await session.liveness()).toBe("taken-over");
+    });
   });
 
   it("passes every launch parameter through to the worker command — permission mode, project, initial prompt", async () => {
@@ -585,5 +819,83 @@ describe("defaultWorkerBinaryProbe (the real PATH walk)", () => {
 
   it("fails CLOSED with no PATH at all, rather than throwing out of the launch path", () => {
     expect(withPath(undefined, () => defaultWorkerBinaryProbe("claude", probeRoot))).toBe(false);
+  });
+});
+
+// The pure half of the tmux liveness probe (#35): what a `list-windows -a -F` enumeration MEANS for
+// one window. Hermetic — no tmux, no runner, just tmux's output shape in and a reading out. The
+// enumerations below are transcribed from a real tmux 3.7b, not invented; the fenced integration
+// block above is what keeps them honest.
+describe("readWindowLiveness (#35)", () => {
+  const OURS = "ccctl";
+
+  it("reads a window in OUR session with no client attached as `alive-server-owned`", () => {
+    expect(readWindowLiveness("@1 ccctl 0", "@1", OURS)).toBe("alive-server-owned");
+  });
+
+  it("reads a window whose session has a client ATTACHED as `taken-over` (AC2)", () => {
+    // The operator is at the desk, in the ccctl session. Every window in it is in human hands.
+    expect(readWindowLiveness("@1 ccctl 1", "@1", OURS)).toBe("taken-over");
+  });
+
+  it("reads a window MOVED out of our session as `taken-over` — it is not ours anymore", () => {
+    expect(readWindowLiveness("@1 operators-own-workspace 0", "@1", OURS)).toBe("taken-over");
+  });
+
+  it("reads a window absent from the enumeration as `exited` (AC4)", () => {
+    // tmux listed every window it has; ours is not among them. That is a fact, not an inference.
+    expect(readWindowLiveness("@2 ccctl 0\n@3 ccctl 0", "@1", OURS)).toBe("exited");
+  });
+
+  it("reads an EMPTY enumeration as `exited`, never as ours to kill", () => {
+    expect(readWindowLiveness("", "@1", OURS)).toBe("exited");
+  });
+
+  it("picks OUR window out of a busy enumeration, ignoring every other window's state", () => {
+    // The decisive case for `-a`: sibling ccctl windows, an attached unrelated session, and ours —
+    // quietly detached in the middle of it. A probe that keyed on anything but our own line (the first
+    // line, the attached one, "any window in an attached session") gets this wrong.
+    const enumeration = ["@1 ccctl 0", "@2 someones-editor 1", "@3 ccctl 0", "@4 ccctl 0"].join("\n");
+
+    expect(readWindowLiveness(enumeration, "@3", OURS)).toBe("alive-server-owned");
+  });
+
+  it("does not confuse a window id with a PREFIX of another (`@1` vs `@10`)", () => {
+    // tmux ids are `@N` and go past 9 in any long-lived session. A substring/startsWith match here
+    // would read @10's state as @1's — and one of them may be the operator's.
+    expect(readWindowLiveness("@10 ccctl 1", "@1", OURS)).toBe("exited");
+    expect(readWindowLiveness("@1 ccctl 0\n@10 ccctl 1", "@10", OURS)).toBe("taken-over");
+  });
+
+  it("reads a session name containing SPACES — the fields are found where tmux puts them", () => {
+    // tmux allows spaces in a session name (`new-session -s 'my session'`), so the session name is not
+    // one whitespace-separated field. Parsed outside-in, `@1`'s session is the whole middle.
+    expect(readWindowLiveness("@1 my work session 0", "@1", "my work session")).toBe("alive-server-owned");
+    expect(readWindowLiveness("@1 my work session 1", "@1", "my work session")).toBe("taken-over");
+    // …and one moved into a spaced session that is NOT ours is still a takeover.
+    expect(readWindowLiveness("@1 someones other session 0", "@1", OURS)).toBe("taken-over");
+  });
+
+  it("does not misparse a spaced session name into OUR session plus an unattached count", () => {
+    // The kill hiding in a naive three-field destructure: a window in a session literally named
+    // `ccctl 0` would parse as ("ccctl", "0") — our session, unattached, ours to reap — and teardown
+    // would close the operator's window. Outside-in, the session reads `ccctl 0` (not ours) and the
+    // attach count reads `1`. Contrived; the point is that it cannot happen at all.
+    expect(readWindowLiveness("@1 ccctl 0 1", "@1", OURS)).toBe("taken-over");
+  });
+
+  it("falls to the SAFE side on a malformed line — never `alive-server-owned`", () => {
+    // A line we cannot parse must not become permission to kill. A truncated line cannot match our id
+    // (so it reads `exited`, and closing an already-gone surface is the harmless no-op); a garbled
+    // attach count is not `0`, so it reads `taken-over` rather than ours.
+    expect(readWindowLiveness("@1", "@1", OURS)).toBe("taken-over");
+    expect(readWindowLiveness("@1 ccctl", "@1", OURS)).toBe("taken-over");
+    expect(readWindowLiveness("@1 ccctl ?", "@1", OURS)).toBe("taken-over");
+    expect(readWindowLiveness("garbage", "@1", OURS)).toBe("exited");
+  });
+
+  it("tolerates the trailing newline and padding a real tmux emits", () => {
+    expect(readWindowLiveness("@1 ccctl 0\n", "@1", OURS)).toBe("alive-server-owned");
+    expect(readWindowLiveness("  @1 ccctl 0  \n", "@1", OURS)).toBe("alive-server-owned");
   });
 });
