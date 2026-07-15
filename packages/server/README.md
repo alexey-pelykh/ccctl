@@ -127,6 +127,11 @@ refuses to start when no local-server auth is configured — there is no
 unauthenticated mode, even on loopback — and `resolveBindHost` keeps the listener
 on loopback (`127.0.0.1`), refusing the `0.0.0.0` wildcard so nothing is exposed
 off-box. This is start-time refusal, distinct from the per-request UI-ingress auth
-above, which stays deferred. Both are the minimal slice: the full credential
-boundary (a config-file source, an actionable error, every start path) is a later
-item, as is the complete non-loopback bind refusal (`::`, LAN, public).
+above, which stays deferred. Refuse-start-without-auth is now **complete to spec**
+(#57): the secret is read from either `CCCTL_LOCAL_SERVER_AUTH` or the config file at
+`resolveLocalServerAuthPath` (`$XDG_CONFIG_HOME/ccctl/local-server-auth`, default
+`~/.config/ccctl/local-server-auth`), a present-but-empty value on either source counts
+as no auth, and the refusal names the env key, the file path it looked for, and how to
+configure either. The secret's fuller credential boundary (generation, scoping,
+storage-format, rotation, at-rest permissions) stays deferred, as does the complete
+non-loopback bind refusal (`::`, LAN, public — #58).

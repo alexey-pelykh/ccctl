@@ -14,15 +14,24 @@
  *     never the `0.0.0.0` wildcard; nothing is reachable off-box until an explicit
  *     tunnel is attached. {@link resolveBindHost} refuses the wildcard.
  *
- * This is the MINIMAL slice: presence-of-a-secret and refuse-`0.0.0.0`. Completing
- * each to spec is tracked separately — the auth credential boundary (a config-file
- * source, an actionable error naming the exact key + file path, malformed-value
- * handling on every start path) is #57; the full localhost-bind guarantee (refuse
- * EVERY non-loopback address — `::`, LAN, public — and make it non-overridable) is
- * #58. Keeping the two guards here, pure and injectable, lets both the daemon
- * ({@link https://ccctl | @ccctl/cli}'s `serve`) and any future embedder apply the
- * same baseline, and lets the properties be unit-tested without binding a socket.
+ * The localhost-bind guard is still the MINIMAL slice: refuse-`0.0.0.0` only; the full
+ * localhost-bind guarantee (refuse EVERY non-loopback address — `::`, LAN, public — and
+ * make it non-overridable) completes in #58. The refuse-start-without-auth guard is now
+ * COMPLETE to spec (#57): {@link requireLocalServerAuth} reads the secret from either the
+ * {@link LOCAL_SERVER_AUTH_ENV} env var or the {@link resolveLocalServerAuthPath} config
+ * file, treats a present-but-blank value on EITHER source as no auth, and — when neither
+ * is configured — refuses with an actionable error naming the env key AND the config-file
+ * path it looked for AND how to configure either. Provisioning, scoping, storage-format,
+ * and rotation of the secret (the fuller credential boundary) stay deferred
+ * (security-posture.md § "Credential boundary"); this completes only the refusal. Keeping
+ * the guards here, pure and injectable, lets both the daemon ({@link https://ccctl |
+ * @ccctl/cli}'s `serve`) and any future embedder apply the same baseline, and lets the
+ * properties be unit-tested without binding a socket or touching the real filesystem.
  */
+
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
 
 /**
  * Default loopback bind host — nothing is exposed without an explicit tunnel.
@@ -33,13 +42,33 @@
 export const DEFAULT_HOST = "127.0.0.1";
 
 /**
- * The environment variable the walking skeleton reads the local-server auth
- * secret from. This is the minimal provisioning source; the full credential
- * boundary — a config-file-backed source, and the exact key + file path named in
- * the refusal error — lands with #57. Kept as a named constant so the daemon, the
+ * The environment variable the local server reads the auth secret from — the PRIMARY of
+ * the two provisioning sources (#57), taking precedence over the {@link
+ * resolveLocalServerAuthPath} config file. Kept as a named constant so the daemon, the
  * refusal message, and the tests all reference the one key.
  */
 export const LOCAL_SERVER_AUTH_ENV = "CCCTL_LOCAL_SERVER_AUTH";
+
+/**
+ * The environment variable naming the base of the XDG *config* directory (XDG Base
+ * Directory spec). Config — as opposed to state or cache — is where an operator-provided,
+ * survives-forever secret belongs, so the auth file lives under it (the sibling
+ * {@link https://ccctl | session store} lives under XDG *state* for the opposite reason:
+ * it is regenerable). Honoured only when set to an ABSOLUTE path, exactly as
+ * {@link resolveLocalServerAuthPath} documents.
+ */
+export const XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME";
+
+/** The per-application subdirectory under the XDG config home that holds ccctl's config. */
+export const CCCTL_CONFIG_DIR = "ccctl";
+
+/**
+ * The local-server auth secret file's name under {@link CCCTL_CONFIG_DIR}. The whole
+ * trimmed file contents ARE the secret — a plain-text source, deliberately not a
+ * structured config (a storage FORMAT is part of the deferred credential boundary). Named
+ * so the resolver, the refusal message, and the tests reference the one file name.
+ */
+export const LOCAL_SERVER_AUTH_FILE_NAME = "local-server-auth";
 
 /**
  * The IPv4 wildcard bind. Binding `0.0.0.0` would expose the daemon on every
@@ -49,26 +78,101 @@ export const LOCAL_SERVER_AUTH_ENV = "CCCTL_LOCAL_SERVER_AUTH";
 export const WILDCARD_BIND_HOST = "0.0.0.0";
 
 /**
- * Assert that local-server auth is configured, returning the secret. Throws a
- * clear error when it is absent (or blank) so the daemon refuses to start
- * unauthenticated — there is no unauthenticated mode, even on loopback
- * (security-posture.md § "Mandatory local-server auth"). The `env` is injectable
- * so the property is unit-testable without mutating the process environment.
+ * Resolve the local-server auth config file's path:
+ * `$XDG_CONFIG_HOME/ccctl/local-server-auth`, falling back to
+ * `~/.config/ccctl/local-server-auth`. Per the XDG Base Directory spec,
+ * `$XDG_CONFIG_HOME` is honoured ONLY when set to an ABSOLUTE path; unset, empty, or
+ * relative all fall back to `$HOME/.config` (a relative XDG base is spec-invalid and
+ * would otherwise resolve against the process cwd — a footgun). Mirrors the sibling
+ * {@link https://ccctl | resolveSessionStorePath} exactly, one directory over (config vs
+ * state).
  *
- * A present-but-blank value is treated as "not configured": an empty secret is
- * trivially not a secret. The fuller malformed-value handling, the config-file
- * source, and an actionable error naming the exact key + file path on every start
- * path complete the credential boundary in #57.
+ * `env` and `home` are injectable seams so the resolution is unit-testable without
+ * touching the real environment or home directory — the same pure-and-injectable idiom as
+ * {@link requireLocalServerAuth}.
  */
-export function requireLocalServerAuth(env: NodeJS.ProcessEnv = process.env): string {
-  const secret = env[LOCAL_SERVER_AUTH_ENV]?.trim() ?? "";
-  if (secret === "") {
-    throw new Error(
-      `ccctl: local-server auth is required — the local server refuses to start without it. ` +
-        `Set ${LOCAL_SERVER_AUTH_ENV} to a secret; there is no unauthenticated mode, even on loopback.`,
-    );
+export function resolveLocalServerAuthPath(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+  const configured = env[XDG_CONFIG_HOME_ENV]?.trim();
+  const configHome =
+    configured !== undefined && configured !== "" && isAbsolute(configured) ? configured : join(home, ".config");
+  return join(configHome, CCCTL_CONFIG_DIR, LOCAL_SERVER_AUTH_FILE_NAME);
+}
+
+/**
+ * Reads the local-server auth config file, returning its raw contents, or `null` when the
+ * file is absent. Injectable so {@link requireLocalServerAuth} is unit-testable without
+ * touching the real filesystem; the default reads {@link resolveLocalServerAuthPath}
+ * synchronously (the guard runs once, at boot, before anything binds).
+ */
+export type AuthFileReader = (path: string) => string | null;
+
+/**
+ * The production {@link AuthFileReader}: a synchronous read that maps a MISSING file to
+ * `null` (absence is not an error — the operator simply provisioned auth via the env var
+ * instead), while a REAL I/O failure (EACCES, EISDIR, …) surfaces rather than
+ * masquerading as "no auth configured" — silently swallowing it would make the guard
+ * refuse for the wrong reason on a transient permission glitch. Mirrors
+ * {@link https://ccctl | createFileSessionStore}'s load-time ENOENT-is-`null` handling.
+ */
+const defaultAuthFileReader: AuthFileReader = (path) => {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw error;
   }
-  return secret;
+};
+
+/**
+ * Assert that local-server auth is configured, returning the secret; throw an actionable
+ * error when it is not, so the daemon refuses to start unauthenticated — there is no
+ * unauthenticated mode, even on loopback (security-posture.md § "Mandatory local-server
+ * auth"). Complete-to-spec (#57): the secret is read from EITHER of two sources —
+ *
+ *   1. the {@link LOCAL_SERVER_AUTH_ENV} env var (PRIMARY — an explicit env override
+ *      wins, the 12-factor precedent), or
+ *   2. the {@link resolveLocalServerAuthPath} config file (fallback).
+ *
+ * A present-but-blank value on EITHER source is treated as "not configured" — an empty
+ * secret is trivially not a secret (the AC's "malformed/empty is no auth"). When NEITHER
+ * source yields a non-empty secret, the refusal is actionable: it names the exact env key,
+ * the exact config-file path it looked for, and how to configure either.
+ *
+ * `env`, and the injectable `home` / `readAuthFile` seams, keep the guard pure and
+ * synchronously unit-testable without mutating the process environment or touching the
+ * real filesystem — the daemon and any embedder just call it with the defaults.
+ */
+export function requireLocalServerAuth(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { home?: string; readAuthFile?: AuthFileReader } = {},
+): string {
+  const { home = homedir(), readAuthFile = defaultAuthFileReader } = options;
+
+  // Source 1 (primary): the env var. An explicit override wins over the on-disk config.
+  const fromEnv = env[LOCAL_SERVER_AUTH_ENV]?.trim() ?? "";
+  if (fromEnv !== "") {
+    return fromEnv;
+  }
+
+  // Source 2 (fallback): the config file. Present-but-blank is treated as absent, the same
+  // blank-is-no-secret rule as the env var above.
+  const authFilePath = resolveLocalServerAuthPath(env, home);
+  const fromFile = readAuthFile(authFilePath)?.trim() ?? "";
+  if (fromFile !== "") {
+    return fromFile;
+  }
+
+  // Neither source is configured (absent, blank, or otherwise empty on every start path):
+  // refuse to start with an error naming BOTH the env key AND the file path it looked for,
+  // and how to configure either.
+  throw new Error(
+    `ccctl: local-server auth is required — the local server refuses to start without it. ` +
+      `Configure it by setting ${LOCAL_SERVER_AUTH_ENV} to a secret, ` +
+      `or by writing the secret to ${authFilePath}. ` +
+      `A present-but-empty value counts as no auth; there is no unauthenticated mode, even on loopback.`,
+  );
 }
 
 /**

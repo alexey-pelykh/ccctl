@@ -14,8 +14,9 @@ Three verbs stand up the local setup:
 - **`ccctl serve`** — start the loopback-bound [`@ccctl/server`](../server) daemon.
   `--tunnel <kind>` additionally exposes it through a tunnel in one step. Enforces
   the baseline startup guards from `@ccctl/server` before binding
-  (refuse-start-without-auth + localhost-bind: no configured local-server auth exits
-  non-zero, and a `0.0.0.0` bind is refused). Wires the session launcher a `ccctl launch`
+  (refuse-start-without-auth + localhost-bind: with no local-server auth configured — via
+  `CCCTL_LOCAL_SERVER_AUTH` or the `~/.config/ccctl/local-server-auth` config file — it
+  exits non-zero naming both sources, and a `0.0.0.0` bind is refused). Wires the session launcher a `ccctl launch`
   runs, so a "New session" spawns the **patched** `claude` worker; the binary defaults to
   `claude` on `PATH` and is pinned to an absolute path via `CCCTL_CLAUDE_BIN`.
 - **`ccctl tunnel <kind>`** — establish a [`@ccctl/tunnel-adapters`](../tunnel-adapters)
