@@ -10,7 +10,9 @@ import {
   type LaunchAcceptedWire,
   type LaunchedSession,
   type SessionLaunchOptions,
+  type SessionStopOptions,
   type SessionSummaryWire,
+  type StopAcceptedWire,
   type SurfaceLiveness,
 } from "@ccctl/server";
 import type { EstablishedTunnel, Tunnel, TunnelKind } from "@ccctl/tunnel-adapters";
@@ -48,6 +50,8 @@ interface FakeDepsOptions {
   readonly list?: (target: HostEndpoint) => Promise<SessionSummaryWire[]>;
   /** Override the session-client `steer` (e.g. to reject); defaults to an accepted steer returning a correlation id. */
   readonly steer?: (target: HostEndpoint, sessionId: string, command: SteerCommand) => Promise<string>;
+  /** Override the session-client `stop` (e.g. to reject with a typed refusal); defaults to a successful kill. */
+  readonly stop?: (target: HostEndpoint, sessionId: string, options: SessionStopOptions) => Promise<StopAcceptedWire>;
 }
 
 /** Build fake {@link CliDependencies} plus handles to the spies the assertions read. */
@@ -60,6 +64,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
   launch: ReturnType<typeof vi.fn>;
   list: ReturnType<typeof vi.fn>;
   steer: ReturnType<typeof vi.fn>;
+  stop: ReturnType<typeof vi.fn>;
   launcher: ISessionLauncher;
   renderQr: ReturnType<typeof vi.fn>;
 } {
@@ -106,7 +111,15 @@ function makeDeps(options: FakeDepsOptions = {}): {
     options.steer ??
       ((_target: HostEndpoint, _sessionId: string, _command: SteerCommand) => Promise.resolve("cmd-corr-1")),
   );
-  const sessionClient: SessionClient = { launch, list, steer };
+  // The `stop` client the `stop` verb drives (#77). Defaults to a successful kill reporting the
+  // terminal state the daemon's transition produced; a test overrides it to reject (a typed refusal)
+  // or to assert the body sent — above all whether `force` really rode the request.
+  const stop = vi.fn(
+    options.stop ??
+      ((_target: HostEndpoint, sessionId: string, _stopOptions: SessionStopOptions) =>
+        Promise.resolve({ sessionId, outcome: "stopped", status: "closed" } satisfies StopAcceptedWire)),
+  );
+  const sessionClient: SessionClient = { launch, list, steer, stop };
   // A fake session launcher: the `serve` verb injects it into the daemon (#157); a test asserts the
   // exact instance is passed to `startServer`, without a real tmux window or a spawned worker.
   const launcher: ISessionLauncher = {
@@ -131,6 +144,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
     launch,
     list,
     steer,
+    stop,
     launcher,
     renderQr,
   };
@@ -730,5 +744,103 @@ describe("ccctl steer — drives one session on a running daemon (AC2: steerable
     await expect(
       buildProgram(deps).parseAsync(["steer", "sess-1", "--prompt", "go"], { from: "user" }),
     ).rejects.toThrow(/has no live worker yet/);
+  });
+});
+
+describe("ccctl stop — the emergency stop (#77 AC2)", () => {
+  it("stops the named session and reports the terminal state the daemon produced", async () => {
+    const { deps, stop } = makeDeps();
+    await buildProgram(deps).parseAsync(["stop", "sess-1"], { from: "user" });
+    expect(stop).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 }, "sess-1", { force: false });
+    const text = loggedText();
+    expect(text).toContain("stopped session sess-1 on http://127.0.0.1:4321");
+    // The AC's "reflect the resulting terminal state" — carried from the daemon, not asserted here.
+    expect(text).toContain("closed");
+  });
+
+  it("does NOT force by default — the destructive flag is opt-in, and a literal boolean on the wire", async () => {
+    const { deps, stop } = makeDeps();
+    await buildProgram(deps).parseAsync(["stop", "sess-1"], { from: "user" });
+    // `false`, not `undefined`: the daemon's parse refuses a non-boolean rather than coercing it, so
+    // the destructive field's correctness must not rest on how JSON.stringify treats `undefined`.
+    expect(stop).toHaveBeenCalledWith(expect.anything(), "sess-1", { force: false });
+  });
+
+  it("forces on --force — the operator saying yes to killing a session they have taken over", async () => {
+    const { deps, stop } = makeDeps();
+    await buildProgram(deps).parseAsync(["stop", "sess-1", "--force"], { from: "user" });
+    expect(stop).toHaveBeenCalledWith(expect.anything(), "sess-1", { force: true });
+  });
+
+  it("reports an already-exited surface honestly rather than claiming a kill it did not make", async () => {
+    const { deps } = makeDeps({
+      stop: (_target, sessionId) => Promise.resolve({ sessionId, outcome: "already-exited", status: "closed" }),
+    });
+    await buildProgram(deps).parseAsync(["stop", "sess-1"], { from: "user" });
+    const text = loggedText();
+    // Names the daemon that answered, like every other branch: `--host`/`--port` exist because there
+    // can be more than one.
+    expect(text).toContain("session sess-1 on http://127.0.0.1:4321 had already exited — closed");
+    // The daemon declined to claim a kill here, so neither may the CLI.
+    expect(text).not.toContain("stopped session");
+  });
+
+  it("degrades an outcome this build does not recognize instead of calling it an already-exited surface", async () => {
+    // `ccctl` can be older than the daemon it drives, so a future outcome is reachable here (the
+    // client's reader admits any string). "It had already exited" is a SPECIFIC claim about what
+    // happened to the session — the kind this verb must never invent — so an unrecognized outcome
+    // gets a neutral sentence instead. The web UI's reader degrades the same way, which is what
+    // makes the two surfaces one contract read twice rather than two guesses.
+    const { deps } = makeDeps({
+      stop: (_target, sessionId) =>
+        // Cast: the wire type names two outcomes, and the point of this test is the third one a
+        // newer daemon could send.
+        Promise.resolve({ sessionId, outcome: "vaporized", status: "closed" } as unknown as StopAcceptedWire),
+    });
+    await buildProgram(deps).parseAsync(["stop", "sess-1"], { from: "user" });
+    const text = loggedText();
+    expect(text).toContain("session sess-1 on http://127.0.0.1:4321 is stopped — closed");
+    expect(text).not.toContain("had already exited");
+    expect(text).not.toContain("stopped session");
+  });
+
+  it("carries an `errored` terminal status rather than flattening every stop to `closed`", async () => {
+    const { deps } = makeDeps({
+      stop: (_target, sessionId) => Promise.resolve({ sessionId, outcome: "stopped", status: "errored" }),
+    });
+    await buildProgram(deps).parseAsync(["stop", "sess-1"], { from: "user" });
+    // A stop does not overwrite the diagnosis of a session that had already failed on its own.
+    expect(loggedText()).toContain("stopped session sess-1 on http://127.0.0.1:4321 — errored");
+  });
+
+  it("stops against an explicit --host and --port", async () => {
+    const { deps, stop } = makeDeps();
+    await buildProgram(deps).parseAsync(["stop", "sess-1", "--host", "127.0.0.1", "--port", "9999"], { from: "user" });
+    expect(stop).toHaveBeenCalledWith({ host: "127.0.0.1", port: 9999 }, "sess-1", { force: false });
+  });
+
+  it("surfaces a REFUSED stop as a rejection — never a quiet success over a live session", async () => {
+    // The whole value of the verb is that the operator can believe its answer and stop watching, so
+    // `ccctl stop X && echo done` must not print `done` for a session that is still running.
+    // `cli.ts` turns this rejection into the non-zero exit that makes the `&&` hold.
+    const { deps } = makeDeps({
+      stop: () => Promise.reject(new Error("ccctl: session sess-1 has been taken over. Re-run with `--force`")),
+    });
+    await expect(buildProgram(deps).parseAsync(["stop", "sess-1"], { from: "user" })).rejects.toThrow(/taken over/);
+    expect(loggedText()).not.toContain("stopped session");
+  });
+
+  it("requires a session id — a stop is never inferred (#20)", async () => {
+    const { deps, stop } = makeDeps();
+    await expect(buildProgram(deps).parseAsync(["stop"], { from: "user" })).rejects.toThrow();
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("rejects a bad --port BEFORE any network round-trip — no side effects on a usage error", async () => {
+    const { deps, stop } = makeDeps();
+    await expect(buildProgram(deps).parseAsync(["stop", "sess-1", "--port", "nope"], { from: "user" })).rejects.toThrow(
+      /invalid port/,
+    );
+    expect(stop).not.toHaveBeenCalled();
   });
 });

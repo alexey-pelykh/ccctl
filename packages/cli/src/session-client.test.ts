@@ -186,3 +186,136 @@ describe("defaultSessionClient.steer — real POST /api/sessions/{id}/command wi
     expect(await res.text()).toContain("malformed command");
   });
 });
+
+// #77/#76: the daemon types every stop refusal, and — as with launch — the CLI branches on that
+// CODE rather than the HTTP status. Here that is not a stylistic echo but a necessity: FOUR distinct
+// refusals share `409`, so the status alone cannot tell "someone is driving it" (fixed by `--force`)
+// from "the backend could not be read" (fixed by nothing this shell can do). Real-wire locks: every
+// code below is the one the real handler actually wrote.
+//
+// The AC-level flow (both surfaces, the verb, the terminal state) is pinned in `@ccctl/e2e`'s
+// `web-ui-stop-flow.test.ts`. These tests are narrower on purpose — they pin the decisions this
+// CLIENT owns: which refusals earn an added hint, and what it does with an answer it cannot read.
+
+/**
+ * A fake launcher whose surface can actually BE stopped: its liveness flips to `exited` once
+ * `close()` has run, PER SURFACE.
+ *
+ * The distinction from {@link fakeLauncher} above is not incidental, and it is worth stating because
+ * the difference is invisible until a stop runs: that one reports `alive-server-owned` forever, so a
+ * stop against it tears the surface down and then — on the rule's post-close RE-READ — still sees a
+ * live terminal and refuses to report the kill (`stop-failed`). That is #76 working exactly as
+ * designed ("a stop VERIFIES; a teardown trusts": `close()` resolving is the backend's claim, not a
+ * proof, so `stopLaunchedSession` refuses to report a kill it can disprove) — a launcher whose
+ * surface never dies is simply not a surface anything can stop. It is fine for the launch tests,
+ * which never close anything.
+ *
+ * `liveness` selects the reading BEFORE the close, so one helper drives both the happy path
+ * (`alive-server-owned`) and the `taken-over` refusal that `--force` overrides.
+ */
+function stoppableLauncher(
+  liveness: SurfaceLiveness = "alive-server-owned",
+  hint = "tmux attach -t ccctl:1",
+): ISessionLauncher {
+  return {
+    launch(_options: SessionLaunchOptions): Promise<LaunchedSession> {
+      // Per-surface: closing one session's terminal must not make a sibling's read as `exited`.
+      let closed = false;
+      return Promise.resolve({
+        attachment: { attachable: true, hint },
+        liveness: (): Promise<SurfaceLiveness> => Promise.resolve(closed ? "exited" : liveness),
+        close: (): Promise<void> => {
+          closed = true;
+          return Promise.resolve();
+        },
+      });
+    },
+  };
+}
+
+/** Launch one session against `server` through the real handler and return its minted id. */
+async function launchSessionId(server: CcctlServer): Promise<string> {
+  const accepted = await defaultSessionClient.launch(server.address, { cwd: LAUNCH_CWD, permissionMode: "default" });
+  return accepted.sessionId;
+}
+
+describe("defaultSessionClient.stop — real POST /api/sessions/{id}/stop wire (#77)", () => {
+  it("round-trips a stop against the real handler, returning what it did and the terminal state", async () => {
+    const server = await startTestServer(stoppableLauncher());
+    const sessionId = await launchSessionId(server);
+
+    const stopped = await defaultSessionClient.stop(server.address, sessionId, { force: false });
+
+    // The 200 `{ sessionId, outcome, status }` body the real handler wrote, decoded by the client.
+    expect(stopped).toEqual({ sessionId, outcome: "stopped", status: "closed" });
+  });
+
+  it("maps a real 404 `unknown-session` to an error naming the verb that lists what IS there", async () => {
+    const server = await startTestServer(stoppableLauncher());
+
+    const error = await defaultSessionClient
+      .stop(server.address, "no-such-session", { force: false })
+      .catch((e: unknown) => e as Error);
+
+    // The daemon's own sentence plus the CLI's next-move hint.
+    expect(error.message).toMatch(/no session no-such-session.*ccctl attach/s);
+  });
+
+  it("maps a real 409 `taken-over` to an error naming the SHELL's remedy, not the wire's", async () => {
+    const server = await startTestServer(stoppableLauncher("taken-over", "tmux attach -t ccctl:9"));
+    const sessionId = await launchSessionId(server);
+
+    const error = await defaultSessionClient
+      .stop(server.address, sessionId, { force: false })
+      .catch((e: unknown) => e as Error);
+
+    // The daemon's sentence echoes the surface's own attach hint — which only it knows…
+    expect(error.message).toContain("tmux attach -t ccctl:9");
+    // …and names its remedy in WIRE words (`{ force: true }`), which nobody can type at a shell.
+    // `--force` is the CLI translating that remedy for the surface the operator is actually on.
+    expect(error.message).toContain("--force");
+  });
+
+  it("sends `force` as a literal boolean the real fail-closed parse accepts — and it overrides", async () => {
+    const server = await startTestServer(stoppableLauncher("taken-over"));
+    const sessionId = await launchSessionId(server);
+
+    // `parseStopOptions` refuses anything that is not exactly a boolean, so a stringified or coerced
+    // `force` would be a real-handler 400 here rather than the override the operator asked for.
+    await expect(defaultSessionClient.stop(server.address, sessionId, { force: false })).rejects.toThrow(/taken over/);
+    await expect(defaultSessionClient.stop(server.address, sessionId, { force: true })).resolves.toMatchObject({
+      outcome: "stopped",
+    });
+  });
+
+  // Not reachable against ccctl's own ingress; reachable across a tunnel or proxy that interposes a
+  // body of its own. The shape IS how the client knows what happened to the session, so an
+  // unreadable answer must throw rather than resolve — reporting a kill nobody verified is the one
+  // answer an emergency-stop must never give.
+  //
+  // Each field is dropped INDEPENDENTLY, which is the whole point: a single body missing all three
+  // passes while any ONE of the three checks is live, so it proves only that *some* validation
+  // exists — not that the field a future edit deletes is still checked. (Written that way first;
+  // deleting the `outcome` check left it green.)
+  it.each([
+    ["sessionId", { outcome: "stopped", status: "closed" }],
+    ["outcome", { sessionId: "s-1", status: "closed" }],
+    ["status", { sessionId: "s-1", outcome: "stopped" }],
+  ])(
+    "refuses to report a 200 whose body is missing `%s` — an unreadable answer is not a kill",
+    async (_field, body) => {
+      const server = await startTestServer(stoppableLauncher());
+      const sessionId = await launchSessionId(server);
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (() => Promise.resolve(new Response(JSON.stringify(body), { status: 200 }))) as typeof fetch;
+
+      try {
+        await expect(defaultSessionClient.stop(server.address, sessionId, { force: false })).rejects.toThrow(
+          /did not return a \{ sessionId, outcome, status \} body/,
+        );
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    },
+  );
+});

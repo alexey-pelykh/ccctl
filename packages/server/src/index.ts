@@ -129,14 +129,34 @@ export { toSessionCreateResponseWire, type SessionCreateResponseWire } from "./s
 // against the PINNED camelCase projection instead of re-transcribing its shape, so a wire drift
 // breaks the consumer's typecheck rather than silently mismatching at runtime. `SessionSummaryWire`
 // is one entry of the `GET /api/sessions` list; `LaunchAcceptedWire` is the `POST /api/sessions`
-// launch-accepted body; `StopAcceptedWire` / `StopFailureWire` + `StopFailureCode` are the
-// `POST /api/sessions/{id}/stop` bodies (#76) — re-exported ahead of their consumers because #77's
-// stop button and `ccctl stop` are BOTH required to branch on the same typed `code` rather than on
-// prose, which only a pinned type can hold them to. Defined + wire-tested in ui-sessions.ts /
-// ui-session-launch.ts / ui-session-stop.ts.
+// launch-accepted body; `SessionStopOptions` / `StopAcceptedWire` / `StopFailureWire` +
+// `StopFailureCode` are the `POST /api/sessions/{id}/stop` bodies (#76) — re-exported ahead of their
+// consumers because #77's stop button and `ccctl stop` are BOTH required to branch on the same typed
+// `code` rather than on prose, which only a pinned type can hold them to. `SessionStopOptions` is
+// the REQUEST half of that pair, and doubles as the parameter of the programmatic
+// `CcctlServer.stopSession` below — a public method whose argument type a caller could not otherwise
+// name. Defined + wire-tested in ui-sessions.ts / ui-session-launch.ts / ui-session-stop.ts.
 export type { SessionSummaryWire } from "./ui-sessions.js";
 export type { LaunchAcceptedWire } from "./ui-session-launch.js";
-export type { StopAcceptedWire, StopFailureCode, StopFailureWire, StopOutcomeWire } from "./ui-session-stop.js";
+export type {
+  SessionStopOptions,
+  StopAcceptedWire,
+  StopFailureCode,
+  StopFailureWire,
+  StopOutcomeWire,
+} from "./ui-session-stop.js";
+
+// …and the RUNTIME half of that same stop contract (#77): the guard and the pinned set. The type
+// above says what a `code` IS; only the guard lets a consumer NARROW an arbitrary decoded body to
+// one, which is exactly what reading a failure answer requires — `ccctl stop`'s reader takes a
+// `unknown` off the wire and must fail closed on anything outside the set (an errno-bearing throw
+// also carries a string `code`). Shipping the type without the guard left the consumer #76 named
+// able to declare the contract but not to check it, so it would have had to re-transcribe the set
+// as a local copy — the precise drift the type export exists to prevent. The launch twin already
+// ships both halves for this reason (`isLaunchFailureCode` + `LAUNCH_FAILURE_CODES` above); this is
+// that pair's missing mirror. A value export, since both ship runtime. Defined + unit-tested in
+// ui-session-stop.ts.
+export { isStopFailureCode, STOP_FAILURE_CODES } from "./ui-session-stop.js";
 
 // Re-export the baseline startup guarantees (#14) on the public surface. The daemon
 // (@ccctl/cli's `serve`) applies them before binding, and any embedder gets the same

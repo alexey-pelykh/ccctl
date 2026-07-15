@@ -33,10 +33,18 @@
  *   - `ccctl steer` — take over a selected session: push ONE steer verb at it
  *     (`POST /api/sessions/{id}/command` — send a prompt, approve a pending action, or interrupt),
  *     the very control path the phone drives.
+ *   - `ccctl stop` — the emergency stop (#77): kill ONE session's terminal outright
+ *     (`POST /api/sessions/{id}/stop`, #76) and report the terminal state it reached. The last verb
+ *     of a session's life, and the opposite of `steer` despite the adjacent route — a steer ASKS the
+ *     worker to do something and needs it listening; a stop kills the surface the worker RUNS ON and
+ *     needs only the handle the daemon has held since it launched it, which is exactly why it works
+ *     on the session that stopped answering.
  *
  * All go THROUGH the daemon, so a CLI-launched session lands in the same `/api/sessions` list as
- * the phone-driven ones AND is steerable the same way (the issue's second AC). This module builds
- * the command tree; `cli.ts` is the thin executable that runs it.
+ * the phone-driven ones AND is steerable the same way (the issue's second AC) — and, for `stop`, so
+ * the shell and the phone drive the SAME server-side emergency-stop rather than two copies of a rule
+ * that could disagree about which kills are legal (#77 AC3). This module builds the command tree;
+ * `cli.ts` is the thin executable that runs it.
  */
 
 import { Command } from "commander";
@@ -56,6 +64,8 @@ import {
   requireLocalServerAuth,
   resolveBindHost,
   type SessionLaunchOptions,
+  type SessionStopOptions,
+  type StopAcceptedWire,
 } from "@ccctl/server";
 import type { TunnelKind } from "@ccctl/tunnel-adapters";
 import { defaultDependencies, type CliDependencies } from "./dependencies.js";
@@ -147,6 +157,36 @@ function describeActivity(activity: SessionActivity): string {
       return `requires action — ${activity.detail}`;
     case "idle":
       return "idle";
+  }
+}
+
+/**
+ * Render an accepted stop (#77) as the operator's one-line answer: WHICH session is over, on WHICH
+ * daemon, HOW it ended, and the terminal state it reached — the AC's "reflect the resulting terminal
+ * state", carried from the daemon rather than asserted here.
+ *
+ * The two outcomes stay distinct sentences because they are different FACTS: we killed it, or it was
+ * already gone and there was nothing left to kill. Both are what the operator asked for; only one of
+ * them is a kill, and the daemon is careful not to claim the other is.
+ *
+ * Names the daemon in every branch, like `attach`'s sentences: `--host`/`--port` exist because there
+ * can be more than one, and "which one answered" is not a detail to the operator who is killing a
+ * runaway.
+ *
+ * An outcome this build does not recognize gets a neutral third sentence rather than being folded
+ * into `already-exited`: `ccctl` can be older than the daemon it drives, and "it had already exited"
+ * is a specific claim about what happened — the kind this verb must not invent. The web UI's reader
+ * degrades identically (`@ccctl/web-ui`'s `describeStopAccepted`), which is the same contract read
+ * the same way on both surfaces rather than two guesses.
+ */
+function describeStopAccepted(stopped: StopAcceptedWire, where: string): string {
+  switch (stopped.outcome) {
+    case "stopped":
+      return `stopped session ${stopped.sessionId} on ${where} — ${stopped.status}`;
+    case "already-exited":
+      return `session ${stopped.sessionId} on ${where} had already exited — ${stopped.status}`;
+    default:
+      return `session ${stopped.sessionId} on ${where} is stopped — ${stopped.status}`;
   }
 }
 
@@ -422,6 +462,26 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
         console.log(`ccctl: the daemon accepted it (correlation ${id}).`);
       },
     );
+
+  // --- stop: the emergency stop — kill one session's terminal outright -----------------
+  program
+    .command("stop")
+    .description("Stop one session on a running daemon: kill its terminal and end the session")
+    .argument("<session-id>", "the session to stop (from `ccctl attach`)")
+    .option("-p, --port <port>", "loopback port the daemon is on", "4321")
+    .option("--host <host>", "loopback host the daemon is on", DEFAULT_HOST)
+    .option("--force", "stop it even if it has been taken over at a terminal")
+    .action(async (sessionId: string, options: { port: string; host: string; force?: boolean }) => {
+      const target: HostEndpoint = { host: resolveBindHost(options.host), port: parsePort(options.port) };
+      // `--force` is a boolean flag, so commander gives `true` when present and `undefined` when not;
+      // normalized to a literal boolean because the daemon's parse REFUSES a non-boolean rather than
+      // coercing it (`undefined` would serialize the key away, which happens to be right, but relying
+      // on that would make the destructive field's correctness an accident of JSON.stringify).
+      const stopOptions: SessionStopOptions = { force: options.force === true };
+
+      const stopped = await deps.sessionClient.stop(target, sessionId, stopOptions);
+      console.log(`ccctl: ${describeStopAccepted(stopped, serverUrl(target.host, target.port))}`);
+    });
 
   return program;
 }
