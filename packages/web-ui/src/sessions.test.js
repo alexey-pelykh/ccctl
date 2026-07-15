@@ -7,6 +7,8 @@ import {
   activityLabel,
   sessionLabel,
   notificationsDegraded,
+  sessionCursor,
+  laterCursor,
   diffSessionList,
   nextSelection,
 } from "./sessions.js";
@@ -155,5 +157,61 @@ describe("nextSelection", () => {
   it("keeps (does not select) when the list is empty", () => {
     expect(nextSelection(null, [])).toEqual({ kind: "keep" });
     expect(nextSelection("a", [])).toEqual({ kind: "clear" });
+  });
+});
+
+describe("sessionCursor (#80)", () => {
+  it("reads the message cursor from the wire row", () => {
+    expect(sessionCursor({ id: "a", cursor: 0 })).toBe(0);
+    expect(sessionCursor({ id: "a", cursor: 7 })).toBe(7);
+    expect(sessionCursor({ id: "a", cursor: 1024 })).toBe(1024);
+  });
+
+  it("reads a missing / pre-#80 cursor as 0 (emitted nothing), never a spurious advance", () => {
+    // A row without the field (a pre-#80 server, or a partial poll) must not read as moved-on.
+    expect(sessionCursor({ id: "a" })).toBe(0);
+    expect(sessionCursor({ id: "a", cursor: undefined })).toBe(0);
+    expect(sessionCursor({ id: "a", cursor: null })).toBe(0);
+  });
+
+  it("fails safe to 0 for a hostile / non-integer / negative cursor, never throwing", () => {
+    expect(sessionCursor({ cursor: -1 })).toBe(0);
+    expect(sessionCursor({ cursor: 1.5 })).toBe(0);
+    expect(sessionCursor({ cursor: "7" })).toBe(0);
+    expect(sessionCursor({ cursor: NaN })).toBe(0);
+    expect(sessionCursor(undefined)).toBe(0);
+    expect(sessionCursor(null)).toBe(0);
+  });
+});
+
+describe("laterCursor (#80) — the monotonic-advance rule", () => {
+  it("advances to a higher incoming sighting (a fresher poll / live event)", () => {
+    expect(laterCursor(3, 7)).toBe(7);
+    expect(laterCursor(0, 1)).toBe(1);
+  });
+
+  it("never regresses to a lower incoming sighting (a lagging poll behind the live stream)", () => {
+    // The load-bearing property: a stale source cannot pull the cursor backward and fabricate a moved-on.
+    expect(laterCursor(7, 3)).toBe(7);
+    expect(laterCursor(5, 0)).toBe(5);
+  });
+
+  it("is idempotent for an equal sighting", () => {
+    expect(laterCursor(4, 4)).toBe(4);
+  });
+
+  it("ignores a garbled incoming sighting, leaving the current cursor standing (never throws)", () => {
+    expect(laterCursor(5, undefined)).toBe(5);
+    expect(laterCursor(5, null)).toBe(5);
+    expect(laterCursor(5, "9")).toBe(5);
+    expect(laterCursor(5, NaN)).toBe(5);
+    expect(laterCursor(5, -2)).toBe(5);
+    expect(laterCursor(5, 1.5)).toBe(5);
+  });
+
+  it("treats a garbled current as 0, so a first valid sighting still lands", () => {
+    expect(laterCursor(undefined, 3)).toBe(3);
+    expect(laterCursor(-1, 3)).toBe(3);
+    expect(laterCursor(NaN, 0)).toBe(0);
   });
 });

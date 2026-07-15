@@ -35,6 +35,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Session, SessionActivity, SessionStatus } from "@ccctl/core";
+import { sessionMessageCursor, type SessionEventRelays } from "./event-stream.js";
 import { writeError, writeJson } from "./http-response.js";
 
 /** The base path of the browser-facing session namespace (`GET` lists; `/{id}/…` addresses one). */
@@ -83,10 +84,16 @@ export function matchUiSessionRoute(pathname: string): UiSessionRoute | null {
   return null;
 }
 
-/** The per-server state the session list reads: the sessions tracked by this server. */
+/** The per-server state the session list reads: the sessions tracked by this server + their SSE relays. */
 export interface UiSessionsState {
   /** Sessions tracked by the server, keyed by ccctl session id. */
   readonly sessions: ReadonlyMap<string, Session>;
+  /**
+   * The per-session SSE relays — read (never mutated) for each session's message cursor (#80),
+   * the last event id emitted on its stream ({@link sessionMessageCursor}). A structural subset of
+   * the server's {@link SessionEventRelays}, so this module stays decoupled from the HTTP wiring.
+   */
+  readonly eventRelays: SessionEventRelays;
 }
 
 /** One session's projection on the `GET /api/sessions` list wire: its id + own state. */
@@ -104,21 +111,32 @@ export interface SessionSummaryWire {
    * flow surfaces — the mode cannot change mid-run, so it never clears.
    */
   readonly notificationsDegraded: boolean;
+  /**
+   * The session's monotonic message cursor ({@link sessionMessageCursor}, #80): the last event id
+   * emitted on its stream, 0 when it has emitted nothing yet. The stale-guard's authority — the UI
+   * records the cursor it last viewed and, on a steer, prompts "moved on — still send?" if the
+   * session has advanced past it. Rides the list the picker already polls, so the UI reads it for
+   * every session (including one it is not viewing, whose offline-queued steer must still be guarded).
+   */
+  readonly cursor: number;
 }
 
 /**
  * Project a {@link Session} to its {@link SessionSummaryWire} — the intentional list
- * face (id + status + activity + the notifications-degraded marker), not the whole
- * internal snapshot (the createdAt / heartbeat timing fields stay server-internal). An
- * explicit wire projection, matching the codebase's explicit-DTO discipline
- * (session-create-wire, bridge-wire).
+ * face (id + status + activity + the notifications-degraded marker + the message cursor),
+ * not the whole internal snapshot (the createdAt / heartbeat timing fields stay
+ * server-internal). The cursor is read from the session's SSE relay ({@link
+ * sessionMessageCursor}, #80), which lives outside the {@link Session} model — hence the
+ * `relays` parameter. An explicit wire projection, matching the codebase's explicit-DTO
+ * discipline (session-create-wire, bridge-wire).
  */
-function sessionSummary(session: Session): SessionSummaryWire {
+function sessionSummary(session: Session, relays: SessionEventRelays): SessionSummaryWire {
   return {
     id: session.id,
     status: session.status,
     activity: session.activity,
     notificationsDegraded: session.notificationsDegraded,
+    cursor: sessionMessageCursor(relays, session.id),
   };
 }
 
@@ -134,6 +152,6 @@ export function handleSessionsList(req: IncomingMessage, res: ServerResponse, st
     writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on ${UI_SESSIONS_PATH}`);
     return;
   }
-  const sessions = [...state.sessions.values()].map(sessionSummary);
+  const sessions = [...state.sessions.values()].map((session) => sessionSummary(session, state.eventRelays));
   writeJson(res, 200, { sessions });
 }

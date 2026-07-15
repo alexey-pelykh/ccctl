@@ -10,6 +10,7 @@ import {
   queuedSteer,
   cancelQueued,
   partitionQueueForFire,
+  sessionMovedOn,
 } from "./steer-queue.js";
 
 /** A representative steer body as `command.js` builds it, for queue-shape tests. */
@@ -43,13 +44,30 @@ describe("shouldQueueSteer", () => {
 });
 
 describe("queuedSteer", () => {
-  it("builds a pending item carrying the id, target session, and command verbatim — AC1", () => {
+  it("builds a pending item carrying the id, target session, command, and viewed cursor — AC1 + #80 AC2", () => {
+    expect(queuedSteer({ id: 1, sessionId: "sess-a", command: inputSteer, cursor: 12 })).toEqual({
+      id: 1,
+      sessionId: "sess-a",
+      command: inputSteer,
+      cursor: 12,
+      status: QUEUED_PENDING,
+    });
+  });
+
+  it("defaults the cursor to 0 when absent (a pre-#80 caller / no cursor known), failing safe", () => {
     expect(queuedSteer({ id: 1, sessionId: "sess-a", command: inputSteer })).toEqual({
       id: 1,
       sessionId: "sess-a",
       command: inputSteer,
+      cursor: 0,
       status: QUEUED_PENDING,
     });
+  });
+
+  it("clamps a fractional / negative / non-integer cursor to 0 (defensive), never carrying garbage", () => {
+    expect(queuedSteer({ id: 1, sessionId: "sess-a", command: inputSteer, cursor: -3 })?.cursor).toBe(0);
+    expect(queuedSteer({ id: 1, sessionId: "sess-a", command: inputSteer, cursor: 1.5 })?.cursor).toBe(0);
+    expect(queuedSteer({ id: 1, sessionId: "sess-a", command: inputSteer, cursor: "5" })?.cursor).toBe(0);
   });
 
   it("carries the command by reference — it is the immutable value command.js just built", () => {
@@ -149,5 +167,61 @@ describe("partitionQueueForFire", () => {
 
   it("handles an empty queue", () => {
     expect(partitionQueueForFire([])).toEqual({ send: [], hold: [] });
+  });
+});
+
+describe("sessionMovedOn — the armed stale-guard predicate (#80)", () => {
+  it("is stale exactly when the current cursor advanced past the viewed one — 'any new message' (AC3)", () => {
+    // Viewed cursor 5; a single new message (6) is enough to flag moved-on (simple + aggressive).
+    expect(sessionMovedOn(5, 6)).toBe(true);
+    expect(sessionMovedOn(5, 99)).toBe(true);
+  });
+
+  it("is NOT stale when the session has not advanced (equal cursors) — the operator saw the head", () => {
+    expect(sessionMovedOn(5, 5)).toBe(false);
+    expect(sessionMovedOn(0, 0)).toBe(false);
+  });
+
+  it("is NOT stale when the current cursor is somehow behind the viewed one (never a false moved-on)", () => {
+    // Cursors are monotonic, so this should not happen; if it does, fail toward sending, not prompting.
+    expect(sessionMovedOn(6, 5)).toBe(false);
+  });
+
+  it("coerces each side defensively — a garbled current reads as 0 (behind → not stale), never throwing", () => {
+    // A garbled CURRENT (→0) can only under-state the head → not-stale, so no false prompt.
+    expect(sessionMovedOn(5, undefined)).toBe(false);
+    expect(sessionMovedOn(5, null)).toBe(false);
+    expect(sessionMovedOn(5, "6")).toBe(false);
+    expect(sessionMovedOn(5, NaN)).toBe(false);
+    // A garbled VIEWED (→0) with any real current fails toward stale (aggressive, the issue's intent).
+    expect(sessionMovedOn(undefined, 3)).toBe(true);
+    expect(sessionMovedOn(-1, 3)).toBe(true);
+  });
+});
+
+describe("partitionQueueForFire armed with sessionMovedOn (#80)", () => {
+  // The shell arms the seam by passing `(item) => sessionMovedOn(item.cursor, currentCursor(item.sessionId))`.
+  const current = new Map([
+    ["a", 10], // session a moved on (head 10)…
+    ["b", 4], // …session b did not (head 4)
+  ]);
+  const guard = (item) => sessionMovedOn(item.cursor, current.get(item.sessionId) ?? 0);
+
+  it("holds a steer whose session advanced past its captured cursor, sends one whose session did not", () => {
+    const queue = [
+      { id: 1, sessionId: "a", command: inputSteer, cursor: 5, status: QUEUED_PENDING }, // a: 5 → 10, stale
+      { id: 2, sessionId: "b", command: inputSteer, cursor: 4, status: QUEUED_PENDING }, // b: 4 → 4, fresh
+    ];
+    const { send, hold } = partitionQueueForFire(queue, guard);
+    expect(send.map((item) => item.id)).toEqual([2]);
+    expect(hold.map((item) => item.id)).toEqual([1]);
+    expect(hold[0].status).toBe(QUEUED_STALE);
+  });
+
+  it("sends an item whose captured cursor already equals the current head (it saw everything)", () => {
+    const queue = [{ id: 1, sessionId: "a", command: inputSteer, cursor: 10, status: QUEUED_PENDING }];
+    const { send, hold } = partitionQueueForFire(queue, guard);
+    expect(send.map((item) => item.id)).toEqual([1]);
+    expect(hold).toEqual([]);
   });
 });

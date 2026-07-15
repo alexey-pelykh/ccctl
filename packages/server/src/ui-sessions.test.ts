@@ -2,7 +2,13 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { afterEach, describe, expect, it } from "vitest";
-import { SESSIONS_PATH, workerChannelPath, workerRegisterPath, type SessionActivity } from "@ccctl/core";
+import {
+  SESSIONS_PATH,
+  workerChannelPath,
+  workerEventsPath,
+  workerRegisterPath,
+  type SessionActivity,
+} from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
 import { matchUiSessionRoute } from "./ui-sessions.js";
 
@@ -46,6 +52,28 @@ interface SessionSummary {
   readonly status: string;
   readonly activity: SessionActivity;
   readonly notificationsDegraded: boolean;
+  readonly cursor: number;
+}
+
+/** Register `sessionId`'s §4 worker and return its epoch, so its §5 upstream `worker/events` is drivable. */
+async function registerWorker(server: CcctlServer, sessionId: string): Promise<number> {
+  const res = await fetch(`${base(server)}${workerRegisterPath(sessionId)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  return ((await res.json()) as { worker_epoch: number }).worker_epoch;
+}
+
+/** Drive the §5 upstream leg: POST `count` raw worker events for `sessionId`, advancing its message cursor. */
+async function emitEvents(server: CcctlServer, sessionId: string, epoch: number, count: number): Promise<void> {
+  const events = Array.from({ length: count }, (_, i) => ({ payload: { seq: i } }));
+  const res = await fetch(`${base(server)}${workerEventsPath(sessionId)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ worker_epoch: epoch, events }),
+  });
+  expect(res.status).toBe(200);
 }
 
 async function listSessions(server: CcctlServer): Promise<SessionSummary[]> {
@@ -91,11 +119,33 @@ describe("GET /api/sessions — session list (#20)", () => {
     expect(sessions.map((s) => s.id)).toEqual([first, second]);
     // A freshly-created session is `connecting` transport-wise and `idle` activity-wise, and
     // — created under `default` (a prompting mode) — carries no notifications-degraded marker.
+    // It has emitted nothing on its stream yet, so its message cursor (#80) is 0.
     for (const summary of sessions) {
       expect(summary.status).toBe("connecting");
       expect(summary.activity).toEqual({ kind: "idle" });
       expect(summary.notificationsDegraded).toBe(false);
+      expect(summary.cursor).toBe(0);
     }
+  });
+
+  it("carries each session's monotonic message cursor — 0 fresh, advancing as its worker emits events (#80)", async () => {
+    const server = await startTestServer();
+    const busy = await createSession(server);
+    const quiet = await createSession(server);
+
+    // Both start at 0 (nothing emitted).
+    let sessions = await listSessions(server);
+    expect(sessions.find((s) => s.id === busy)?.cursor).toBe(0);
+    expect(sessions.find((s) => s.id === quiet)?.cursor).toBe(0);
+
+    // Drive three worker events into `busy`; `quiet` is untouched.
+    const epoch = await registerWorker(server, busy);
+    await emitEvents(server, busy, epoch, 3);
+
+    sessions = await listSessions(server);
+    // `busy`'s cursor advanced to the last emitted event id; `quiet`'s never moved (#20 isolation).
+    expect(sessions.find((s) => s.id === busy)?.cursor).toBe(3);
+    expect(sessions.find((s) => s.id === quiet)?.cursor).toBe(0);
   });
 
   it("surfaces each session's OWN activity — a status update on one never moves the other (#20)", async () => {

@@ -50,7 +50,7 @@ import {
   redirectCommand,
   describeCommand,
 } from "./command.js";
-import { diffSessionList, nextSelection, notificationsDegraded } from "./sessions.js";
+import { diffSessionList, nextSelection, notificationsDegraded, sessionCursor, laterCursor } from "./sessions.js";
 import { connectionHealth } from "./connection.js";
 import { applyPairingToken, authHeader } from "./pairing.js";
 import { DEVICES_PATH, deviceLabel, isCurrentDevice, isRenderableDevice } from "./devices.js";
@@ -74,7 +74,14 @@ import {
   needsYouKey,
   needsYouDetail,
 } from "./needs-you.js";
-import { shouldQueueSteer, queuedSteer, cancelQueued, partitionQueueForFire } from "./steer-queue.js";
+import {
+  QUEUED_STALE,
+  shouldQueueSteer,
+  queuedSteer,
+  cancelQueued,
+  partitionQueueForFire,
+  sessionMovedOn,
+} from "./steer-queue.js";
 
 const connectionEl = document.getElementById("connection");
 const statusEl = document.getElementById("status");
@@ -183,6 +190,61 @@ let steerSeq = 0;
  * refresh racing the reconnect) do not both start firing the same queue — the mirror of `polling`.
  */
 let firingQueue = false;
+/**
+ * The CURRENT message cursor of each session (#80), keyed by session id — the last event id the server
+ * has emitted on that session's stream, the "has it moved on?" authority the stale-guard compares
+ * against. Fed monotonically ({@link bumpCursor}) from BOTH legs: the 2s `/api/sessions` poll
+ * ({@link applySessionList} → `sessionCursor`) covers EVERY session (including one not being viewed,
+ * whose offline-queued steer must still be guarded), and the selected session's SSE stream
+ * ({@link recordViewedEvent} → `event.lastEventId`) refines it live between polls.
+ */
+const sessionCursors = new Map();
+/**
+ * The cursor each session had when the operator LAST LOOKED at it (#80 AC2), keyed by session id.
+ * Captured at {@link selectSession} (opening a session is looking) and advanced by each SSE event that
+ * renders while it is the viewed session ({@link recordViewedEvent} — the operator sees it live), so a
+ * live viewer stays caught up. It falls behind the head cursor exactly when the session moved on
+ * UNSEEN — the stream was down / the poll ran ahead — which is what {@link sessionMovedOn} guards a
+ * steer against. A queued steer captures THIS value; an online steer compares against it before sending.
+ */
+const viewedCursors = new Map();
+
+/**
+ * Advance a per-session cursor map MONOTONICALLY — set `sessionId`'s entry to `cursor` only when it is
+ * a higher non-negative integer than what is stored, so a lagging source (a 2s poll behind the live SSE,
+ * or an out-of-order delivery) can never REGRESS a cursor. Shared by {@link sessionCursors} and
+ * {@link viewedCursors}. A non-integer / negative `cursor` is ignored (defensive; never throws).
+ */
+function bumpCursor(map, sessionId, cursor) {
+  if (typeof sessionId !== "string") {
+    return;
+  }
+  const current = map.get(sessionId) ?? 0;
+  const next = laterCursor(current, cursor);
+  // Set only on a genuine advance — so a garbled / non-advancing sighting never MATERIALIZES an entry,
+  // keeping `has(sessionId)` an honest "a real cursor has been recorded" signal (the deep-link one-shot
+  // in `loadSessions` reads it to know a viewed cursor still needs initializing).
+  if (next > current) {
+    map.set(sessionId, next);
+  }
+}
+
+/**
+ * Record that the operator saw one live SSE event for the VIEWED session (#80): advance BOTH its head
+ * cursor (this is the freshest signal the session moved) AND its viewed cursor (the operator is looking
+ * at it right now, so they are caught up). The `lastEventId` is the SSE `id:` the server stamped;
+ * `Number(lastEventId)` parses it (a blank / non-numeric id → NaN → ignored by {@link bumpCursor}).
+ * No-op when nothing is selected — an event with no viewed session is not the operator looking at
+ * anything.
+ */
+function recordViewedEvent(sessionId, lastEventId) {
+  if (sessionId === null) {
+    return;
+  }
+  const cursor = Number(lastEventId);
+  bumpCursor(sessionCursors, sessionId, cursor);
+  bumpCursor(viewedCursors, sessionId, cursor);
+}
 
 /** Build one transcript `<li>`: a bold subtype label plus an optional human summary. */
 function transcriptItem(subtype, summary) {
@@ -365,6 +427,9 @@ function applySessionList(sessions) {
     // No sessions → no needs-you to attend; drop any reconciled entries so a later reconcile rebuilds
     // from the server's set rather than badging a session that has since gone.
     needsYou.clear();
+    // No sessions → no cursors to guard against (#80); drop them so a session id later reused starts fresh.
+    sessionCursors.clear();
+    viewedCursors.clear();
     return;
   }
   // Coming from the empty-state placeholder (which is not a tracked row): clear it first.
@@ -376,11 +441,21 @@ function applySessionList(sessions) {
   // The degraded marker is per-session and life-long, so it is read at row birth (below),
   // not carried through the label diff — a status/activity change never toggles the badge.
   const byId = new Map(sessions.map((session) => [session.id, session]));
+  // Advance each session's head cursor from the poll (#80). Monotonic, so it never regresses the
+  // fresher live-SSE cursor of the viewed session; it is the ONLY cursor source for sessions not being
+  // viewed (an offline-queued steer's target), so it must run every poll, not just on the row diff.
+  for (const session of sessions) {
+    bumpCursor(sessionCursors, session.id, sessionCursor(session));
+  }
   for (const id of diff.removed) {
     sessionRows.get(id)?.remove();
     sessionRows.delete(id);
     // A vanished (closed) session's needs-you is moot — there is nothing left to view or ack.
     needsYou.delete(id);
+    // …and its cursors (#80): a closed session cannot be steered, and dropping them keeps a later
+    // reused id from inheriting a stale "current" that would falsely read as moved-on.
+    sessionCursors.delete(id);
+    viewedCursors.delete(id);
   }
   for (const { id, label } of diff.added) {
     const li = createSessionRow(id, label, notificationsDegraded(byId.get(id)));
@@ -485,6 +560,15 @@ async function loadSessions() {
       delete stopStatusEl.dataset.stop;
     }
     markSelected();
+  }
+  // Deep-link cold-open (#52) viewed-cursor init (#80): the deep-link selected its session at module
+  // init, before any poll knew a cursor, so `selectSession` deferred the "seen up to head" capture. Now
+  // that this poll has learned the head (applySessionList above), initialize it — ONCE, guarded on
+  // `has` so a later poll never re-runs it to keep dragging viewed up to head (which would defeat the
+  // guard). Mirrors what the auto-select path gets for free (its applySessionList precedes its
+  // selectSession). If a live SSE event already advanced viewed, `has` is true and this no-ops.
+  if (currentSessionId !== null && !viewedCursors.has(currentSessionId)) {
+    viewedCursors.set(currentSessionId, sessionCursors.get(currentSessionId) ?? 0);
   }
   // On a (re)connect, reconcile the un-acked needs-you queue over the tunnel so a blocking event whose
   // push was lost/coalesced re-surfaces (#53). Fire-and-forget: it paints badges when it resolves and
@@ -823,6 +907,10 @@ function connect(sessionId) {
   });
 
   source.addEventListener("message", (event) => {
+    // The operator is viewing this session live, so this delivered event advances both its head
+    // cursor and the cursor they have "seen" (#80) — keeping a live viewer caught up so the guard
+    // fires only on messages they DIDN'T see (the stream down / poll running ahead).
+    recordViewedEvent(sessionId, event.lastEventId);
     handleEvent(event.data);
   });
 
@@ -854,6 +942,15 @@ function selectSession(sessionId) {
   // Viewing the session acknowledges its reconciled needs-you (#53): drop the badge and ack the
   // entries so a later reconnect no longer re-surfaces them. No-op when the session had none.
   ackNeedsYou(sessionId);
+  // Opening a session IS looking at it (#80): the operator has now "seen" it up to its current head,
+  // so a steer made from here is guarded only against messages that arrive AFTER this moment. Capture
+  // ONLY when the head is already known: a deep-link cold-open (#52) runs selectSession at module init
+  // BEFORE the first poll, when no cursor is known yet — capturing 0 there would falsely read as "moved
+  // on" on the first steer (a fresh SSE gets no replay to catch it up). Deferred to `loadSessions`'
+  // one-shot, which initializes viewed→head the first poll that learns it (what auto-select gets free).
+  if (sessionCursors.has(sessionId)) {
+    bumpCursor(viewedCursors, sessionId, sessionCursors.get(sessionId));
+  }
   connect(sessionId);
 }
 
@@ -877,6 +974,10 @@ async function sendSteerTo(sessionId, command) {
   }
   if (sessionId === currentSessionId) {
     appendOutbound(command.subtype, describeCommand(command));
+    // The operator just steered the viewed session, so they have acted on its current state (#80):
+    // advance the viewed cursor to the head so an immediate follow-up steer is not re-flagged as
+    // moved-on for messages that were already there — and, after a "Send anyway", not re-held at once.
+    bumpCursor(viewedCursors, sessionId, sessionCursors.get(sessionId) ?? 0);
   }
 }
 
@@ -899,6 +1000,15 @@ function steer(command) {
     enqueueSteer(currentSessionId, command);
     return;
   }
+  // Online, but the session may have moved on since the operator last looked (#80 AC3): if its head
+  // cursor has advanced past the cursor they viewed, HOLD the steer as a stale row ("moved on — still
+  // send?") rather than firing it blind. "Send anyway" (confirm) fires it; Cancel (discard) drops it.
+  const viewed = viewedCursors.get(currentSessionId) ?? 0;
+  const head = sessionCursors.get(currentSessionId) ?? 0;
+  if (sessionMovedOn(viewed, head)) {
+    holdStaleSteer(currentSessionId, command, viewed);
+    return;
+  }
   sendSteerTo(currentSessionId, command).catch((error) => {
     appendTranscript("error", error.message);
   });
@@ -913,7 +1023,11 @@ function steer(command) {
  */
 function enqueueSteer(sessionId, command) {
   steerSeq += 1;
-  const item = queuedSteer({ id: steerSeq, sessionId, command });
+  // Capture the cursor the operator last viewed for this session (#80 AC2): the fire-time guard
+  // compares it against the session's cursor THEN, holding the item stale if the session moved on
+  // during the outage. `?? 0` (viewed nothing) fails safe toward the guard firing.
+  const cursor = viewedCursors.get(sessionId) ?? 0;
+  const item = queuedSteer({ id: steerSeq, sessionId, command, cursor });
   if (item === null) {
     return;
   }
@@ -922,9 +1036,50 @@ function enqueueSteer(sessionId, command) {
 }
 
 /**
+ * Hold an ONLINE steer the operator submitted against a session that has moved on since they last
+ * looked (#80 AC3), as a `stale` queue row — the same red, "Send anyway"/Cancel affordance a
+ * fire-time-held queued item gets, so both paths share one confirm surface. Unlike {@link enqueueSteer}
+ * it is NOT waiting on the link (it is online); it is waiting on the operator's "still send?" decision.
+ * `cursor` is the viewed cursor the steer was judged stale against — carried so a reconnect drain
+ * re-evaluates it consistently (it stays stale while the head keeps advancing).
+ */
+function holdStaleSteer(sessionId, command, cursor) {
+  steerSeq += 1;
+  const item = queuedSteer({ id: steerSeq, sessionId, command, cursor });
+  if (item === null) {
+    return;
+  }
+  steerQueue = [...steerQueue, { ...item, status: QUEUED_STALE }];
+  renderSteerQueue();
+}
+
+/**
+ * Confirm a held (stale) steer — the "still send?" YES (#80 AC4): drop it from the queue and fire it
+ * NOW against the session it was composed for, bypassing the guard (the operator has acknowledged the
+ * session moved on). A handle no longer present (a Send-anyway that raced a Cancel) is a harmless no-op.
+ * Errors surface like any failed steer, and only into the viewed session's transcript (never
+ * misattributed to a different session on screen — the `sendSteerTo` contract).
+ */
+function sendSteerAnyway(id) {
+  const item = steerQueue.find((queued) => queued.id === id);
+  if (item === undefined) {
+    return;
+  }
+  steerQueue = cancelQueued(steerQueue, id);
+  renderSteerQueue();
+  sendSteerTo(item.sessionId, item.command).catch((error) => {
+    if (item.sessionId === currentSessionId) {
+      appendTranscript("error", error.message);
+    }
+  });
+}
+
+/**
  * Build one queued-steer row: the verb label + its human summary (as the transcript renders a frame),
  * the target session it will fire against, and a Cancel that drops it before it fires (#79 AC3). The row
- * carries `data-queued` (pending / stale) for its colour and the cancel handle in `data-queue-id`.
+ * carries `data-queued` (pending / stale) for its colour and the cancel handle in `data-queue-id`. A
+ * `stale` row (the session moved on, #80) also carries a "moved on" note and a "Send anyway" button —
+ * the "still send?" confirm (#80 AC4): Send anyway fires it, Cancel discards it.
  */
 function steerQueueItem(item) {
   // Reuse the transcript-frame builder (as appendOutbound does) for the verb + summary, then augment.
@@ -937,6 +1092,20 @@ function steerQueueItem(item) {
   target.dataset.queueTarget = "true";
   target.textContent = ` — for ${item.sessionId}`;
   li.appendChild(target);
+  // A held (stale) item: say WHY it is held (the session moved on) and offer the "still send?" confirm
+  // beside Cancel. A pending item is unchanged — it fires itself on reconnect and is cancel-only.
+  if (item.status === QUEUED_STALE) {
+    const note = document.createElement("span");
+    note.dataset.queueStaleNote = "true";
+    note.textContent = " — moved on since you looked";
+    li.appendChild(note);
+    const sendAnyway = document.createElement("button");
+    sendAnyway.type = "button";
+    sendAnyway.dataset.queueSend = "true";
+    sendAnyway.textContent = "Send anyway";
+    sendAnyway.addEventListener("click", () => sendSteerAnyway(item.id));
+    li.appendChild(sendAnyway);
+  }
   const cancel = document.createElement("button");
   cancel.type = "button";
   cancel.dataset.queueCancel = "true";
@@ -980,17 +1149,21 @@ function cancelSteerQueued(id) {
  * POST is AWAITED in turn so the sends land in the order the operator made them — an out-of-order
  * redirect could countermand a later input. Guarded against overlapping reconnects (the `polling` mirror).
  *
- * The stale-guard (#79 AC4) is `partitionQueueForFire`'s default — nothing is stale, so every queued
- * decision fires — until W5-21 (#80, which depends on this item) exposes the per-session message cursor
- * and replaces this call with a cursor-compare guard + a "session moved on — still send?" prompt. The
- * fire path already routes every item through the guard; #80 only arms it. A held item would carry
- * status `stale` and render red, cancel-only, until that prompt lands.
+ * The stale-guard (#79 AC4) is ARMED here (#80): each item is routed through {@link sessionMovedOn},
+ * comparing the cursor it captured when the operator last viewed its session against that session's
+ * CURRENT cursor (from the poll / SSE). An item whose session moved on during the outage is HELD
+ * (`stale`, red) with a "Send anyway"/Cancel confirm rather than fired blind; the rest fire in order.
+ * `partitionQueueForFire`'s routing is exactly #79's — #80 only supplies the predicate. A held item
+ * stays held on later drains (the head only advances, so `sessionMovedOn` stays true) until the
+ * operator confirms ({@link sendSteerAnyway}) or cancels it.
  */
 async function fireSteerQueue() {
   if (firingQueue || steerQueue.length === 0) {
     return;
   }
-  const { send, hold } = partitionQueueForFire(steerQueue);
+  const { send, hold } = partitionQueueForFire(steerQueue, (item) =>
+    sessionMovedOn(item.cursor, sessionCursors.get(item.sessionId) ?? 0),
+  );
   // Drop the about-to-send items from the queue NOW, before any await, so a cancel or a second reconnect
   // racing the in-flight sends cannot double-fire them; a held (stale) item stays visible + cancellable.
   steerQueue = hold;
