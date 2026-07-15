@@ -5,8 +5,11 @@
  * @ccctl/web-ui — zero-build UI.
  *
  * Vanilla ES module, no framework and no bundler. It talks to @ccctl/server
- * over three channels, all SESSION-ADDRESSED (#20) so more than one running
- * session can be carried at once:
+ * over four channels, the last three all SESSION-ADDRESSED (#20) so more than one
+ * running session can be carried at once:
+ *   - launch:     a fetch() POST of `/api/sessions` LAUNCHES a fresh session (#37/#31, UC2) —
+ *     the "New session" control's optional initial prompt + working directory/project. The
+ *     launched session is `registering` from birth (#33), so the list leg below surfaces it;
  *   - list:       a fetch() GET of `/api/sessions`, POLLED on an interval, enumerates the
  *     sessions the daemon is carrying (#20) and keeps each row's per-session status live as
  *     sessions change state (#25); the user picks one to view + steer.
@@ -20,18 +23,21 @@
  * This shell is deliberately thin: every decode/classify/format decision lives
  * in the DOM-free `./transcript.js` (unit-tested), every verb→frame decision
  * in the DOM-free `./command.js` (unit-tested), every list diff / label /
- * selection decision in the DOM-free `./sessions.js` (unit-tested), and the
+ * selection decision in the DOM-free `./sessions.js` (unit-tested), every launch
+ * body / typed-failure decision in the DOM-free `./launch.js` (unit-tested), and the
  * connection-health verdict in the DOM-free `./connection.js` (unit-tested).
  * Here we only wire DOM controls to those builders and apply their results to
  * the page. Each poll updates the picker IN PLACE (only the rows that changed)
  * so it stays live without flicker; the always-visible connection-health
  * indicator reflects the two TRANSPORT legs — the poll (fetch) heartbeat and the
  * selected session's SSE stream — as live / reconnecting / offline (#75), never a
- * session's worker status; selecting a session (re)opens its stream and clears the
- * prior session's transcript; a `worker_status` frame updates the CURRENT-TURN
- * indicator in place; every other control event is appended to the TRANSCRIPT; an
- * undecodable line is surfaced verbatim rather than dropped; and an accepted steer
- * is echoed into the transcript (marked outbound) so it is reflected in the viewed session.
+ * session's worker status; an accepted launch refreshes the picker so the new session
+ * shows at once and a failed one surfaces its TYPED code (#37); selecting a session
+ * (re)opens its stream and clears the prior session's transcript; a `worker_status`
+ * frame updates the CURRENT-TURN indicator in place; every other control event is
+ * appended to the TRANSCRIPT; an undecodable line is surfaced verbatim rather than
+ * dropped; and an accepted steer is echoed into the transcript (marked outbound) so
+ * it is reflected in the viewed session.
  */
 
 import { processEventData } from "./transcript.js";
@@ -48,6 +54,7 @@ import { diffSessionList, nextSelection, notificationsDegraded } from "./session
 import { connectionHealth } from "./connection.js";
 import { applyPairingToken, authHeader } from "./pairing.js";
 import { DEVICES_PATH, deviceLabel, isCurrentDevice, isRenderableDevice } from "./devices.js";
+import { launchRequest, launchFailure, describeLaunchAccepted } from "./launch.js";
 
 const connectionEl = document.getElementById("connection");
 const statusEl = document.getElementById("status");
@@ -55,6 +62,12 @@ const activityEl = document.getElementById("activity");
 const eventsEl = document.getElementById("events");
 const sessionListEl = document.getElementById("session-list");
 const refreshSessionsEl = document.getElementById("refresh-sessions");
+const launchFormEl = document.getElementById("launch-form");
+const launchCwdEl = document.getElementById("launch-cwd");
+const launchProjectEl = document.getElementById("launch-project");
+const launchPromptEl = document.getElementById("launch-prompt");
+const launchButtonEl = document.getElementById("launch-button");
+const launchStatusEl = document.getElementById("launch-status");
 const promptFormEl = document.getElementById("prompt-form");
 const promptInputEl = document.getElementById("prompt-input");
 const redirectFormEl = document.getElementById("redirect-form");
@@ -85,6 +98,15 @@ let pollState = "pending";
 let streamState = "idle";
 /** The last connection-health verdict painted to #connection, so an unchanged poll doesn't re-announce it. */
 let renderedConnection = null;
+/**
+ * Whether a launch POST is already in flight, so the "New session" control cannot stack a second one.
+ *
+ * The client half of the very loop `maxSessions` (#36) defends against server-side: every launch
+ * spawns a REAL terminal on the operator's host, and a double-tap on a phone is the cheapest way to
+ * ask for two. The server's cap is the authority (it also bounds a replaying proxy this flag cannot
+ * see); this simply stops the UI from being the thing that asks.
+ */
+let launching = false;
 
 /** Build one transcript `<li>`: a bold subtype label plus an optional human summary. */
 function transcriptItem(subtype, summary) {
@@ -312,6 +334,81 @@ async function loadSessions() {
   }
 }
 
+/**
+ * Read a response's JSON body, or null when there isn't one to read. Every launch answer — accepted
+ * or failed — is JSON from ccctl's own ingress, but the operator's phone reaches it across a tunnel
+ * that can interpose an error page of its own, so a body is never assumed to parse. `./launch.js`
+ * reads a null payload as honestly as a partial one.
+ */
+async function readJson(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Paint the launch outcome (#37). `data-launch` carries the state for colour; a TYPED failure also
+ * renders its `code` as a bold chip ahead of the sentence — mirroring how the transcript renders a
+ * frame's subtype — so the operator SEES which failure it is (AC3) rather than having to
+ * pattern-match the prose. The region is `aria-live`, so each outcome is announced once.
+ */
+function renderLaunchStatus(state, text, code) {
+  launchStatusEl.hidden = false;
+  launchStatusEl.dataset.launch = state;
+  if (code === undefined) {
+    launchStatusEl.textContent = text;
+    return;
+  }
+  const chip = document.createElement("strong");
+  chip.dataset.launchCode = code;
+  chip.textContent = code;
+  launchStatusEl.replaceChildren(chip, document.createTextNode(` ${text}`));
+}
+
+/**
+ * POST one launch upstream: the server runs its injected launcher, places the new session in the
+ * registry as `registering`, and answers 201 with the minted id + how to attach to the surface.
+ *
+ * On success the picker is refreshed at once, so the launched session appears in the list (AC2)
+ * rather than up to a poll interval later — it needs no row of its own here, because it is in the
+ * registry from birth (#33) and the list leg already renders it.
+ *
+ * This does not itself select the launched session — but note that the picker's existing first-load
+ * rule (`nextSelection`) still MAY: launching into an empty list leaves nothing selected, so the
+ * refresh below auto-selects the new `registering` row and opens its stream. That is benign, and
+ * checked rather than assumed: the server holds an SSE open for a `registering` session (it 404s
+ * only an UNKNOWN one), so the stream simply carries nothing until the worker registers and the row
+ * advances in place — and if the worker never comes, the eviction (#33) drops the row, which
+ * `nextSelection` reads as `clear` and `loadSessions` disconnects. So the operator watching their
+ * own launch come up is exactly the intended reading, not a promise the session cannot keep.
+ *
+ * A failure surfaces the server's TYPED code plus its own actionable sentence (AC3) — never an
+ * opaque "launch failed".
+ */
+async function submitLaunch(request) {
+  const response = await fetch(SESSIONS_PATH, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeader(localStorage) },
+    body: JSON.stringify(request),
+  });
+  const payload = await readJson(response);
+  if (!response.ok) {
+    const failure = launchFailure(response.status, payload);
+    renderLaunchStatus("failed", failure.message, failure.code);
+    return;
+  }
+  renderLaunchStatus("launched", describeLaunchAccepted(payload));
+  // The initial prompt is consumed by the launch it seeded — clearing it stops the next "New
+  // session" tap from silently re-seeding the same prompt. Cleared on SUCCESS only, unlike the
+  // steer forms above (which clear optimistically on submit): a launch can fail eight typed ways,
+  // and making the operator retype their prompt to fix a mistyped directory would be hostile. The
+  // cwd / project are their standing context and stay put for the next launch.
+  launchPromptEl.value = "";
+  refreshSessionsNow();
+}
+
 /** Close the active EventSource, if any, and drop the stream leg to idle. */
 function disconnect() {
   if (source !== null) {
@@ -426,6 +523,19 @@ function scheduleNextPoll() {
 }
 
 /**
+ * Re-list NOW and restart the poll clock, so an out-of-band refresh doesn't double-fetch. Shared by
+ * the Refresh button and an accepted launch (which wants its new session in the list at once, #37
+ * AC2). A poll already in flight short-circuits inside `pollSessions` and re-arms the timer itself,
+ * so this is safe to call at any moment.
+ */
+function refreshSessionsNow() {
+  if (pollTimer !== null) {
+    clearTimeout(pollTimer);
+  }
+  pollSessions();
+}
+
+/**
  * Build one device row: a `<li>` keyed by device id — the stable identity a per-device revoke
  * (W6-19, AC3) will hang off — carrying the device's label (name + last-seen, AC1). The current
  * device (AC2) is marked with a `data-current` flag (styled distinctly) plus an appended
@@ -489,12 +599,38 @@ async function loadDevices() {
   applyDeviceList(devices);
 }
 
-// refresh: re-list now and restart the poll clock, so a manual refresh doesn't double-fetch.
-refreshSessionsEl.addEventListener("click", () => {
-  if (pollTimer !== null) {
-    clearTimeout(pollTimer);
+// refresh: re-list the sessions on demand.
+refreshSessionsEl.addEventListener("click", refreshSessionsNow);
+
+// new session: launch one (#37). The cwd is `required` in the markup, so the browser blocks a blank
+// submit before this runs; `launchRequest` returning null is the defensive second half of that pair.
+// The control is disabled for the whole in-flight window — a launch spawns a real terminal, so a
+// double-tap must not ask for two — and a network throw (no answer at all, distinct from a typed
+// refusal) surfaces in the same line rather than as an unhandled rejection.
+launchFormEl.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (launching) {
+    return;
   }
-  pollSessions();
+  const request = launchRequest({
+    cwd: launchCwdEl.value,
+    project: launchProjectEl.value,
+    initialPrompt: launchPromptEl.value,
+  });
+  if (request === null) {
+    return;
+  }
+  launching = true;
+  launchButtonEl.disabled = true;
+  renderLaunchStatus("launching", "launching…");
+  submitLaunch(request)
+    .catch((error) => {
+      renderLaunchStatus("failed", `ccctl: could not reach the server — ${error.message}`);
+    })
+    .finally(() => {
+      launching = false;
+      launchButtonEl.disabled = false;
+    });
 });
 
 // input: send the prompt text to the current turn.

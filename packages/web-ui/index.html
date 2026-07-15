@@ -84,6 +84,35 @@
         border: 1px solid #f59e0b;
         border-radius: 0.25rem;
       }
+      /* The "New session" launch control (#37). Unlike the single-input steer rows below, this form
+         carries three fields plus its submit, so it STACKS rather than sharing one flex row — three
+         inputs abreast are unusable on the phone this UI is driven from. */
+      .launch-form {
+        margin-top: 0.5rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+      /* The launch outcome, in the page's existing status hues: grey while in flight (as #status),
+         running-green on an accepted launch, red on a failure (as a failed device list). */
+      #launch-status[data-launch="launching"] {
+        color: #666;
+      }
+      #launch-status[data-launch="launched"] {
+        color: #047857;
+      }
+      #launch-status[data-launch="failed"] {
+        color: #b91c1c;
+      }
+      /* The TYPED failure code (#33) as a chip ahead of the server's sentence, so WHICH failure it
+         is reads at a glance (#37 AC3) instead of having to be pattern-matched out of the prose. */
+      #launch-status [data-launch-code] {
+        font-family: ui-monospace, monospace;
+        font-size: 0.75rem;
+        padding: 0.05rem 0.4rem;
+        border: 1px solid currentColor;
+        border-radius: 0.25rem;
+      }
       /* The operator's paired-device list (#85). Each row is one device; the current device
          is called out in running-green (the page's "this is live / yours" hue) and bold. */
       #device-list {
@@ -147,6 +176,36 @@
       <section id="sessions">
         <h2>Sessions <button id="refresh-sessions" type="button">Refresh</button></h2>
         <ul id="session-list" aria-live="polite"></ul>
+      </section>
+      <!-- The "New session" control (#37, UC2): launch a fresh session on the operator's host via
+           `POST /api/sessions` (#31). The working directory is the one REQUIRED field — `required`
+           lets the browser block a blank submit natively, and `launch.js` refuses one anyway; the
+           project and initial prompt are optional. The launched session is `registering` from birth
+           (#33), so it lands in the picker above on the refresh an accepted launch triggers. The
+           outcome — the minted id + attach hint, or a TYPED failure code + the server's actionable
+           sentence — lands in the `aria-live` status line below the form. -->
+      <section id="new-session">
+        <h2>New session</h2>
+        <form id="launch-form" class="launch-form">
+          <input
+            id="launch-cwd"
+            name="cwd"
+            type="text"
+            autocomplete="off"
+            required
+            placeholder="Working directory (required, e.g. /home/alex/code/app)"
+          />
+          <input id="launch-project" name="project" type="text" autocomplete="off" placeholder="Project (optional)" />
+          <input
+            id="launch-prompt"
+            name="initialPrompt"
+            type="text"
+            autocomplete="off"
+            placeholder="Initial prompt (optional)"
+          />
+          <button id="launch-button" type="submit">New session</button>
+        </form>
+        <p id="launch-status" aria-live="polite" hidden></p>
       </section>
       <!-- Transport lifecycle of the SSE connection to the selected session. -->
       <section id="status" aria-live="polite">no session selected</section>

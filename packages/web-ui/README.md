@@ -1,11 +1,12 @@
 # @ccctl/web-ui
 
 The zero-build browser UI for [ccctl](../../README.md). Deliberately has **no
-framework and no bundler**: it is a single `index.html` plus seven vanilla ES
+framework and no bundler**: it is a single `index.html` plus eight vanilla ES
 modules served statically — `src/app.js` (the thin DOM shell), `src/transcript.js`
 (the DOM-free downstream rendering logic), `src/command.js` (the DOM-free
 upstream steer-building logic), `src/sessions.js` (the DOM-free session-list
-diff / label / selection logic), `src/connection.js` (the DOM-free
+diff / label / selection logic), `src/launch.js` (the DOM-free "New session"
+launch-body / typed-failure logic), `src/connection.js` (the DOM-free
 connection-health verdict), `src/pairing.js` (the DOM-free QR-pair
 token-application logic) and `src/devices.js` (the DOM-free device-list
 label / last-seen / current-device logic). There is nothing to compile; `build` just copies
@@ -45,6 +46,27 @@ zero-build transport pair:
   (`{ subtype: "approve" }`). An accepted steer (server `202`) is echoed into the
   transcript — marked outbound — so it is reflected in the viewed session even
   before the worker's own events flow back down the SSE stream.
+- **Launch (implemented, #37; UC2 core #31):** a **"New session"** control `fetch`
+  POSTs `{ cwd, permissionMode, project?, initialPrompt? }` to
+  `POST /api/sessions` — the operator's **working directory** (required) plus an
+  optional **project** label and **initial prompt** — and the server runs its
+  injected launcher to bring up a real headful terminal running the patched
+  `claude`. `src/launch.js` owns the body-building and the answer-reading; the
+  `permissionMode` is pinned to `default` rather than offered as a control, because
+  the server requires the field and refuses the non-prompting modes (a session that
+  never blocks could never raise the "awaiting input" signal a remote steer needs —
+  SRV-C-003 / #32). The launched session is `registering` **from birth** (#33), so
+  an accepted launch simply refreshes the list above and the new session appears
+  there. The launch itself selects nothing; the picker's ordinary first-load rule
+  still applies, so launching into an empty list auto-selects the new row and opens
+  its stream — which the server holds until the worker registers and the row advances
+  in place (and if the worker never comes, the eviction drops the row and the
+  selection clears). A failure surfaces the server's
+  **typed** `code` (`invalid-cwd`, `at-capacity`, `backend-unavailable`, … — #33/#36)
+  as a chip alongside the server's own actionable sentence, so the operator is told
+  _which_ failure it is instead of having to pattern-match prose. The control is
+  disabled while a launch is in flight: each one spawns a real terminal, so a
+  double-tap must not ask for two (the client half of `maxSessions`, #36).
 
 Above the session picker sits an always-visible **connection-health indicator
 (#75)** — `live` / `reconnecting` / `offline` — for the phone↔server transport as a
@@ -74,11 +96,18 @@ The `@ccctl/core` frame shapes are **mirrored, not imported** — this UI is ser
 to the browser as-is, so `src/*.js` stays dependency-free vanilla ESM. The
 downstream rendering logic in `src/transcript.js`, the upstream steer-building
 logic in `src/command.js`, the session-list diff / label / selection logic in
-`src/sessions.js`, the connection-health verdict in `src/connection.js`, the
+`src/sessions.js`, the launch-body / typed-failure logic in `src/launch.js`, the
+connection-health verdict in `src/connection.js`, the
 QR-pair token application in `src/pairing.js` and the device-list logic in
 `src/devices.js` are all
-unit-tested (`vitest`), and the e2e harness imports the first two to drive the real
-decode / steer path against a real daemon. The DOM
+unit-tested (`vitest`), and four of them are additionally driven against the **real
+server** — the yardstick a mirror needs, since a unit test can only check a module's
+copy of the contract against a fixture in the same package. `src/transcript.js` +
+`src/command.js` drive the real decode / steer path against a real daemon (a live
+patched worker, so those specs run under `test:e2e`); `src/launch.js` +
+`src/sessions.js` drive the real launch path against the real `POST /api/sessions`
+ingress and its typed-failure branches (with a faked launcher, so that one needs no
+worker and runs on every `test`). The DOM
 shell in `src/app.js` is thin glue that is **not** directly exercised: it reads the
 DOM at module load and the repo ships no DOM driver, so it is verified by
 inspection. That is the split the modules exist to enable — every decision lives in
