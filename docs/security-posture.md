@@ -1,10 +1,11 @@
 # Security posture
 
 > **Status: stub.** This page records `ccctl`'s baseline security _posture_ — the
-> guarantees it is designed to hold, not an as-built description. The full
-> baseline (transport security / certificate pinning, the credential boundary,
-> and the audit trail) is specified in a later item; see
-> [Deferred to a later item](#deferred-to-a-later-item).
+> guarantees it is designed to hold, not an as-built description. The worker↔server
+> channel's certificate pinning is now specified below (its live TLS handshake lands
+> with the real worker — [#67]); the rest of the baseline — the remaining transport
+> security, the credential boundary, and the audit trail — is specified in later
+> items; see [Deferred to a later item](#deferred-to-a-later-item).
 
 `ccctl` runs entirely on your own machine and relays only Claude Code's
 `stream-json` control channel between the worker and your UI. Model inference
@@ -74,6 +75,40 @@ generated, scoped, stored (its at-rest format and permissions), and rotated is t
 credential-boundary spec deferred below; this page fixes the refuse-start-without-auth
 guarantee and where the secret is read from, not its lifecycle.
 
+### Worker↔server certificate pinning
+
+The worker reaches the local server over TLS and **pins the server's public key**:
+it trusts only the expected server certificate, and a substituted certificate —
+even an otherwise-valid one — is rejected, so the worker channel never establishes.
+
+The pin is on the **SPKI** (the certificate's public key), the RFC 7469
+`pin-sha256` construction: the base64 SHA-256 of the certificate's DER
+`SubjectPublicKeyInfo`. `@ccctl/core` owns the `SpkiPin` brand and the pure
+"trusted iff pinned" decision (`certificatePinMatches`); `@ccctl/server` owns the
+`node:crypto` pin computation (`computeSpkiPin`, the sibling of the device-token
+hash) and the guard the worker runs (`assertPinnedServerKey`). No certificate is
+generated or served by `ccctl` in order to pin it — the guard operates on the
+certificate a server presents.
+
+**Rotation / re-pin.** Because the pin is over the KEY, not the whole certificate:
+
+- **A leaf reissue keeps the pin.** Reissuing (renewing) the leaf certificate with
+  the SAME key leaves its `SubjectPublicKeyInfo` — and therefore the pin —
+  unchanged; there is nothing to re-pin.
+- **A key rotation re-pairs.** Rotating the server KEY changes the SPKI, and thus
+  the pin; the worker must be given the new pin. To rotate without downtime, pin
+  BOTH keys for an overlap window (the pinned set holds more than one `SpkiPin`),
+  roll the server to the new key, then retire the old pin. A pinned set is therefore
+  always non-empty and MAY hold several keys.
+
+**Scope — mechanism now, live handshake at [#67].** This page specifies, and
+`@ccctl/server` ships and unit-tests, the pinning **mechanism**: computing a pin,
+accepting the expected key, and rejecting a substituted one. Exercising it over a
+REAL loopback TLS socket — a worker that actually speaks TLS and runs the guard, and
+the rejection of a plaintext endpoint — lands with the real patched worker in [#67],
+the same hard gate every prior security slice defers real-worker proof to. Until
+then the encrypted transport itself is not asserted end-to-end.
+
 ### Tunnel-only exposure
 
 Off-box access is only ever through an outbound tunnel — the
@@ -108,8 +143,9 @@ unchanged.
 This stub deliberately stops at the posture above. The complete security
 baseline is specified in a later item and will cover, at minimum:
 
-- **Transport security & certificate pinning** — TLS and certificate pinning
-  for the tunnel and UI channels.
+- **Transport security** — TLS for the tunnel and UI channels. (The worker↔server
+  channel's certificate pinning is specified above — #59; its live TLS handshake
+  lands with the real worker — #67.)
 - **Credential boundary** — how the local-server auth secret is generated,
   scoped, stored (at-rest format and permissions), and rotated (the fuller
   mechanism behind the mandatory-auth guarantee above; reading a provided secret

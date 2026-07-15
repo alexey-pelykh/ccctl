@@ -326,6 +326,20 @@ export {
   type RandomBytesSource,
 } from "./device-pairing.js";
 
+// Re-export the worker↔server TLS certificate-pinning mechanism (#59) on the public surface —
+// the node:crypto SPKI reduction (computeSpkiPin, sibling to hashDeviceToken) and the pin guard
+// the worker runs (assertPinnedServerKey / CertificatePinMismatchError). `@ccctl/core` owns the
+// pure contract (the SpkiPin brand + the certificatePinMatches decision); these are the
+// runtime-coupled pieces. Ship runtime (the guard + reducer + error), so value exports alongside
+// the named hash-algorithm constant. Defined and unit-tested in certificate-pinning.ts. SCOPE:
+// the mechanism now; the live loopback TLS handshake wiring lands with the real worker (#67).
+export {
+  assertPinnedServerKey,
+  CertificatePinMismatchError,
+  computeSpkiPin,
+  SPKI_PIN_HASH_ALGORITHM,
+} from "./certificate-pinning.js";
+
 // Re-export the single-file JSON-snapshot IDeviceStore backend (#84) on the public surface — the
 // concrete persistence the hub's paired-device registry survives a restart on (a `0600` snapshot
 // at an XDG state path, no plaintext token at rest). `@ccctl/core` owns the runtime-agnostic
