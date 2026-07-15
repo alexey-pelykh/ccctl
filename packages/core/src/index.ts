@@ -402,6 +402,71 @@ export function loggablePairingUrl(url: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// worker↔server transport: TLS certificate pinning (#59)
+// ---------------------------------------------------------------------------
+
+/** Nominal brand for {@link SpkiPin}. */
+declare const spkiPinBrand: unique symbol;
+
+/**
+ * An SPKI certificate pin: the base64 SHA-256 of a certificate's DER-encoded
+ * SubjectPublicKeyInfo — the RFC 7469 `pin-sha256` construction. The worker pins the
+ * EXPECTED server public key by this value; a presented certificate is trusted iff its SPKI
+ * pin is one of the pinned values ({@link certificatePinMatches}).
+ *
+ * Pinning the SPKI (the public KEY) rather than the whole certificate is what makes the pin
+ * survive a leaf-certificate REISSUE with the same key — the reissued leaf carries the same
+ * SubjectPublicKeyInfo, hence the same pin — while a KEY rotation deliberately changes it (a
+ * new key ⇒ a new pin ⇒ a re-pin; see `docs/security-posture.md`, AC4). Branded so it cannot
+ * be confused with an arbitrary string or another hash family (e.g. {@link DeviceTokenHash});
+ * still a `string` (hence a {@link JsonValue}) because it legitimately rides configuration /
+ * JSON at rest.
+ *
+ * Computing a pin from a key is a `node:crypto` digest, so it lives in @ccctl/server's
+ * `computeSpkiPin` — the counterpart to `hashDeviceToken`; core owns only the brand, its
+ * validating constructor, and the pure {@link certificatePinMatches} decision.
+ */
+export type SpkiPin = string & {
+  readonly [spkiPinBrand]: never;
+};
+
+/**
+ * Tag a raw string as a {@link SpkiPin}, failing closed on anything that is not a base64
+ * SHA-256 digest (43 base64 characters + the single `=` that pads a 32-byte hash). A blank or
+ * malformed pin is a misconfiguration, never a valid pin — the same "single place a raw string
+ * becomes X, so every X is valid by construction" treatment {@link deviceTokenHash} applies.
+ * Rejecting a malformed pin HERE means a typo in a pinned value fails LOUD at configuration
+ * time, rather than silently as a never-matching pin that would reject every certificate.
+ */
+export function spkiPin(value: string): SpkiPin {
+  if (!/^[A-Za-z0-9+/]{43}=$/.test(value)) {
+    throw new Error(
+      "ccctl: an SPKI pin must be the base64 SHA-256 of a DER SubjectPublicKeyInfo (43 base64 chars + '=')",
+    );
+  }
+  return value as SpkiPin;
+}
+
+/**
+ * The pinning DECISION, pure and crypto-free: a presented server key (already reduced to its
+ * {@link SpkiPin} by @ccctl/server's `computeSpkiPin`) is trusted iff it is one of `pinnedKeys`.
+ * Plain set membership, deliberately NOT a constant-time compare — a pin is a hash of a PUBLIC
+ * key, so there is no secret to protect from timing.
+ *
+ * Fails CLOSED on an empty `pinnedKeys`: pinning against no keys is a misconfiguration (it can
+ * only mean "trust nothing", or — if misread — "trust everything"), so it throws rather than
+ * silently rejecting or accepting. Supporting MULTIPLE pinned keys is exactly what gives a key
+ * rotation its overlap window — pin both the outgoing and incoming keys, roll the server key,
+ * then retire the old pin (`docs/security-posture.md`, AC4).
+ */
+export function certificatePinMatches(pinnedKeys: readonly SpkiPin[], presented: SpkiPin): boolean {
+  if (pinnedKeys.length === 0) {
+    throw new Error("ccctl: certificate pinning requires at least one pinned key");
+  }
+  return pinnedKeys.includes(presented);
+}
+
+// ---------------------------------------------------------------------------
 // session / state model
 // ---------------------------------------------------------------------------
 
