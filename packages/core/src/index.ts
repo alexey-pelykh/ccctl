@@ -1453,12 +1453,20 @@ export type BridgeCredentialJsonProofs = [
  * marker (#26), changing the persisted registry shape — so a pre-#26 `version: 1`
  * snapshot, whose sessions lack the field, is fail-closed on load rather than
  * loaded as a `Session` with an `undefined` marker.
+ *
+ * `3` (was `2`): {@link UnreadEntry} gained the required `eventId` — the per-session
+ * SSE `Last-Event-ID` the needs-you was broadcast under, which the unread-queue
+ * reconcile (#47) orders and acknowledges by. A pre-#47 `version: 2` snapshot, whose
+ * unread entries lack the field, is fail-closed on load rather than loaded as an entry
+ * with an `undefined` order/ack key. The store is "safe to lose" state, so the
+ * one-time hard stop on upgrade is the correct cost of a clean shape.
  */
-export const SESSION_STORE_SNAPSHOT_VERSION = 2;
+export const SESSION_STORE_SNAPSHOT_VERSION = 3;
 
 /**
  * A single unread marker: a per-session {@link SessionActivity} the operator has
- * not yet seen, held in the hub's unread *queue* (ordered by {@link UnreadEntry.at}).
+ * not yet seen, held in the hub's unread *queue* (reconciled in {@link UnreadEntry.eventId}
+ * order on reconnect, #47).
  * This is the persisted FACE of an unread notification — the minimal signal
  * needed to re-render "session X needs attention" after a restart — not a full
  * notification/dismissal model (that behaviour lives above this seam).
@@ -1470,7 +1478,16 @@ export const SESSION_STORE_SNAPSHOT_VERSION = 2;
 export interface UnreadEntry {
   /** The {@link Session.id} this unread marker belongs to. */
   readonly sessionId: string;
-  /** Epoch millis when the activity became unread — the queue's ordering key. */
+  /**
+   * The per-session SSE `Last-Event-ID` (the monotonic event-stream cursor, from 1)
+   * the unseen activity was broadcast under. The unread-queue reconcile (#47) ORDERS a
+   * session's entries by it and ACKNOWLEDGES an entry by it: it is the client's own
+   * cursor handle onto the event, so a reconnecting client acks exactly what it saw.
+   * Distinct from {@link UnreadEntry.at} (wall-clock provenance): a strict per-session
+   * total order, not a timestamp that can tie within a millisecond.
+   */
+  readonly eventId: number;
+  /** Epoch millis when the activity became unread — wall-clock provenance for display. */
   readonly at: number;
   /**
    * The unseen {@link SessionActivity} (e.g. `requires_action` — the worker is
@@ -1496,7 +1513,7 @@ export interface SessionStoreSnapshot {
   readonly version: number;
   /** The session registry — every {@link Session} the hub tracks. */
   readonly sessions: readonly Session[];
-  /** The unread queue — unseen per-session activity, ordered by {@link UnreadEntry.at}. */
+  /** The unread queue — unseen per-session activity, reconciled in {@link UnreadEntry.eventId} order (#47). */
   readonly unread: readonly UnreadEntry[];
 }
 

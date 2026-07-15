@@ -51,10 +51,15 @@ const sessions: readonly Session[] = [
   createSession("sess-fresh", "default", T0 + 10),
 ];
 
-/** A representative unread queue, ordered by `at`. */
+/** A representative unread queue; each entry carries the SSE `eventId` it was broadcast under. */
 const unread: readonly UnreadEntry[] = [
-  { sessionId: "sess-blocked", at: T0 + 6, activity: { kind: "requires_action", detail: "Approve tool use?" } },
-  { sessionId: "sess-running", at: T0 + 7, activity: { kind: "idle" } },
+  {
+    sessionId: "sess-blocked",
+    eventId: 3,
+    at: T0 + 6,
+    activity: { kind: "requires_action", detail: "Approve tool use?" },
+  },
+  { sessionId: "sess-running", eventId: 4, at: T0 + 7, activity: { kind: "idle" } },
 ];
 
 /** A full, non-empty snapshot fixture. */

@@ -90,7 +90,21 @@ one-way digest of the session pointer, so repeated wakes for one blocked session
 single notification rather than stacking, yet the gateway that reads that collapse id (a cleartext
 Web-Push `Topic` header) still never learns which session it is. This slice fixes only the
 pointer-only SHAPE, its firewall, and those directives; the wake **dispatch** itself (and its VAPID
-key handling, [#50](https://github.com/alexey-pelykh/ccctl/issues/50)) is a later item. Upstream, the browser steers a
+key handling, [#50](https://github.com/alexey-pelykh/ccctl/issues/50)) is a later item.
+
+Because both rungs above can miss — the live SSE relay misses a disconnected client, and a push is
+at-most-once (coalesced by its `Topic`, dropped on expiry, or lost when a subscription lapses) — a
+blocking needs-you is ALSO enqueued to a **persisted unread queue**
+([#47](https://github.com/alexey-pelykh/ccctl/issues/47), `unread-queue.ts`), reconciled over the
+tunnel on reconnect: the queue, not the at-most-once push, is the source of truth. Each entry carries
+the per-session SSE `Last-Event-ID` it was broadcast under, so a reconnecting client is delivered
+exactly its still-un-acknowledged entries in that order; an acknowledgement REMOVES the entry (so it
+is never re-delivered), and the queue rides the `0600` session-store snapshot
+([#23](https://github.com/alexey-pelykh/ccctl/issues/23)) so it survives a daemon restart. Like the
+push shape above, the queue OPERATIONS are pure and not yet wired into a live dispatch path — the
+store's own daemon wiring is a later item.
+
+Upstream, the browser steers a
 chosen session with a `fetch` **POST** to `/api/sessions/{id}/command`: a `prompt`
 becomes a `{ type: "user" }` turn injected on that session's worker downstream, any
 other verb a `control_request` — both pushed as a `client_event` frame. Naming the
