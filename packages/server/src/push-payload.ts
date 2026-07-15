@@ -27,14 +27,18 @@
  * no seam through which content could enter a push — proven by feeding a detail-bearing notification to
  * {@link toPushPayload} and observing the detail cannot appear (push-payload.test.ts).
  *
- * **Scope (SRV-C-004, first of the W5 push ladder).** This module fixes the pointer-only SHAPE and its
- * firewall — nothing more. The actual wake DISPATCH and VAPID key handling (#50), the reliability headers
- * `Urgency: high` + a collapse id (#46), the unread-queue reconcile (#47), and the client's PWA
- * subscription (#51) / tap→deep-link fetch (#52) are separate downstream slices that CONSUME this shape.
- * The `wake_seq` / `sent_at_ms` VALUES are supplied by that future dispatcher; #45 only guarantees the
- * shape they travel in stays bounded and content-free.
+ * **Scope (first of the W5 push ladder).** #45 (SRV-C-004) fixed the pointer-only SHAPE and its firewall;
+ * #46 (SRV-B-007 a,b) adds — still purely, still unwired to any dispatch — the **reliability directives** a
+ * wake carries ({@link PushReliability}, {@link toPushReliability}): the `Urgency: high` marker and an
+ * OPAQUE per-session collapse id, so repeated wakes for one blocked session coalesce rather than stack. The
+ * actual wake DISPATCH and VAPID key handling (#50), the unread-queue reconcile (#47), and the client's PWA
+ * subscription (#51) / tap→deep-link fetch (#52) remain separate downstream slices that CONSUME these
+ * shapes. The `wake_seq` / `sent_at_ms` VALUES are supplied by that future dispatcher; this module only
+ * guarantees the shapes they travel in stay bounded, content-free, and — for the gateway-visible collapse
+ * id — pointer-free.
  */
 
+import { createHash } from "node:crypto";
 import { NOTIFICATION_CLASS_BLOCKING } from "./worker-channel.js";
 
 /**
@@ -56,7 +60,8 @@ export const PUSH_WAKE_TEXT = "A session needs your input";
  *     content is fetched over the tunnel and is NEVER in this payload.
  *   - `text` — the minimal generic {@link PUSH_WAKE_TEXT}; never the `requires_action` detail.
  *   - `notification_class` — the blocking class (#44) carried FORWARD from the source notification (reused,
- *     never re-derived), so a consumer (#46 maps it to `Urgency: high`) keys on the class without
+ *     never re-derived) and pinned in this payload's TYPE, so the reliability derivation
+ *     ({@link toPushReliability}, #46) can pin `Urgency: high` as a type-level consequence — without
  *     re-inspecting the wake. Only the blocking "it is waiting on you" class is push-woken; the
  *     informational idle nudge (#41) is quiet/batchable and is not.
  *
@@ -83,8 +88,10 @@ export interface PushPayload {
  *
  * "Existence" (AC2) is the mere presence of a view — a wake occurred. There is deliberately NO `session_id`
  * / `text` / `detail` / transcript field: the type IS the AC2 firewall. The `wake_seq` / `sent_at_ms`
- * VALUES are supplied by the future dispatcher (#50) and reliability headers (#46); #45 fixes only that
- * whatever the gateway sees is this bounded, content-free, pointer-free shape.
+ * VALUES are supplied by the future dispatcher (#50); #45 fixes only that whatever the gateway sees is this
+ * bounded, content-free, pointer-free shape. The wake's reliability directives — `Urgency: high` + an
+ * opaque collapse id (#46) — are the OTHER gateway-visible shape ({@link PushReliability}), likewise
+ * content-free and pointer-free.
  */
 export interface PushGatewayView {
   readonly subscription_id: string;
@@ -135,4 +142,86 @@ export function toPushGatewayView(subscriptionId: string, wakeSeq: number, sentA
     wake_seq: wakeSeq,
     sent_at_ms: sentAtMs,
   });
+}
+
+/**
+ * The RFC 8030 §5.3 `Urgency` value a blocking push wake carries (#46 AC3) — `"high"`: "surface now", the
+ * one wake class that should pull a backgrounded/closed client back immediately (and, on a
+ * battery-constrained push service, be delivered rather than deferred). It is the wire header value the
+ * future dispatcher (#50) stamps onto the Web-Push request — distinct from, though aligned with, the
+ * blocking notification class's INTERNAL high-urgency handling policy (#44 `BLOCKING_NOTIFICATION.urgency`):
+ * that policy governs how the UI surfaces the SSE notification; this is the push TRANSPORT's delivery
+ * priority. Only the blocking class is push-woken (the informational idle nudge is quiet/batchable and
+ * never becomes a wake), so a wake's Urgency is always high.
+ */
+export const PUSH_URGENCY_HIGH = "high";
+
+/**
+ * The maximum length of a {@link PushReliability.collapse_id} (#46 AC3) — 32, the RFC 8030 §5.4 `Topic`
+ * header cap ("no more than 32 characters from the URL- and filename-safe Base64 alphabet [RFC 4648 §5]").
+ * The collapse id IS that Topic — the coalescing key a Web-Push service compares to replace an undelivered
+ * wake with a newer one for the same blocked session — so it MUST fit the cap or the push service rejects
+ * it and coalescing silently stops. Named, not a hidden 32, so the derivation and its test assert against
+ * one source of truth.
+ */
+export const PUSH_COLLAPSE_ID_MAX_LENGTH = 32;
+
+/**
+ * The **reliability directives** a blocking push wake carries (#46 AC3) — the two Web-Push delivery
+ * controls that make a wake reliable WITHOUT stacking, derived from a {@link PushPayload} and handed to the
+ * future dispatcher (#50) to stamp onto the outgoing Web-Push request:
+ *   - `urgency` — the RFC 8030 §5.3 `Urgency` header, always {@link PUSH_URGENCY_HIGH} for a wake (only the
+ *     blocking class is push-woken). The "surface now" marker AC3 asks for.
+ *   - `collapse_id` — the RFC 8030 §5.4 `Topic` header: the COALESCING key. A push service replaces an
+ *     undelivered wake with a newer one carrying the SAME Topic, so repeated wakes for ONE blocked session
+ *     collapse to a single notification rather than piling up (AC3 "repeats coalesce, do not stack"). It is
+ *     OPAQUE — a one-way digest of the session pointer, never the pointer itself — because the Topic rides
+ *     as a CLEARTEXT HTTP header the EXTERNAL push gateway reads, and #45's firewall forbids that gateway
+ *     ever learning which session is which (the pointer rides only the encrypted payload). Stable per
+ *     session (so a re-nudge (#48) for the same session reuses it and coalesces) and distinct across
+ *     sessions (so two different blocked sessions do NOT collapse into one wake).
+ *
+ * Frozen for the same runtime-firewall reason as the sibling shapes: a downstream dispatcher cannot mutate
+ * the urgency down or swap a session-revealing collapse id back in.
+ */
+export interface PushReliability {
+  readonly urgency: typeof PUSH_URGENCY_HIGH;
+  readonly collapse_id: string;
+}
+
+/**
+ * Derive the OPAQUE per-session collapse id (#46 AC3) — the RFC 8030 §5.4 `Topic` — from the opaque session
+ * pointer. A keyless SHA-256 digest, base64url-encoded (the RFC 4648 §5 / RFC 8030 §5.4 alphabet) and
+ * clamped to {@link PUSH_COLLAPSE_ID_MAX_LENGTH}:
+ *   - **Opaque.** The Topic is a cleartext HTTP header the external push gateway reads, so it must not BE
+ *     the session pointer (#45's firewall). A one-way digest reveals nothing invertible: the session id is
+ *     a 122-bit-entropy server-minted UUID, so the gateway can neither invert the hash nor enumerate
+ *     candidates to confirm one — it learns only a stable token, never which session. Keyless (no server
+ *     secret to manage — that stays #50's VAPID concern); the UUID's entropy alone carries the opacity.
+ *   - **Stable per session.** Deterministic, so every wake for one blocked session (including a re-nudge,
+ *     #48) yields the SAME Topic and the push service coalesces them.
+ *   - **Distinct across sessions.** Different session ids give different digests (collision negligible at
+ *     192 truncated bits), so two blocked sessions never collapse into one wake.
+ *
+ * Deterministic and 0 I/O (a digest, not randomness or a clock) — the module's purity stance holds.
+ */
+function collapseIdFor(sessionId: string): string {
+  return createHash("sha256").update(sessionId).digest("base64url").slice(0, PUSH_COLLAPSE_ID_MAX_LENGTH);
+}
+
+/**
+ * Derive the {@link PushReliability} directives from a pointer-only {@link PushPayload} (#46 AC3). Reads
+ * ONLY the payload's opaque session pointer (→ an opaque, gateway-safe collapse id via
+ * {@link collapseIdFor}); the urgency is a fixed {@link PUSH_URGENCY_HIGH}, correct WITHOUT re-inspecting
+ * the wake because {@link PushPayload} statically pins the blocking class #45 carried forward (only the
+ * blocking class is push-woken) — so high is a type-level consequence of that pinned class, not a per-wake
+ * read. Carries no `detail`/transcript/content and does not expose the session pointer, so — like its
+ * sibling builders — the reliability shape a push gateway reads stays content-free and pointer-free. Frozen
+ * so the pointer-free / high-urgency guarantees also hold at runtime.
+ */
+export function toPushReliability(payload: PushPayload): PushReliability {
+  return Object.freeze({
+    urgency: PUSH_URGENCY_HIGH,
+    collapse_id: collapseIdFor(payload.session_id),
+  } as const);
 }

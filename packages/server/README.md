@@ -83,8 +83,14 @@ needs your input") — never the `detail` or any session content, and the gatewa
 bounded metadata (a wake's existence, timing, and cadence, plus a stable subscription id) — never
 the pointer or the content. The actual session content is fetched back over the **tunnel** on tap
 (the opaque id is the deep-link target), so nothing a session is saying ever leaves the box in a
-push. This slice fixes only that pointer-only SHAPE and its firewall; the wake dispatch itself
-(and its VAPID/`Urgency`/collapse-id handling) is a later item. Upstream, the browser steers a
+push. Each wake also carries two **reliability directives**
+([#46](https://github.com/alexey-pelykh/ccctl/issues/46)): the `Urgency: high` marker (so a
+backgrounded client is pulled back now, not deferred) and an **opaque per-session collapse id** — a
+one-way digest of the session pointer, so repeated wakes for one blocked session coalesce into a
+single notification rather than stacking, yet the gateway that reads that collapse id (a cleartext
+Web-Push `Topic` header) still never learns which session it is. This slice fixes only the
+pointer-only SHAPE, its firewall, and those directives; the wake **dispatch** itself (and its VAPID
+key handling, [#50](https://github.com/alexey-pelykh/ccctl/issues/50)) is a later item. Upstream, the browser steers a
 chosen session with a `fetch` **POST** to `/api/sessions/{id}/command`: a `prompt`
 becomes a `{ type: "user" }` turn injected on that session's worker downstream, any
 other verb a `control_request` — both pushed as a `client_event` frame. Naming the
