@@ -40,9 +40,16 @@ function fakeLauncher(hint = "tmux attach -t ccctl:1", attachable = true): ISess
 
 const started: CcctlServer[] = [];
 
-/** Start a real loopback server on an ephemeral port, tracked for teardown. */
-async function startTestServer(launcher: ISessionLauncher | undefined): Promise<CcctlServer> {
-  const server = await startServer(launcher === undefined ? { port: 0 } : { port: 0, launcher });
+/**
+ * Start a real loopback server on an ephemeral port, tracked for teardown. `maxSessions` (#36) lowers
+ * the launch cap so the at-capacity wire can be reached in two launches rather than nine.
+ */
+async function startTestServer(launcher: ISessionLauncher | undefined, maxSessions?: number): Promise<CcctlServer> {
+  const server = await startServer({
+    port: 0,
+    ...(launcher === undefined ? {} : { launcher }),
+    ...(maxSessions === undefined ? {} : { maxSessions }),
+  });
   started.push(server);
   return server;
 }
@@ -92,6 +99,22 @@ describe("defaultSessionClient.launch — real POST /api/sessions wire (UC2)", (
     await expect(
       defaultSessionClient.launch(server.address, { cwd: LAUNCH_CWD, permissionMode: "default" }),
     ).rejects.toThrow(/no session launcher is configured.*Is this the right server\?/s);
+  });
+
+  it("maps a real 429 `at-capacity` to an error naming the cap AND how to see what holds it (#36)", async () => {
+    // A cap of 1, so the SECOND launch is the refused one. A real-wire lock like its siblings: 429 is
+    // a status the CLI has never seen before #36, and the client branches on the typed `code` rather
+    // than the status — this proves that holds for a status nothing else in the launch path answers.
+    const server = await startTestServer(fakeLauncher(), 1);
+    await defaultSessionClient.launch(server.address, { cwd: LAUNCH_CWD, permissionMode: "default" });
+
+    const error = await defaultSessionClient
+      .launch(server.address, { cwd: LAUNCH_CWD, permissionMode: "default" })
+      .catch((e: unknown) => e as Error);
+
+    // The daemon's own sentence (which names the numbers) plus the CLI's next-move hint — the CLI
+    // knows something the daemon does not: the command that lists who is holding the slots.
+    expect(error.message).toMatch(/at capacity.*cap is 1.*ccctl attach/s);
   });
 
   it("maps a real 400 `invalid-cwd` to an error naming the directory AND the flag that fixes it", async () => {

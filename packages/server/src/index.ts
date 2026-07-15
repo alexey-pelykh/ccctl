@@ -72,12 +72,16 @@ import {
 import { handleUiCommand } from "./ui-command.js";
 import { handleSessionsList, matchUiSessionRoute } from "./ui-sessions.js";
 import {
+  DEFAULT_MAX_SESSIONS,
   handleSessionLaunch,
   launchSession as launchTrackedSession,
   releaseLaunchedSessions,
   type LaunchOutcome,
 } from "./ui-session-launch.js";
 import { DEFAULT_REGISTRATION_TIMEOUT_MS, type PendingLaunch } from "./pending-launch.js";
+// The §1 wire's own "is this a usable concurrent-session cap" guard, reused verbatim to validate this
+// server's `maxSessions` (#36) — one rule for both caps rather than two that drift (bridge-wire.ts).
+import { isPositiveInteger } from "./bridge-wire.js";
 import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
 import {
   reconcileRecordedLaunches,
@@ -169,6 +173,12 @@ export {
   type LaunchFailureCode,
 } from "./session-launcher.js";
 export type { LaunchFailureWire, LaunchOutcome } from "./ui-session-launch.js";
+
+// Re-export the launch cap's public constant (#36) — the default ceiling (8) on live sessions, past
+// which a launch is refused `at-capacity`. A caller overrides it via ServerConfig.maxSessions;
+// exported so it can name the default rather than re-hardcode 8, exactly as the sibling
+// DEFAULT_REGISTRATION_TIMEOUT_MS below is. Defined and unit-tested in ui-session-launch.ts.
+export { DEFAULT_MAX_SESSIONS } from "./ui-session-launch.js";
 
 // Re-export the pending-launch registry's public constant (#33) — the default window a launched
 // session may stay `registering` before it is evicted as a ghost. The daemon (and a test) overrides
@@ -320,6 +330,32 @@ export interface ServerConfig {
    */
   launcher?: ISessionLauncher;
   /**
+   * Ceiling on how many sessions may be LIVE at once (#36) — a `POST /api/sessions` (or a
+   * programmatic {@link CcctlServer.launchSession}) that would exceed it is refused with a typed
+   * `at-capacity` {@link LaunchFailureCode} rather than spawning another terminal. Defaults to
+   * {@link DEFAULT_MAX_SESSIONS} (8).
+   *
+   * Bounds a remotely-triggered launch loop: each launch spawns a real terminal on the host, so an
+   * unbounded one exhausts it and kills the operator's own sessions (`SRV-B-003`). Counts ALL live
+   * sessions — launched (#31) and UC1-attached alike — so the ceiling is on what the host is
+   * actually carrying, not on what this server happened to start, plus any launch in flight (so a
+   * concurrent burst is bounded, not just a sequential caller). A slot frees whenever a session ends,
+   * and the next launch succeeds.
+   *
+   * MUST be a positive integer — {@link startServer} REJECTS on anything else rather than degrading
+   * to the default. `NaN` in particular (what `Number(process.env.CCCTL_MAX_SESSIONS)` yields for an
+   * unset or mistyped var) would make every `live >= cap` comparison false and silently disable the
+   * cap altogether, so it is refused at the door: this is a safety ceiling, and it fails closed.
+   *
+   * Not to be confused with the §1 environment's own `max_sessions` (`EnvironmentRegisterRequestBody`)
+   * — that is a ceiling an environment DECLARES about itself on the bridge wire; this is the one this
+   * server ENFORCES on its own launches.
+   *
+   * Raise it on a host that can carry more; a test lowers it to exercise the refusal without
+   * spawning eight of anything.
+   */
+  maxSessions?: number;
+  /**
    * How long (ms) a LAUNCHED session may stay `registering` — up on its terminal but not yet
    * checked in over the bridge (§2) — before it is evicted as a ghost (#33): its session dropped
    * from the registry and its terminal closed, so a worker that never registers cannot leave an
@@ -416,6 +452,13 @@ interface ServerState {
   readonly launcher: ISessionLauncher | undefined;
   /** Handles to the terminals this server launched (#31), tracked so shutdown tears them down. */
   readonly launchedSessions: Set<LaunchedSession>;
+  /**
+   * Ceiling on live sessions (#36) — a launch past it is refused `at-capacity`. Counts `sessions`
+   * plus `launchReservations`. Validated at {@link startServer}, so it is always a positive integer.
+   */
+  readonly maxSessions: number;
+  /** Slots held by in-flight launches (#36) — taken before the launcher runs, released when it settles. */
+  readonly launchReservations: Set<symbol>;
   /**
    * Launches awaiting their worker's registration (#33), keyed by the session id minted at launch —
    * each holding its terminal handle and an armed eviction timer. A launch adds one; the §2
@@ -582,6 +625,27 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
  */
 export function startServer(config: ServerConfig): Promise<CcctlServer> {
   const host = config.host ?? DEFAULT_HOST;
+  // Refuse a nonsense session cap AT BOOT, before anything binds (#36). `??` only defends against an
+  // absent value, and the values it lets through are not all harmless: `NaN` — trivially produced by
+  // the very `Number(process.env.…)` an embedder writes to honor the cap's config-overridability —
+  // makes `live >= cap` ALWAYS FALSE, so the guard silently never fires. A safety cap that fails OPEN
+  // is worse than none: it reports a bound it is not enforcing. A negative or fractional cap is
+  // likewise a mistake, not an intent. So this fails CLOSED and LOUDLY, in the one place the number
+  // enters the server, rather than degrading to the default — an operator who asked for a specific
+  // cap and silently got 8 has been told nothing, and would find out by watching a loop run.
+  //
+  // REJECTED, not thrown: this function's contract is to return a promise, and it already rejects for
+  // the other way a start can fail (`brandListenError` below). A synchronous throw out of a
+  // promise-returning function is the classic mixed-contract footgun — `startServer(cfg).catch(…)`
+  // would not catch it — so the one entry point answers its caller one way, always.
+  if (config.maxSessions !== undefined && !isPositiveInteger(config.maxSessions)) {
+    return Promise.reject(
+      new Error(
+        `ccctl: maxSessions must be a positive integer (got \`${String(config.maxSessions)}\`) — ` +
+          "it is the ceiling on live sessions, and a cap that is not a counting number cannot bound anything",
+      ),
+    );
+  }
   const state: ServerState = {
     sessions: new Map<string, Session>(),
     environments: new Map<string, EnvironmentRecord>(),
@@ -589,6 +653,8 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     eventRelays: createSessionEventRelays(),
     launcher: config.launcher,
     launchedSessions: new Set<LaunchedSession>(),
+    maxSessions: config.maxSessions ?? DEFAULT_MAX_SESSIONS,
+    launchReservations: new Set<symbol>(),
     pendingLaunches: new Map<string, PendingLaunch>(),
     registrationTimeoutMs: config.registrationTimeoutMs ?? DEFAULT_REGISTRATION_TIMEOUT_MS,
     workPollTimeoutMs: config.workPollTimeoutMs ?? DEFAULT_WORK_POLL_TIMEOUT_MS,

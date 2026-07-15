@@ -211,6 +211,12 @@ export interface ISessionLauncher {
  *     is not a directory), `non-prompting-mode` (a mode that could never raise the awaiting-input
  *     signal, SRV-C-003), `malformed-request` (an unparseable body);
  *   - this SERVER cannot launch at all — `launcher-absent` (no launcher was wired into it);
+ *   - this SERVER will not launch RIGHT NOW — `at-capacity` (#36): every slot under the
+ *     `maxSessions` cap is held by a live session, so a further launch is refused until one ends.
+ *     Its own branch of the partition because it is the only failure that is neither permanent nor
+ *     anybody's mistake: the request is well-formed, the host is healthy, and the same launch
+ *     succeeds unchanged the moment a slot frees. That is precisely what the operator must be told
+ *     — not "it broke", but "not yet";
  *   - the HOST cannot bring a surface up — `backend-unavailable` (no backend could: tmux is
  *     absent AND the owned-pty fallback could not load), `worker-not-found` (the patched
  *     `claude` binary is not executable at the path the worker argv names);
@@ -218,9 +224,15 @@ export interface ISessionLauncher {
  *     spawned for a reason the server cannot classify structurally. It is a real answer, not a
  *     dumping ground: a backend that CAN name its failure must, and only an unclassifiable one
  *     lands here.
+ *
+ * A BACKEND never raises `at-capacity` (nor `launcher-absent` / `malformed-request`): the cap is
+ * this server's own policy, counted over state only the server holds, and it is enforced ahead of
+ * the port in {@link launchSession}. A backend that has its own ceiling still reports it as
+ * whatever it structurally is — a rejected spawn is `spawn-failed`.
  */
 export type LaunchFailureCode =
   | "launcher-absent"
+  | "at-capacity"
   | "malformed-request"
   | "non-prompting-mode"
   | "invalid-cwd"
@@ -231,6 +243,7 @@ export type LaunchFailureCode =
 /** The pinned {@link LaunchFailureCode} set, in one place, for the guard, the status map, and the tests. */
 export const LAUNCH_FAILURE_CODES: readonly LaunchFailureCode[] = [
   "launcher-absent",
+  "at-capacity",
   "malformed-request",
   "non-prompting-mode",
   "invalid-cwd",

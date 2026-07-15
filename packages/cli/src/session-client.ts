@@ -124,6 +124,7 @@ interface LaunchFailure {
  */
 const LAUNCH_FAILURE_HINTS: Partial<Record<LaunchFailureCode, string>> = {
   "launcher-absent": "Is this the right server? (a daemon without a launcher can relay sessions but not start them)",
+  "at-capacity": "Run `ccctl attach` to see which sessions hold the slots",
   "invalid-cwd": "Pass an existing directory with `--cwd`",
   "backend-unavailable": "Install tmux for an attachable terminal, or build the optional `node-pty` fallback",
   "worker-not-found": "Check that the patched `claude` is installed and on PATH (`ccctl patch`)",

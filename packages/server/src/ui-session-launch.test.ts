@@ -6,8 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { SESSIONS_PATH } from "@ccctl/core";
-import { DEFAULT_HOST, startServer, type CcctlServer, type ServerConfig } from "./index.js";
+import { DEFAULT_HOST, DEFAULT_MAX_SESSIONS, startServer, type CcctlServer, type ServerConfig } from "./index.js";
 import {
+  isLaunchFailureCode,
+  LAUNCH_FAILURE_CODES,
   SessionLaunchError,
   type ISessionLauncher,
   type LaunchedSession,
@@ -61,21 +63,30 @@ afterAll(() => {
  * was launched" is expressed, which is the whole hazard #35 addresses. Defaults to
  * `alive-server-owned`: an ordinary launched surface nobody has touched, which teardown may reap.
  */
-function fakeLauncher(hint = "tmux attach -t ccctl:1", attachable = true) {
+function fakeLauncher({ hint = "tmux attach -t ccctl:1", attachable = true, launchDelayMs = 0 } = {}) {
   const launches: SessionLaunchOptions[] = [];
   let closes = 0;
   const state = { liveness: "alive-server-owned" as SurfaceLiveness };
   const launcher: ISessionLauncher = {
-    launch(options: SessionLaunchOptions): Promise<LaunchedSession> {
+    async launch(options: SessionLaunchOptions): Promise<LaunchedSession> {
       launches.push(options);
-      return Promise.resolve({
+      // `launchDelayMs` models how long a REAL backend takes to bring a surface up — tmux shells out,
+      // the pty forks — and defaults to 0 because no other test needs it. The cap's concurrency test
+      // (#36) does, and cannot be written without it: a launcher that resolves in a MICROTASK lets each
+      // request run to its registry write before the next is dequeued, so a burst against a
+      // zero-delay fake serializes itself and the check-then-act window never opens. The race that
+      // fake hides is real on both backends — so a delay here is the honest fake, not a contrived one.
+      if (launchDelayMs > 0) {
+        await sleep(launchDelayMs);
+      }
+      return {
         attachment: { attachable, hint },
         liveness: (): Promise<SurfaceLiveness> => Promise.resolve(state.liveness),
         close: (): Promise<void> => {
           closes += 1;
           return Promise.resolve();
         },
-      });
+      };
     },
   };
   return {
@@ -154,7 +165,7 @@ function sleep(ms: number): Promise<void> {
 
 describe("POST /api/sessions (launch)", () => {
   it("launches via the injected launcher and answers 201 with the session id and surface attachment", async () => {
-    const { launcher, launches } = fakeLauncher("tmux attach -t ccctl:2", true);
+    const { launcher, launches } = fakeLauncher({ hint: "tmux attach -t ccctl:2", attachable: true });
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
 
     const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
@@ -168,7 +179,7 @@ describe("POST /api/sessions (launch)", () => {
   });
 
   it("surfaces a DEGRADED attachment when the backend that launched is a fallback", async () => {
-    const { launcher } = fakeLauncher("owned pty: attach is degraded", false);
+    const { launcher } = fakeLauncher({ hint: "owned pty: attach is degraded", attachable: false });
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
 
     const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
@@ -345,6 +356,332 @@ describe("POST /api/sessions — a failed launch is typed, and leaves nothing be
       expect(await res.json()).toMatchObject({ code: "spawn-failed" });
       expect(await listSessions(server)).toEqual([]);
     }
+  });
+});
+
+// #36 — the maxSessions cap. A phone-side loop must not be able to spawn unbounded terminals, so a
+// launch past the cap is REFUSED with a typed `at-capacity` (rather than spawning an Nth window and
+// hoping). Every test here fills the cap through a REAL path — a launch, or a §2 registration — and
+// then asserts the refusal, so none of them can pass against a cap counting the wrong set.
+describe("the maxSessions cap (#36)", () => {
+  /** Launch `n` sessions that all SUCCEED, asserting each one as it goes — the cap's "below" side. */
+  async function fillByLaunching(server: CcctlServer, n: number): Promise<void> {
+    for (let i = 0; i < n; i += 1) {
+      const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+      expect(res.status).toBe(201);
+    }
+  }
+
+  it("launches while BELOW the cap — including the cap-th launch itself", async () => {
+    const { launcher, launches } = fakeLauncher();
+    // A long registration timeout: these sessions must stay `registering` (and so keep holding their
+    // slots) for the whole test, or an eviction would free one behind our back and hide an off-by-one.
+    const server = await startTestServer({
+      port: 0,
+      host: DEFAULT_HOST,
+      launcher,
+      maxSessions: 3,
+      registrationTimeoutMs: 60_000,
+    });
+
+    // The boundary from below: the 3rd launch is AT the cap and must still succeed — the cap is the
+    // number of sessions allowed, not the number after which one is refused.
+    await fillByLaunching(server, 3);
+
+    expect(launches).toHaveLength(3);
+    expect(server.sessions.size).toBe(3);
+  });
+
+  it("refuses the launch PAST the cap with a typed `at-capacity` — and spawns nothing", async () => {
+    const { launcher, launches } = fakeLauncher();
+    const server = await startTestServer({
+      port: 0,
+      host: DEFAULT_HOST,
+      launcher,
+      maxSessions: 2,
+      registrationTimeoutMs: 60_000,
+    });
+    await fillByLaunching(server, 2);
+
+    const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+
+    // Typed, and surfaced to the UI: the machine-readable `code` a UI branches on, plus the human
+    // sentence every ccctl failure carries. The status is 429 — the request is well-formed and the
+    // server REFUSES it by policy (like `non-prompting-mode`, a 4xx), not a host that could not
+    // bring a surface up (502).
+    expect(res.status).toBe(429);
+    expect(await res.json()).toMatchObject({ code: "at-capacity", error: expect.stringContaining("ccctl:") });
+    // The refusal is a REFUSAL, not a failed attempt: the guard runs before the launcher, so no third
+    // terminal was spawned and no ghost row was left behind (#33's invariant, held by the new branch).
+    expect(launches).toHaveLength(2);
+    expect(server.sessions.size).toBe(2);
+    expect(await listSessions(server)).toHaveLength(2);
+  });
+
+  it("names the cap and the count in the refusal, so the operator knows WHY and by how much", async () => {
+    const { launcher } = fakeLauncher();
+    const server = await startTestServer({
+      port: 0,
+      host: DEFAULT_HOST,
+      launcher,
+      maxSessions: 2,
+      registrationTimeoutMs: 60_000,
+    });
+    await fillByLaunching(server, 2);
+
+    const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+
+    // The operator cannot act on "at capacity" alone — the number is what tells them the cap is 2
+    // rather than the 8 they assumed, and that raising it (or closing one) is the move.
+    const { error } = (await res.json()) as { error: string };
+    expect(error).toMatch(/2 sessions are live and the cap is 2/);
+  });
+
+  it("stays truthful when live sessions EXCEED the cap — attaching is not a launch, and is not refused", async () => {
+    const { launcher, launches } = fakeLauncher();
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher, maxSessions: 2 });
+
+    // Three UC1 attaches against a cap of 2, all accepted. The cap governs LAUNCHING — the verb this
+    // server initiates and can decline. A §2 registration announces a session that ALREADY EXISTS;
+    // refusing it would un-spawn nothing and would only blind the list to a terminal that is running.
+    // So `live > cap` is a REACHABLE, legitimate state, not a bookkeeping error.
+    for (const cwd of [CWD, OTHER_CWD, RESOLVED_CWD]) {
+      expect((await registerWorker(server, cwd)).status).toBe(201);
+    }
+    expect(server.sessions.size).toBe(3);
+
+    const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+
+    // The refusal still fires (`>=`, not `===` — an overflow must not read as "room available")...
+    expect(res.status).toBe(429);
+    expect(launches).toHaveLength(0);
+    // ...and the sentence still reads as the truth rather than as a server that lost count: the
+    // earlier phrasing rendered this exact state as "3 of 2 session slots are in use".
+    const { error } = (await res.json()) as { error: string };
+    expect(error).toMatch(/3 sessions are live and the cap is 2/);
+    expect(error).not.toMatch(/3 of 2/);
+  });
+
+  it("frees a slot when a session ENDS, and the next launch succeeds again", async () => {
+    const { launcher } = fakeLauncher();
+    // A short registration timeout is how a session ENDS here: these launches never register, so the
+    // ghost-reaper (#33) evicts them — a real end-of-session path, driven rather than simulated.
+    const server = await startTestServer({
+      port: 0,
+      host: DEFAULT_HOST,
+      launcher,
+      maxSessions: 1,
+      registrationTimeoutMs: 40,
+    });
+    await fillByLaunching(server, 1);
+
+    // At the cap: refused.
+    expect((await postLaunch(server, { cwd: CWD, permissionMode: "default" })).status).toBe(429);
+
+    // The session ends (its worker never checked in, so it is reaped) — the slot is freed.
+    await sleep(120);
+    expect(server.sessions.size).toBe(0);
+
+    // ...and the next launch succeeds again. This is the whole point of counting LIVE sessions rather
+    // than launches-ever: a cap that counted cumulative launches would still refuse here, forever.
+    const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+    expect(res.status).toBe(201);
+  });
+
+  it("counts ATTACHED sessions too — a cap filled by UC1 registrations refuses a launch", async () => {
+    const { launcher, launches } = fakeLauncher();
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher, maxSessions: 2 });
+
+    // Two UC1 ATTACH sessions: workers registering over §2 from a cwd NO launch is pending on, so each
+    // mints its own id (`environments-bridge.ts`) — nothing here was launched by this server. This is
+    // the test that discriminates: a cap counting only `launchedSessions` or only `pendingLaunches`
+    // passes every other test in this file and fails this one.
+    expect((await registerWorker(server, OTHER_CWD)).status).toBe(201);
+    expect((await registerWorker(server, CWD)).status).toBe(201);
+    expect(server.sessions.size).toBe(2);
+
+    const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+
+    expect(res.status).toBe(429);
+    expect(await res.json()).toMatchObject({ code: "at-capacity" });
+    expect(launches).toHaveLength(0);
+  });
+
+  it("defaults the cap to 8 — the 8th launch succeeds, the 9th is refused", async () => {
+    const { launcher } = fakeLauncher();
+    // No `maxSessions` — this asserts the DEFAULT, which is the half of AC4 a configured test cannot
+    // reach. The exported constant is checked below; here the wired server's own behavior is the yardstick.
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher, registrationTimeoutMs: 60_000 });
+
+    await fillByLaunching(server, DEFAULT_MAX_SESSIONS);
+
+    const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+    expect(res.status).toBe(429);
+    expect(await res.json()).toMatchObject({ code: "at-capacity" });
+    expect(server.sessions.size).toBe(8);
+  });
+
+  it("pins the default at 8 — the constant a caller names instead of re-hardcoding it", () => {
+    expect(DEFAULT_MAX_SESSIONS).toBe(8);
+  });
+
+  it("is CONFIG-overridable — a cap of 1 refuses the second launch", async () => {
+    const { launcher } = fakeLauncher();
+    const server = await startTestServer({
+      port: 0,
+      host: DEFAULT_HOST,
+      launcher,
+      maxSessions: 1,
+      registrationTimeoutMs: 60_000,
+    });
+    await fillByLaunching(server, 1);
+
+    // Overriding DOWN is what proves the config is read at all: an implementation that ignored
+    // `maxSessions` and always used the default would still pass a test that raised the cap.
+    const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+    expect(res.status).toBe(429);
+    expect(await res.json()).toMatchObject({ code: "at-capacity" });
+  });
+
+  it("reads as English at a cap of one — `1 session is live`, not `1 sessions are live`", async () => {
+    const { launcher } = fakeLauncher();
+    const server = await startTestServer({
+      port: 0,
+      host: DEFAULT_HOST,
+      launcher,
+      maxSessions: 1,
+      registrationTimeoutMs: 60_000,
+    });
+    await fillByLaunching(server, 1);
+
+    const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+
+    // A cap of 1 is the one an operator actually sets when they want a single session at a time, so
+    // the singular is the reachable case rather than a pedantic one.
+    const { error } = (await res.json()) as { error: string };
+    expect(error).toMatch(/1 session is live and the cap is 1/);
+  });
+
+  it("keeps `at-capacity` in the pinned code set, so a client can narrow it structurally", () => {
+    // The set is what `isLaunchFailureCode` fails closed on — the CLI (`session-client.ts`) narrows a
+    // daemon's `code` through it, so a code missing here is a code the client silently discards.
+    expect(LAUNCH_FAILURE_CODES).toContain("at-capacity");
+    expect(isLaunchFailureCode("at-capacity")).toBe(true);
+  });
+
+  // The cap's whole purpose is to bound a LOOP, and a loop is concurrent — the phone does not await
+  // one launch before firing the next, and a replaying tunnel least of all. A cap that holds only for
+  // a sequential caller would satisfy every scenario above and still let the hazard through, so the
+  // burst is tested directly. These need a launcher with a REAL delay: a zero-delay fake resolves in a
+  // microtask, which serializes the burst and hides the window entirely (see `fakeLauncher`).
+  describe("under CONCURRENT launches — the loop it exists to bound", () => {
+    it("admits exactly `maxSessions` from a simultaneous burst, and refuses the rest", async () => {
+      const { launcher, launches } = fakeLauncher({ launchDelayMs: 20 });
+      const server = await startTestServer({
+        port: 0,
+        host: DEFAULT_HOST,
+        launcher,
+        maxSessions: 2,
+        registrationTimeoutMs: 60_000,
+      });
+
+      // Eight at once against a cap of 2 — none awaits another, so all eight read the count before any
+      // of them has a registry row. Slots must be taken BEFORE the launcher is awaited or every one of
+      // them passes the guard.
+      const statuses = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          postLaunch(server, { cwd: CWD, permissionMode: "default" }).then((res) => res.status),
+        ),
+      );
+
+      expect(statuses.filter((s) => s === 201)).toHaveLength(2);
+      expect(statuses.filter((s) => s === 429)).toHaveLength(6);
+      // The one that actually matters: a refused launch must never have SPAWNED. Terminals are the
+      // resource being protected — six extra 429s on the wire would be cold comfort next to six extra
+      // windows on the operator's desk.
+      expect(launches).toHaveLength(2);
+      expect(server.sessions.size).toBe(2);
+    });
+
+    it("bounds a burst at the DEFAULT cap — 40 at once yields 8 terminals, not 40", async () => {
+      const { launcher, launches } = fakeLauncher({ launchDelayMs: 20 });
+      const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher, registrationTimeoutMs: 60_000 });
+
+      // The measured breach, pinned as a regression: before slots were reserved across the launcher's
+      // await, this exact burst spawned 40 terminals against a cap of 8 — every request 201.
+      const statuses = await Promise.all(
+        Array.from({ length: 40 }, () =>
+          postLaunch(server, { cwd: CWD, permissionMode: "default" }).then((res) => res.status),
+        ),
+      );
+
+      expect(launches).toHaveLength(DEFAULT_MAX_SESSIONS);
+      expect(statuses.filter((s) => s === 201)).toHaveLength(DEFAULT_MAX_SESSIONS);
+      expect(statuses.filter((s) => s === 429)).toHaveLength(32);
+      expect(server.sessions.size).toBe(DEFAULT_MAX_SESSIONS);
+    });
+
+    it("gives an in-flight slot BACK when the launch fails — a failed burst does not wedge the cap", async () => {
+      // Reserving a slot must not leak it: if a failed launch kept its reservation, a server that had
+      // merely failed a few launches would refuse forever with nothing live — the cap would become a
+      // one-way ratchet rather than a ceiling.
+      const server = await startTestServer({
+        port: 0,
+        host: DEFAULT_HOST,
+        launcher: failingLauncher(new SessionLaunchError("spawn-failed", "ccctl: no")),
+        maxSessions: 2,
+      });
+
+      const failed = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          postLaunch(server, { cwd: CWD, permissionMode: "default" }).then((res) => res.status),
+        ),
+      );
+
+      // ALL SIX failed (502) — and that is precisely the proof the slots came back. Six launches
+      // against a cap of 2: if a failed launch kept its reservation, the first two would consume the
+      // cap and the rest would come back 429 `at-capacity` instead of reaching the launcher at all.
+      // Every one reaching the launcher means every one found a free slot.
+      expect(failed).toEqual([502, 502, 502, 502, 502, 502]);
+      // ...and nothing was left behind — no rows (#33's no-ghost invariant, which the reservation
+      // must not weaken: it is not the registry, so a failure writes none).
+      expect(server.sessions.size).toBe(0);
+    });
+  });
+
+  // A cap is a SAFETY control, so a value that cannot bound anything must be refused at the door
+  // rather than accepted and silently not enforced. `NaN` is the sharp one: `live >= NaN` is always
+  // false, so a NaN cap disables the guard completely — and `Number(process.env.CCCTL_MAX_SESSIONS)`
+  // is exactly how an embedder would wire the config-overridability the AC asks for.
+  describe("a cap that cannot bound anything is refused at boot", () => {
+    it("REJECTS a maxSessions that is not a positive integer — NaN above all", async () => {
+      const { launcher } = fakeLauncher();
+
+      for (const maxSessions of [Number.NaN, 0, -1, 2.5, Number.POSITIVE_INFINITY]) {
+        await expect(startServer({ port: 0, host: DEFAULT_HOST, launcher, maxSessions })).rejects.toThrow(
+          /maxSessions must be a positive integer/,
+        );
+      }
+    });
+
+    it("names the offending value, so the operator can see what their config resolved to", async () => {
+      const { launcher } = fakeLauncher();
+
+      // `NaN` is invisible in a config file — it is what a bad `Number(…)` PRODUCED. Echoing it back is
+      // what turns "the daemon won't start" into "my env var is unset".
+      await expect(startServer({ port: 0, host: DEFAULT_HOST, launcher, maxSessions: Number.NaN })).rejects.toThrow(
+        /NaN/,
+      );
+    });
+
+    it("accepts an absent maxSessions — the default applies, and the server starts", async () => {
+      const { launcher } = fakeLauncher();
+
+      // The guard must not over-refuse: `undefined` is not a bad value, it is no value.
+      const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
+
+      expect(server.address.port).toBeGreaterThan(0);
+    });
   });
 });
 
@@ -631,7 +968,7 @@ describe("the registering session, and its eviction (#33)", () => {
 
 describe("CcctlServer.launchSession (programmatic)", () => {
   it("launches, tracks, and returns the minted session id with the handle", async () => {
-    const { launcher, launches } = fakeLauncher("tmux attach -t ccctl:9");
+    const { launcher, launches } = fakeLauncher({ hint: "tmux attach -t ccctl:9" });
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher, registrationTimeoutMs: 60_000 });
 
     const { sessionId, launched } = await server.launchSession({ cwd: CWD, permissionMode: "default" });
@@ -671,6 +1008,26 @@ describe("CcctlServer.launchSession (programmatic)", () => {
     });
     expect(launches).toHaveLength(0);
     expect(server.sessions.size).toBe(0);
+  });
+
+  it("rejects a typed `at-capacity` — the cap holds for the programmatic caller too (#36)", async () => {
+    const { launcher, launches } = fakeLauncher();
+    const server = await startTestServer({
+      port: 0,
+      host: DEFAULT_HOST,
+      launcher,
+      maxSessions: 1,
+      registrationTimeoutMs: 60_000,
+    });
+    await server.launchSession({ cwd: CWD, permissionMode: "default" });
+
+    // The cap lives in the SHARED core, not the HTTP handler — so it cannot be walked around by
+    // calling the programmatic entry point, which is exactly the loop #36 exists to bound.
+    await expect(server.launchSession({ cwd: CWD, permissionMode: "default" })).rejects.toMatchObject({
+      code: "at-capacity",
+    });
+    expect(launches).toHaveLength(1);
+    expect(server.sessions.size).toBe(1);
   });
 
   it("tears down every launched terminal on close() — including one still registering", async () => {
