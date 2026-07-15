@@ -131,14 +131,15 @@ export const DEFAULT_SESSION_EVICTION_GRACE_MS = 30_000;
  * (`@ccctl/core` § `isInputAwaited`): idle-too-long is a soft "you left this session sitting" nudge, not
  * a blocking "it is waiting on you".
  *
- * Chosen at 300_000 ms (5 min): a DELIBERATE design value, not a derived one. It is deliberately well
- * above the liveness/eviction windows (20s / 30s) — those bound a worker presumed GONE; this bounds one
- * that is demonstrably ALIVE yet unused — so the nudge fires only after a genuine lull an operator would
- * want flagged, never right after every turn settles to idle. INJECTABLE per server
- * ({@link ServerConfig.sessionIdleThresholdMs}); a test passes a short value to exercise it
- * deterministically, never a hidden magic number.
+ * Chosen at 120_000 ms (2 min): a DELIBERATE design value, not a derived one (#42). It is well above
+ * the liveness/eviction windows (20s / 30s) — those bound a worker presumed GONE; this bounds one that
+ * is demonstrably ALIVE yet unused — so the nudge fires only after a genuine lull an operator would want
+ * flagged, never right after every turn settles to idle. It is the DEFAULT of the config-time knob
+ * (#42): overridable per server ({@link ServerConfig.sessionIdleThresholdMs}), which the server validates
+ * as a positive integer at start; a test passes a short value to exercise it deterministically, never a
+ * hidden magic number.
  */
-export const DEFAULT_SESSION_IDLE_THRESHOLD_MS = 300_000;
+export const DEFAULT_SESSION_IDLE_THRESHOLD_MS = 120_000;
 
 /**
  * The `type` discriminant of the "idle > X" informational event (#41) the server broadcasts onto a
