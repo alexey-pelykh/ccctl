@@ -63,6 +63,8 @@ import {
   pushSubscribeOptions,
   vapidPublicKeyFromResponse,
   toServerSubscription,
+  consumeDeepLinkSessionId,
+  navigateMessageSessionId,
 } from "./push.js";
 
 const connectionEl = document.getElementById("connection");
@@ -985,6 +987,30 @@ applyPairingToken({ location, history, storage: localStorage });
 
 // Seed the connection-health indicator (#75): "reconnecting" until the first heartbeat settles it.
 renderConnection();
+
+// Follow a tapped push (#52) to its session: the service worker cold-opened the app at `?session=<id>`,
+// so read that deep-link, scrub the param (so a reload doesn't re-pin a since-closed session), and view
+// the session — `selectSession` opens its event stream, which IS the session's content fetched over the
+// tunnel (AC3). Done BEFORE the first poll below so the deep-link wins over the picker's
+// auto-select-first rule: `nextSelection` sees a selection already set and keeps it (a deep-linked
+// session that has since closed reads as `clear` on that poll — the honest outcome for a stale tap).
+const deepLinkedSessionId = consumeDeepLinkSessionId({ location, history });
+if (deepLinkedSessionId !== null) {
+  selectSession(deepLinkedSessionId);
+}
+
+// A tap that lands while the app is ALREADY open can't cold-open a URL — the service worker instead
+// posts the target session to this live client (#52); switch the viewed session in place. Guarded by
+// the tested `navigateMessageSessionId`, so only a well-formed navigate message steers the UI (never
+// some other page `message`). Registered whatever the SW-registration outcome below.
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    const sessionId = navigateMessageSessionId(event.data);
+    if (sessionId !== null) {
+      selectSession(sessionId);
+    }
+  });
+}
 
 // List now and keep polling so the picker's per-session status stays live (#25 AC3).
 pollSessions();

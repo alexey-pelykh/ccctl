@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   PUSH_VAPID_PUBLIC_KEY_PATH,
   PUSH_SUBSCRIPTION_PATH,
   PUSH_NOTIFICATION_TITLE,
   PUSH_WAKE_TEXT,
+  DEEP_LINK_SESSION_PARAM,
+  NAVIGATE_MESSAGE_TYPE,
   urlBase64ToUint8Array,
   pushSubscribeOptions,
   vapidPublicKeyFromResponse,
   toServerSubscription,
   notificationContent,
+  sessionDeepLinkUrl,
+  deepLinkSessionId,
+  consumeDeepLinkSessionId,
+  navigateMessageSessionId,
 } from "./push.js";
 
 /** base64url-encode bytes (the inverse of {@link urlBase64ToUint8Array}) so the decode can be round-tripped. */
@@ -206,6 +212,130 @@ describe("notificationContent", () => {
       const content = notificationContent(badPointer);
       expect(content.tag).toBe("ccctl-wake");
       expect(content.data).toEqual({});
+    }
+  });
+});
+
+describe("deep-link wire constants (#52)", () => {
+  it("pins the query parameter a session deep-link rides", () => {
+    expect(DEEP_LINK_SESSION_PARAM).toBe("session");
+  });
+
+  it("namespaces the service-worker → client navigate message type", () => {
+    expect(NAVIGATE_MESSAGE_TYPE).toBe("ccctl:navigate");
+  });
+});
+
+describe("sessionDeepLinkUrl", () => {
+  it("builds the app-root deep-link for a session id (`./?session=<id>`)", () => {
+    // A server-minted UUID — URL-safe already, so encoding is a no-op and it reads plainly.
+    expect(sessionDeepLinkUrl("11111111-2222-3333-4444-555555555555")).toBe(
+      "./?session=11111111-2222-3333-4444-555555555555",
+    );
+  });
+
+  it("percent-encodes an id so an opaque pointer can never break the query", () => {
+    // The notification's data.session_id is opaque here; a non-UUID with query metacharacters is escaped.
+    expect(sessionDeepLinkUrl("a b&c=d")).toBe("./?session=a%20b%26c%3Dd");
+  });
+
+  it("falls back to the bare app root for a blank / non-string id (a pointerless wake still opens the app)", () => {
+    for (const bad of ["", "   ", 42, null, undefined, {}, []]) {
+      expect(sessionDeepLinkUrl(bad), `input ${JSON.stringify(bad)}`).toBe("./");
+    }
+  });
+
+  it("round-trips through deepLinkSessionId — the URL a tap opens parses back to the same id", () => {
+    for (const id of ["11111111-2222-3333-4444-555555555555", "a b&c=d", "sess/../9"]) {
+      const url = sessionDeepLinkUrl(id);
+      const search = url.slice(url.indexOf("?"));
+      expect(deepLinkSessionId(search), `id ${id}`).toBe(id);
+    }
+  });
+});
+
+describe("deepLinkSessionId", () => {
+  it("extracts the session id from a `?session=<id>` query", () => {
+    expect(deepLinkSessionId("?session=sess-9")).toBe("sess-9");
+  });
+
+  it("tolerates a query with no leading `?`", () => {
+    expect(deepLinkSessionId("session=sess-9")).toBe("sess-9");
+  });
+
+  it("URL-decodes the id — the inverse of the builder's encodeURIComponent", () => {
+    expect(deepLinkSessionId("?session=a%20b%26c%3Dd")).toBe("a b&c=d");
+  });
+
+  it("finds the session alongside other query parameters", () => {
+    expect(deepLinkSessionId("?view=1&session=sess-9&x=y")).toBe("sess-9");
+  });
+
+  it("returns null for an absent, blank, wrong-parameter, or non-string query", () => {
+    expect(deepLinkSessionId("")).toBeNull();
+    expect(deepLinkSessionId("?")).toBeNull();
+    expect(deepLinkSessionId("?session=")).toBeNull();
+    expect(deepLinkSessionId("?session=%20%20")).toBeNull();
+    expect(deepLinkSessionId("?other=value")).toBeNull();
+    expect(deepLinkSessionId(undefined)).toBeNull();
+    expect(deepLinkSessionId(null)).toBeNull();
+    expect(deepLinkSessionId(42)).toBeNull();
+  });
+});
+
+describe("consumeDeepLinkSessionId", () => {
+  it("reads the deep-linked session AND scrubs the param so a reload doesn't re-pin it", () => {
+    const replaceState = vi.fn();
+    const id = consumeDeepLinkSessionId({
+      location: { search: "?session=sess-9", pathname: "/", hash: "" },
+      history: { replaceState },
+    });
+    expect(id).toBe("sess-9");
+    // The session param is stripped; nothing else is left behind.
+    expect(replaceState).toHaveBeenCalledWith(null, "", "/");
+  });
+
+  it("strips ONLY the session param, preserving other query params, the path, and the fragment", () => {
+    const replaceState = vi.fn();
+    const id = consumeDeepLinkSessionId({
+      location: { search: "?view=1&session=sess-9&x=y", pathname: "/app", hash: "#frag" },
+      history: { replaceState },
+    });
+    expect(id).toBe("sess-9");
+    expect(replaceState).toHaveBeenCalledWith(null, "", "/app?view=1&x=y#frag");
+  });
+
+  it("returns null and touches nothing when there is no deep-link", () => {
+    const replaceState = vi.fn();
+    const id = consumeDeepLinkSessionId({
+      location: { search: "?view=1", pathname: "/", hash: "" },
+      history: { replaceState },
+    });
+    expect(id).toBeNull();
+    expect(replaceState).not.toHaveBeenCalled();
+  });
+});
+
+describe("navigateMessageSessionId", () => {
+  it("extracts the session id from a well-formed navigate message", () => {
+    expect(navigateMessageSessionId({ type: NAVIGATE_MESSAGE_TYPE, session_id: "sess-9" })).toBe("sess-9");
+  });
+
+  it("returns null for a wrong / missing type — only a ccctl navigate steers the UI", () => {
+    expect(navigateMessageSessionId({ type: "other", session_id: "sess-9" })).toBeNull();
+    expect(navigateMessageSessionId({ session_id: "sess-9" })).toBeNull();
+  });
+
+  it("returns null for a blank / non-string session_id", () => {
+    expect(navigateMessageSessionId({ type: NAVIGATE_MESSAGE_TYPE, session_id: "" })).toBeNull();
+    expect(navigateMessageSessionId({ type: NAVIGATE_MESSAGE_TYPE, session_id: "   " })).toBeNull();
+    expect(navigateMessageSessionId({ type: NAVIGATE_MESSAGE_TYPE, session_id: 42 })).toBeNull();
+    expect(navigateMessageSessionId({ type: NAVIGATE_MESSAGE_TYPE })).toBeNull();
+  });
+
+  it("returns null for a shapeless message rather than throwing", () => {
+    for (const bad of [null, undefined, 42, "a string", [], true]) {
+      expect(navigateMessageSessionId(bad), `input ${JSON.stringify(bad)}`).toBeNull();
     }
   });
 });

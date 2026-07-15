@@ -196,3 +196,110 @@ export function notificationContent(payload) {
     data: hasSession ? { session_id: sessionId } : {},
   };
 }
+
+/**
+ * The query parameter a session deep-link pins its target session under (`?session=<id>`) — the
+ * tap→deep-link half of the push ladder (#52). A QUERY, not a fragment: unlike the pairing token
+ * (`pairing.js`, which rides `#…` so the SECRET never reaches the server), a session id is an opaque,
+ * non-secret pointer (the #45 firewall — a bare UUID, no content), so it can ride the query the app
+ * shell reads on cold-open without leaking anything a session is saying.
+ */
+export const DEEP_LINK_SESSION_PARAM = "session";
+
+/**
+ * The message type the service worker posts to an ALREADY-open client to steer it to a tapped
+ * session's view (#52). A tap that finds a live window cannot cold-open a URL against it, so `sw.js`
+ * instead `postMessage`s this — `{ type: NAVIGATE_MESSAGE_TYPE, session_id }` — and the shell switches
+ * the viewed session in place. Namespaced (`ccctl:`) so it never collides with another `message` a
+ * page might receive. `sw.js` MIRRORS the literal inline (it cannot `import` this ES module).
+ */
+export const NAVIGATE_MESSAGE_TYPE = "ccctl:navigate";
+
+/**
+ * Build the in-app deep-link a tapped wake opens (#52): the app ROOT with the target session pinned as
+ * a `?session=<id>` query the shell reads on load. Relative (`./`) so it resolves against the PWA scope
+ * (`manifest.webmanifest` `start_url`/`scope` are `.`; the worker is root-scoped), whether the tap
+ * cold-opens a fresh window or the app is installed to the home screen. The id is `encodeURIComponent`d
+ * so a non-UUID pointer can never break the query (server ids are UUIDs, for which this is a no-op — but
+ * the notification's `data.session_id` is opaque here, so it is escaped defensively).
+ *
+ * FALLS BACK to the bare app root (`./`) for a blank / non-string id, so a wake with no usable pointer
+ * (an empty or shapeless push) still brings the operator to the app rather than yielding no URL to open.
+ * `sw.js` mirrors this few-line decision inline; `push.test.js` is its tested authority.
+ *
+ * @param {unknown} sessionId - the opaque #45 pointer off the notification, or any value.
+ * @returns {string}
+ */
+export function sessionDeepLinkUrl(sessionId) {
+  if (typeof sessionId !== "string" || sessionId.trim() === "") {
+    return "./";
+  }
+  return `./?${DEEP_LINK_SESSION_PARAM}=${encodeURIComponent(sessionId)}`;
+}
+
+/**
+ * Extract the deep-linked session id from a URL query string (`?session=<id>`), or `null` when the
+ * query is absent, carries a different parameter, or the id is blank. The inverse of
+ * {@link sessionDeepLinkUrl}: `URLSearchParams` URL-decodes the value, undoing its `encodeURIComponent`.
+ * Defensive over a non-string exactly like `pairing.js`'s `tokenFromHash` — `app.js` passes
+ * `location.search`, but the module never assumes the shape.
+ *
+ * @param {unknown} search - a URL query string (with or without the leading `?`), or any value.
+ * @returns {string | null}
+ */
+export function deepLinkSessionId(search) {
+  if (typeof search !== "string") {
+    return null;
+  }
+  const raw = search.startsWith("?") ? search.slice(1) : search;
+  const id = new URLSearchParams(raw).get(DEEP_LINK_SESSION_PARAM);
+  return id !== null && id.trim() !== "" ? id : null;
+}
+
+/**
+ * Consume a session deep-link (#52): read the target session out of the URL query and, when present,
+ * STRIP just the `?session=` parameter from the URL (via `history.replaceState`, preserving the path,
+ * any OTHER query parameters, and the fragment) so a reload does not re-pin a session that may since
+ * have closed, then return the id. Returns `null` — touching nothing — when there is no deep-link.
+ *
+ * The session-flavoured sibling of `pairing.js`'s `applyPairingToken`: same read-then-scrub shape with
+ * its I/O (`location` / `history`) injected so it is unit-testable without a browser, but scrubbing for
+ * hygiene / one-shot-intent rather than secrecy (the id is not a secret — see {@link DEEP_LINK_SESSION_PARAM}).
+ * `app.js` calls this once on load, BEFORE the first session poll, and selects the returned id — so the
+ * deep-link wins over the picker's auto-select-first rule (a set selection reads as `keep`, not replace).
+ *
+ * @param {{ location: { search: string, pathname: string, hash: string }, history: Pick<History, "replaceState"> }} deps
+ * @returns {string | null}
+ */
+export function consumeDeepLinkSessionId({ location, history }) {
+  const id = deepLinkSessionId(location.search);
+  if (id === null) {
+    return null;
+  }
+  const raw = location.search.startsWith("?") ? location.search.slice(1) : location.search;
+  const params = new URLSearchParams(raw);
+  params.delete(DEEP_LINK_SESSION_PARAM);
+  const query = params.toString();
+  history.replaceState(null, "", `${location.pathname}${query === "" ? "" : `?${query}`}${location.hash}`);
+  return id;
+}
+
+/**
+ * The session id a service-worker→client navigate message carries (#52), or `null` when the value is
+ * not a well-formed navigate (wrong / missing `type`, or a blank / non-string `session_id`). `app.js`
+ * calls this on EVERY `navigator.serviceWorker` message, so it is the guard that only a genuine
+ * {@link NAVIGATE_MESSAGE_TYPE} message — never some other page `message` — steers the viewed session.
+ *
+ * @param {unknown} message - the `MessageEvent.data`, or any value.
+ * @returns {string | null}
+ */
+export function navigateMessageSessionId(message) {
+  // `message?.type` reads through a null / non-object value to `undefined` (never throws), the same
+  // optional-chaining decode the sibling object-readers use (`toServerSubscription`, `notificationContent`);
+  // a wrong / missing type — or any shapeless message — falls here.
+  if (message?.type !== NAVIGATE_MESSAGE_TYPE) {
+    return null;
+  }
+  const sessionId = message.session_id;
+  return typeof sessionId === "string" && sessionId.trim() !== "" ? sessionId : null;
+}

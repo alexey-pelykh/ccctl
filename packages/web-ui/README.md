@@ -110,7 +110,13 @@ the `WebPushSubscription` (`{ endpoint, keys: { p256dh, auth } }`) the server's
 sent to. On **iOS** — where Web-Push is installed-PWA-only and a push that shows
 nothing gets the subscription revoked — the service worker's `push` handler
 **always** calls `showNotification`, for any payload, so there is **no silent
-push**; it reads only the pointer-only wake (#45), never session content. The
+push**; it reads only the pointer-only wake (#45), never session content.
+**Tapping** a wake **deep-links** to the exact session (#52): the worker
+resolves the opaque `session_id` pointer to `?session=<id>` and the app views
+that session — fetching its content **over the tunnel** on selection, never
+carried in the push. It is the notification **body tap**, never an inline
+action button (iOS won't render custom PWA `actions` reliably); an already-open
+app is steered in place by a `postMessage` instead of a reload. The
 VAPID-public-key and subscription-upload routes are served by a later server
 slice (#50 shipped the wake dispatch + VAPID handling but left "the PWA
 subscription is #51" as its wiring point), so — until then — the enable-push flow
