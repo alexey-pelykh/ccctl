@@ -89,6 +89,7 @@ import { isAbsolute, resolve } from "node:path";
 import { createRegisteringSession, type PermissionMode, type Session } from "@ccctl/core";
 import { closeSessionRelay, type SessionEventRelays } from "./event-stream.js";
 import type { LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
+import { releaseLaunchedSession } from "./session-release.js";
 
 /**
  * Default window (10s) a launched session may stay `registering` before it is evicted as a ghost —
@@ -257,7 +258,9 @@ export function trackPendingLaunch(
   state.sessions.set(sessionId, createRegisteringSession(sessionId, options.permissionMode));
   state.launchedSessions.add(launched);
   const timer = setTimeout(() => {
-    evictPendingLaunch(state, sessionId);
+    // Fire-and-forget: the eviction's terminal half is asynchronous (it PROBES the surface before it
+    // may close it, #35) and there is nobody here to await it. It never rejects, so nothing escapes.
+    void evictPendingLaunch(state, sessionId);
   }, state.registrationTimeoutMs);
   timer.unref();
   state.pendingLaunches.set(sessionId, {
@@ -423,16 +426,43 @@ function dropPlaceholder(state: PendingLaunchState, sessionId: string): void {
  *
  * The TERMINAL half — closing the spawned child so a worker that hung on boot does not outlive the
  * session it failed to become, and dropping the handle so shutdown will not re-close it — is
- * conditional on being able to prove that terminal is dead. It always can, EXCEPT inside a (cwd, mode)
- * group where some worker already registered without being attributable to a specific launch
- * ({@link PendingLaunch.mayHoldLiveWorker}): there, the terminal being evicted may be the live
- * session's, so it is left open and left to shutdown. Reaping a stray window is a cost; killing a live
- * session is a catastrophe, and between the two this function does not gamble.
+ * conditional on being able to prove that terminal is dead. Two independent guards stand in front of
+ * it, and they answer different questions:
  *
- * The close itself is best-effort: `close()` is idempotent and may find the surface already gone (the
- * worker exited, the operator closed the window), so its reject is swallowed, exactly as shutdown does.
+ *   1. **Is this terminal even ELIGIBLE to be reaped?** ({@link PendingLaunch.mayHoldLiveWorker}) —
+ *      no, inside a (cwd, mode) group where some worker already registered without being attributable
+ *      to a specific launch: the terminal being evicted may be the live session's. It is left open and
+ *      left to shutdown, un-probed, because no reading could resolve the ambiguity anyway — the
+ *      question there is "which terminal is the live worker in", and liveness cannot answer it.
+ *   2. **Is it still OURS?** ({@link releaseLaunchedSession}, #35) — the surface is probed, and closed
+ *      only if it is alive and still server-owned. This is the guard that matters most HERE, of
+ *      anywhere in the server: an eviction fires ~10 seconds after launch, which is exactly the window
+ *      in which a takeover happens. The operator launches a session, attaches to it at their desk, and
+ *      drives it by hand — so no worker ever registers, which is precisely what this timer reads as
+ *      "ghost". Without the probe, the reaper closes the window the operator is typing in: a launch
+ *      that WORKED, reaped as a ghost. With it, the row is still evicted (the list stays honest, which
+ *      is what AC3 promises) while the surface the operator took over is left running (#35 AC2).
+ *
+ * Reaping a stray window is a cost; killing a live session is a catastrophe, and between the two this
+ * function does not gamble — at either guard.
+ *
+ * The handle is dropped from `launchedSessions` only when the surface is actually GONE (the release
+ * tore it down, or found it already exited). A surface left running because the operator has it stays
+ * owned by the server and is re-probed at shutdown — by then they may have detached and handed it
+ * back. Forgetting it here would strand a live surface nothing will ever reap.
+ *
+ * The release itself is best-effort and never rejects ({@link releaseLaunchedSession} swallows a
+ * `close()` that raced an already-gone window), so nothing can escape the timer callback that fires this.
+ *
+ * **The SESSION half is synchronous; only the TERMINAL half is awaited.** The row is dropped before the
+ * returned promise is, so `GET /api/sessions` stops showing an evicted ghost the instant eviction runs,
+ * regardless of how long probing its surface takes. The promise resolves once the terminal half has
+ * settled — it exists because the probe made that half genuinely asynchronous, and a caller that must
+ * know when a surface was actually released (a test, above all) should await the work rather than sleep
+ * a guess at it. The timer that fires this in {@link trackPendingLaunch} ignores it, as it must: an
+ * eviction is fire-and-forget from the timer's side.
  */
-export function evictPendingLaunch(state: PendingLaunchState, sessionId: string): void {
+export async function evictPendingLaunch(state: PendingLaunchState, sessionId: string): Promise<void> {
   const pending = state.pendingLaunches.get(sessionId);
   if (pending === undefined) {
     // Already claimed (the worker registered) or already evicted — nothing to reap.
@@ -446,19 +476,22 @@ export function evictPendingLaunch(state: PendingLaunchState, sessionId: string)
     // terminal. The row is gone (the list is honest), but the surface stays up — shutdown owns it now.
     return;
   }
+  if ((await releaseLaunchedSession(pending.launched)) === "leave-running") {
+    // The operator took this surface over (or its liveness could not be read). It is alive and not
+    // ours to reap, so the server KEEPS the handle: if they detach before shutdown, shutdown's own
+    // release will find it server-owned again and tear it down properly.
+    return;
+  }
+  // The surface is gone — we closed it, or it had already exited. Nothing left for shutdown to do.
   state.launchedSessions.delete(pending.launched);
-  void pending.launched.close().catch(() => {
-    // Best-effort teardown: the terminal may already be gone (the worker exited, the operator
-    // closed the window). A stray reject here must never escape a timer callback.
-  });
 }
 
 /**
- * Disarm every pending eviction — invoked on shutdown, before the launched terminals are torn down
- * wholesale ({@link closeLaunchedSessions}). Without this, a server that closes while a launch is
+ * Disarm every pending eviction — invoked on shutdown, before the launched terminals are released
+ * wholesale ({@link releaseLaunchedSessions}). Without this, a server that closes while a launch is
  * still registering leaves an armed timer whose callback would run against a dead server's state.
- * The records are dropped, not evicted: shutdown closes every launched terminal anyway, so
- * evicting here would only double-close them.
+ * The records are dropped, not evicted: shutdown releases every launched terminal anyway, so
+ * evicting here would only double-release them.
  */
 export function clearPendingLaunches(state: PendingLaunchState): void {
   for (const pending of state.pendingLaunches.values()) {

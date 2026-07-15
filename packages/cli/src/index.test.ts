@@ -11,6 +11,7 @@ import {
   type LaunchedSession,
   type SessionLaunchOptions,
   type SessionSummaryWire,
+  type SurfaceLiveness,
 } from "@ccctl/server";
 import type { EstablishedTunnel, Tunnel, TunnelKind } from "@ccctl/tunnel-adapters";
 import type { CliDependencies } from "./dependencies.js";
@@ -112,6 +113,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
     launch: vi.fn((_options: SessionLaunchOptions) =>
       Promise.resolve({
         attachment: { attachable: true, hint: "tmux attach -t ccctl:1" },
+        liveness: (): Promise<SurfaceLiveness> => Promise.resolve("alive-server-owned"),
         close: () => Promise.resolve(),
       } satisfies LaunchedSession),
     ),

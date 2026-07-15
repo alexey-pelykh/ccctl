@@ -72,9 +72,9 @@ import {
 import { handleUiCommand } from "./ui-command.js";
 import { handleSessionsList, matchUiSessionRoute } from "./ui-sessions.js";
 import {
-  closeLaunchedSessions,
   handleSessionLaunch,
   launchSession as launchTrackedSession,
+  releaseLaunchedSessions,
   type LaunchOutcome,
 } from "./ui-session-launch.js";
 import { DEFAULT_REGISTRATION_TIMEOUT_MS, type PendingLaunch } from "./pending-launch.js";
@@ -140,6 +140,17 @@ export type {
   LaunchedSession,
   TerminalAttachment,
 } from "./session-launcher.js";
+
+// Re-export the SURFACE-LIVENESS contract (#35) on the public surface — the pinned reading every
+// `LaunchedSession.liveness()` answers, plus its runtime guard and pinned set. Part of the PORT, so it
+// ships for the same reason the port itself does: anything implementing `LaunchedSession` outside this
+// package must be able to name what its probe returns. The safe-teardown RULE that decides by these
+// readings (`releaseLaunchedSession` / `decideRelease` / `ReleaseDisposition`) stays INTERNAL — the
+// server's own teardown paths are its only callers, exactly as the sibling pending-launch registry and
+// the orphan-reaper keep their functions off this surface (a later need can add an export; un-shipping
+// one is breaking). Ships runtime (the guard + the pinned set), so a value export alongside the type.
+// Defined in session-launcher.ts; the rule is defined and unit-tested in session-release.ts.
+export { isSurfaceLiveness, SURFACE_LIVENESS_READINGS, type SurfaceLiveness } from "./session-launcher.js";
 
 // Re-export the TYPED launch-failure contract (#33) on the public surface — the pinned
 // `LaunchFailureCode` union every failed `POST /api/sessions` answers, its runtime guard, and the
@@ -550,11 +561,12 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
         // `closeIdleConnections()` below would leave it and `close()` would hang waiting on it.
         closeEventStreams(state.eventRelays);
         closeWorkerChannels(state);
-        // Tear down every terminal this server launched (#31) — a tmux window kept open past
-        // shutdown would leak; each close() is idempotent and swallows its own errors. This also
+        // Release every terminal this server launched (#31) — each surface is PROBED and torn down
+        // only if it is still server-owned (#35), so shutting the daemon down never kills a session
+        // the operator took over at their desk; a taken-over one is left running for them. This also
         // disarms any pending registration-eviction timer (#33), so a launch still registering at
         // shutdown neither holds the loop open nor fires against a dead server's state.
-        closeLaunchedSessions(state);
+        releaseLaunchedSessions(state);
         // Release idle keep-alive HTTP sockets so a quiescent server closes promptly
         // instead of waiting on pooled client connections.
         httpServer.closeIdleConnections();

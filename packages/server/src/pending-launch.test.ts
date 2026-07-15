@@ -19,18 +19,25 @@ import {
   type PendingLaunch,
   type PendingLaunchState,
 } from "./pending-launch.js";
-import type { LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
+import type { LaunchedSession, SessionLaunchOptions, SurfaceLiveness } from "./session-launcher.js";
 
 // The pending-launch registry (#33) in ISOLATION — the bookkeeping that makes a launch either
 // CLAIMED (its worker registered) or EVICTED (it never did), and never a ghost. Hermetic: no server,
 // no HTTP, no real terminal — just the state transitions and the timer, so each is pinned on its own.
 // The wired-through behavior is covered by `ui-session-launch.test.ts`.
 
-/** A fake launched terminal: counts its closes, so eviction's "the child is reaped" half is observable. */
-function fakeLaunched() {
+/**
+ * A fake launched terminal: counts its closes, so eviction's "the child is reaped" half is observable.
+ *
+ * Reports `alive-server-owned` by default — the ordinary launched surface nobody has touched, which is
+ * what eviction is entitled to reap (#35). Pass another reading to stand up the surfaces eviction must
+ * NOT reap: `taken-over` is the operator driving it at their desk.
+ */
+function fakeLaunched(liveness: SurfaceLiveness = "alive-server-owned") {
   let closes = 0;
   const launched: LaunchedSession = {
     attachment: { attachable: true, hint: "tmux attach -t ccctl:1" },
+    liveness: (): Promise<SurfaceLiveness> => Promise.resolve(liveness),
     close: (): Promise<void> => {
       closes += 1;
       return Promise.resolve();
@@ -358,7 +365,7 @@ describe("claimPendingLaunch", () => {
 });
 
 describe("evictPendingLaunch", () => {
-  it("reaps a ghost TOTALLY — session dropped, terminal closed, handle un-tracked, relay reaped", () => {
+  it("reaps a ghost TOTALLY — session dropped, terminal closed, handle un-tracked, relay reaped", async () => {
     const state = makeState();
     const { launched, closeCount } = fakeLaunched();
     trackPendingLaunch(state, "sess-1", OPTIONS, launched);
@@ -366,11 +373,27 @@ describe("evictPendingLaunch", () => {
     relayFor(state.eventRelays, "sess-1");
     expect(state.eventRelays.has("sess-1")).toBe(true);
 
-    evictPendingLaunch(state, "sess-1");
+    await evictPendingLaunch(state, "sess-1");
 
     expect(state.sessions.has("sess-1")).toBe(false); // "the session list no longer shows it"
     expect(closeCount()).toBe(1); // the spawned child is reaped, not orphaned
     expect(state.launchedSessions.has(launched)).toBe(false); // shutdown will not re-close it
+    expect(state.pendingLaunches.has("sess-1")).toBe(false);
+    expect(state.eventRelays.has("sess-1")).toBe(false);
+  });
+
+  it("drops the ghost's ROW synchronously, before it has finished probing the terminal (#35)", () => {
+    // The probe made the TERMINAL half of eviction asynchronous; the SESSION half must not follow it.
+    // A ghost's row has to leave `GET /api/sessions` the moment eviction runs (#33 AC3), however long
+    // interrogating its surface takes — the list's honesty cannot be held hostage to a tmux round-trip.
+    const state = makeState();
+    const { launched } = fakeLaunched();
+    trackPendingLaunch(state, "sess-1", OPTIONS, launched);
+    relayFor(state.eventRelays, "sess-1");
+
+    void evictPendingLaunch(state, "sess-1"); // deliberately NOT awaited
+
+    expect(state.sessions.has("sess-1")).toBe(false);
     expect(state.pendingLaunches.has("sess-1")).toBe(false);
     expect(state.eventRelays.has("sess-1")).toBe(false);
   });
@@ -389,30 +412,81 @@ describe("evictPendingLaunch", () => {
     expect(closeCount()).toBe(1);
   });
 
-  it("is a no-op on an unknown or already-claimed session — a registered session is never evicted", () => {
+  it("is a no-op on an unknown or already-claimed session — a registered session is never evicted", async () => {
     const state = makeState();
     const { launched, closeCount } = fakeLaunched();
     trackPendingLaunch(state, "sess-1", OPTIONS, launched);
     claimPendingLaunch(state, OPTIONS.cwd, OPTIONS.permissionMode);
 
     // The race the claim exists to win: the timer fires just after the worker registered.
-    evictPendingLaunch(state, "sess-1");
-    evictPendingLaunch(state, "never-existed");
+    await evictPendingLaunch(state, "sess-1");
+    await evictPendingLaunch(state, "never-existed");
 
     // The claimed session and its live terminal are untouched.
     expect(state.sessions.has("sess-1")).toBe(true);
     expect(closeCount()).toBe(0);
   });
 
-  it("is idempotent — a second eviction reaps nothing twice", () => {
+  it("is idempotent — a second eviction reaps nothing twice", async () => {
     const state = makeState();
     const { launched, closeCount } = fakeLaunched();
     trackPendingLaunch(state, "sess-1", OPTIONS, launched);
 
-    evictPendingLaunch(state, "sess-1");
-    evictPendingLaunch(state, "sess-1");
+    await evictPendingLaunch(state, "sess-1");
+    await evictPendingLaunch(state, "sess-1");
 
     expect(closeCount()).toBe(1);
+  });
+
+  // Rule: A taken-over session is not killed — WIRED THROUGH the ghost-reaper (#35 AC2).
+  //
+  // The sharpest edge in the server, and the reason #35 is not only about shutdown. This timer fires
+  // ~10s after launch, which is exactly when a takeover happens: the operator launches a session,
+  // attaches at their desk and starts driving it by hand — so no worker ever registers, which is
+  // precisely what this timer reads as "ghost". Un-probed, it closes the window they are typing in.
+  it("evicts the ROW but does NOT kill a surface the operator took over (#35)", async () => {
+    const state = makeState();
+    const { launched, closeCount } = fakeLaunched("taken-over");
+    trackPendingLaunch(state, "sess-1", OPTIONS, launched);
+
+    await evictPendingLaunch(state, "sess-1");
+
+    // The row still goes — the session list stays honest (#33 AC3): no worker registered, so there is
+    // no live ccctl session here, whatever is on that terminal.
+    expect(state.sessions.has("sess-1")).toBe(false);
+    expect(state.pendingLaunches.has("sess-1")).toBe(false);
+    // But the surface is untouched. The operator keeps working in it.
+    expect(closeCount()).toBe(0);
+    // And the server KEEPS the handle: if they detach before shutdown, shutdown's own release finds it
+    // server-owned again and tears it down properly. Forgetting it here would strand a live surface.
+    expect(state.launchedSessions.has(launched)).toBe(true);
+  });
+
+  it("evicts the ROW but does NOT kill a surface whose liveness could not be read (#35 AC5)", async () => {
+    const state = makeState();
+    const { launched, closeCount } = fakeLaunched("unknown");
+    trackPendingLaunch(state, "sess-1", OPTIONS, launched);
+
+    await evictPendingLaunch(state, "sess-1");
+
+    expect(state.sessions.has("sess-1")).toBe(false);
+    expect(closeCount()).toBe(0);
+    expect(state.launchedSessions.has(launched)).toBe(true);
+  });
+
+  it("un-tracks an already-exited surface without closing it — teardown is a no-op (#35 AC4)", async () => {
+    const state = makeState();
+    const { launched, closeCount } = fakeLaunched("exited");
+    trackPendingLaunch(state, "sess-1", OPTIONS, launched);
+
+    await evictPendingLaunch(state, "sess-1");
+
+    expect(state.sessions.has("sess-1")).toBe(false);
+    // Nothing to close: the worker already exited on its own. No error, no destructive action.
+    expect(closeCount()).toBe(0);
+    // The surface IS gone, so — unlike the taken-over case above — the handle is dropped: there is
+    // nothing left for shutdown to re-probe.
+    expect(state.launchedSessions.has(launched)).toBe(false);
   });
 
   // The converse of the "never closes a terminal in a claimed group" rule — it must not over-apply.

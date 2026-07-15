@@ -11,6 +11,7 @@ import {
   type ISessionLauncher,
   type LaunchedSession,
   type SessionLaunchOptions,
+  type SurfaceLiveness,
 } from "@ccctl/server";
 import { defaultSessionClient } from "./session-client.js";
 
@@ -30,6 +31,7 @@ function fakeLauncher(hint = "tmux attach -t ccctl:1", attachable = true): ISess
     launch(_options: SessionLaunchOptions): Promise<LaunchedSession> {
       return Promise.resolve({
         attachment: { attachable, hint },
+        liveness: (): Promise<SurfaceLiveness> => Promise.resolve("alive-server-owned"),
         close: (): Promise<void> => Promise.resolve(),
       });
     },

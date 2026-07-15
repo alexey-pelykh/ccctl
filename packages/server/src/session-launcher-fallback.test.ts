@@ -8,6 +8,7 @@ import {
   type ISessionLauncher,
   type LaunchedSession,
   type SessionLaunchOptions,
+  type SurfaceLiveness,
 } from "./session-launcher.js";
 
 // The fallback composite is the reification of the port's "the caller falls back to another
@@ -22,6 +23,7 @@ function resolvingLauncher(hint: string): ISessionLauncher & { lastOptions: Sess
       launcher.lastOptions = options;
       return Promise.resolve({
         attachment: { attachable: true, hint },
+        liveness: (): Promise<SurfaceLiveness> => Promise.resolve("alive-server-owned"),
         close: (): Promise<void> => Promise.resolve(),
       });
     },
