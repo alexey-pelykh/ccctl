@@ -241,8 +241,8 @@
       /* The optimistic offline-steer queue (#79): each row is a steer the operator submitted while the
          connection was offline, held to fire in order on reconnect. Amber — the page's "in-flight /
          attention" hue (as the reconnecting indicator and the degraded badge) — because it is a decision
-         waiting on the link. A row the fire-time stale-guard held (W5-21 / #80: the session moved on)
-         turns red, the stronger attention hue, and is cancel-only until #80 adds the "still send?" confirm. */
+         waiting on the link. A row the stale-guard held (W5-21 / #80: the session moved on) turns red,
+         the stronger attention hue, and carries a "Send anyway" (the "still send?" confirm) beside Cancel. */
       #steer-queue {
         list-style: none;
         padding: 0;
@@ -258,12 +258,15 @@
         color: #b91c1c;
       }
       /* The target session a queued steer fires against — muted, since it is provenance, not the steer's
-         content (the bold verb + summary ahead of it are). */
-      #steer-queue [data-queue-target] {
+         content (the bold verb + summary ahead of it are). The "moved on" note (#80) is the same muted
+         provenance, saying WHY a stale row is held. */
+      #steer-queue [data-queue-target],
+      #steer-queue [data-queue-stale-note] {
         color: #666;
         font-size: 0.85rem;
       }
-      #steer-queue [data-queue-cancel] {
+      #steer-queue [data-queue-cancel],
+      #steer-queue [data-queue-send] {
         margin-left: 0.5rem;
         cursor: pointer;
         padding: 0.05rem 0.4rem;
@@ -358,12 +361,15 @@
       <div class="steer-actions">
         <button id="approve-button" type="button">Approve</button>
       </div>
-      <!-- OPTIMISTIC OFFLINE-STEER QUEUE (#79, UI-B-011): a steer the operator submits while the
-           connection is offline (the #75 indicator above reads "offline") is held here — visibly
-           pending — and fired in order on the next reconnect, so a brief tunnel drop does not lose a
-           decision. Each row can be cancelled before it fires. The section stays hidden until something
-           is queued. The fire path routes every queued item through the stale-guard seam (W5-21 / #80);
-           `src/steer-queue.js` owns the pure queue decisions, `app.js` is the thin shell around them. -->
+      <!-- OPTIMISTIC OFFLINE-STEER QUEUE (#79, UI-B-011) + STALE-GUARD (#80, W5-21 / SRV-B-015+UI-B-011):
+           a steer the operator submits while the connection is offline (the #75 indicator above reads
+           "offline") is held here — visibly pending — and fired in order on the next reconnect, so a
+           brief tunnel drop does not lose a decision. At fire time each item is routed through the
+           stale-guard: one whose session has MOVED ON since the operator last looked (its message cursor
+           advanced past the viewed one) is held red with a "Send anyway"/Cancel confirm rather than fired
+           blind (#80). An ONLINE steer against a moved-on session lands here the same way. The section
+           stays hidden until something is queued. `src/steer-queue.js` owns the pure queue + guard
+           decisions, `app.js` is the thin shell around them. -->
       <section id="steer-queue-section" hidden>
         <h2>Queued steering</h2>
         <ul id="steer-queue" aria-live="polite"></ul>

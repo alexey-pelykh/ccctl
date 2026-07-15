@@ -21,7 +21,7 @@
  * dependency-free vanilla ESM. The mirrored contract (`GET /api/sessions` → `{ sessions }`):
  *
  *   SessionSummaryWire = { id: string, status: SessionStatus, activity: SessionActivity,
- *                          notificationsDegraded: boolean }
+ *                          notificationsDegraded: boolean, cursor: number }
  *   SessionStatus      = "registering" | "connecting" | "ready" | "busy" | "closed" | "errored"
  *                                                                                   (transport;
  *                        `registering` is a session ccctl LAUNCHED whose worker has not checked in
@@ -33,6 +33,10 @@
  *   notificationsDegraded — a non-prompting session's persistent degraded-notification marker
  *                      (#26): carried on the wire and read by {@link notificationsDegraded} into the
  *                      standing per-row badge the shell renders (#27).
+ *   cursor            — the session's monotonic message cursor (#80): the last event id emitted on
+ *                      its stream, read by {@link sessionCursor} into the stale-guard the shell arms
+ *                      (a steer against a session that has advanced past the cursor the operator last
+ *                      viewed is held for a "moved on — still send?" confirm).
  *
  * A row surfaces BOTH dimensions: the transport `status` (is the steering channel live?)
  * and the derived activity as the human "per-session status" the issue enumerates —
@@ -105,6 +109,49 @@ export function sessionLabel(session) {
  */
 export function notificationsDegraded(session) {
   return session?.notificationsDegraded === true;
+}
+
+/**
+ * The session's monotonic message cursor (#80) — the last event id emitted on its stream, read
+ * from the `SessionSummaryWire` the picker polls. This is the "current" side the stale-guard
+ * compares against the cursor the operator last viewed: a session whose cursor has advanced past
+ * the viewed one has "moved on".
+ *
+ * Strict and defensive, so a partial / pre-#80 / hostile row never fabricates a false advance: only
+ * a non-negative integer is honoured; a missing, fractional, negative, or shapeless value reads as
+ * `0` (emitted nothing) rather than throwing. Since the cursor is monotonic, reading a garbled value
+ * as 0 fails SAFE — it can only under-state the head, never invent a spurious "moved on".
+ *
+ * @param {{ cursor?: unknown }} session - a `SessionSummaryWire`, or any value.
+ * @returns {number}
+ */
+export function sessionCursor(session) {
+  const cursor = session?.cursor;
+  return Number.isInteger(cursor) && cursor >= 0 ? cursor : 0;
+}
+
+/**
+ * The later (higher) of two message cursors — the MONOTONIC-advance rule the shell applies when folding
+ * a freshly-sighted cursor (from the 2s poll OR the live SSE stream) into what it already knows for a
+ * session (#80). Returns the larger, so a LAGGING source — a poll a beat behind the fresher live stream,
+ * or an out-of-order delivery — can never REGRESS a cursor that a later steer must be compared against;
+ * without this a regression would fabricate a false "moved on". The load-bearing correctness property of
+ * the shell's per-session cursor bookkeeping, extracted here so it is unit-tested rather than buried in
+ * the DOM shell.
+ *
+ * Defensive and never-throwing: `incoming` is honoured only when it is a non-negative integer, else
+ * `current` stands (a garbled sighting never moves the cursor); a non-integer / negative `current` is
+ * treated as `0` (nothing seen). Idempotent and commutative-in-effect — folding the same or a lower
+ * sighting is a no-op.
+ *
+ * @param {unknown} current - the cursor already known for the session (0/garbled when none).
+ * @param {unknown} incoming - a freshly-sighted cursor, or any value.
+ * @returns {number}
+ */
+export function laterCursor(current, incoming) {
+  const base = Number.isInteger(current) && current >= 0 ? current : 0;
+  const next = Number.isInteger(incoming) && incoming >= 0 ? incoming : base;
+  return next > base ? next : base;
 }
 
 /**

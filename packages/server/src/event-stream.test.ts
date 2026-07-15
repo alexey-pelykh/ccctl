@@ -5,7 +5,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { SESSIONS_PATH, workerEventsPath, workerRegisterPath, type ControlEvent } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
-import { closeSessionRelay, createSessionEventRelays, relayFor } from "./event-stream.js";
+import {
+  broadcastEvent,
+  closeSessionRelay,
+  createSessionEventRelays,
+  relayFor,
+  sessionMessageCursor,
+} from "./event-stream.js";
 
 const ACCOUNT_BEARER = "oauth-account-secret-sse-abc123";
 
@@ -335,5 +341,43 @@ describe("closeSessionRelay — reap a single session's relay on eviction (#176)
     const relays = createSessionEventRelays();
     expect(() => closeSessionRelay(relays, "ghost")).not.toThrow();
     expect(relays.has("ghost")).toBe(false);
+  });
+});
+
+describe("sessionMessageCursor — the per-session message cursor (#80)", () => {
+  it("is 0 for a session with no relay yet (it has emitted nothing)", () => {
+    const relays = createSessionEventRelays();
+    expect(sessionMessageCursor(relays, "sess-x")).toBe(0);
+  });
+
+  it("does NOT materialize a relay for an unknown session — reading a cursor is not subscribing", () => {
+    const relays = createSessionEventRelays();
+    sessionMessageCursor(relays, "sess-x");
+    // Unlike relayFor, the read leaves the registry untouched (a cursor is a projection, not a stream).
+    expect(relays.has("sess-x")).toBe(false);
+  });
+
+  it("tracks the last emitted event id, advancing by one per broadcast", () => {
+    const relays = createSessionEventRelays();
+    broadcastEvent(relays, "a", { m: 1 });
+    expect(sessionMessageCursor(relays, "a")).toBe(1);
+    broadcastEvent(relays, "a", { m: 2 });
+    broadcastEvent(relays, "a", { m: 3 });
+    expect(sessionMessageCursor(relays, "a")).toBe(3);
+  });
+
+  it("is 0 for a relay that exists (subscribed-to) but has emitted nothing", () => {
+    const relays = createSessionEventRelays();
+    relayFor(relays, "a"); // a subscriber materialized the relay; no event broadcast yet.
+    expect(sessionMessageCursor(relays, "a")).toBe(0);
+  });
+
+  it("is per-session — one session's broadcasts never advance another's cursor (#20)", () => {
+    const relays = createSessionEventRelays();
+    broadcastEvent(relays, "a", { m: 1 });
+    broadcastEvent(relays, "a", { m: 2 });
+    broadcastEvent(relays, "b", { m: 1 });
+    expect(sessionMessageCursor(relays, "a")).toBe(2);
+    expect(sessionMessageCursor(relays, "b")).toBe(1);
   });
 });

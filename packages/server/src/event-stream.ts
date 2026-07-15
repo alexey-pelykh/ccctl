@@ -230,6 +230,23 @@ export function handleEventStream(
 }
 
 /**
+ * The session's current **message cursor** — the last event id emitted on its stream, or 0
+ * when it has emitted nothing yet. This is the monotonic per-session cursor #80's stale-guard
+ * compares against: the operator's UI records the cursor it last viewed, and a session that has
+ * advanced past it has "moved on". The relay holds {@link EventStreamState.nextEventId} (the id
+ * the NEXT event will carry, starting at 1), so the last emitted id is `nextEventId - 1`.
+ *
+ * Read-only, and deliberately NON-materializing: unlike {@link relayFor} it uses a bare
+ * `relays.get` so merely reading a not-yet-active session's cursor never creates a relay (a
+ * cursor is a projection of stream state, not a subscribe/broadcast). A session with no relay
+ * yet — never broadcast-to or subscribed-to — has emitted nothing, so its cursor is 0.
+ */
+export function sessionMessageCursor(relays: SessionEventRelays, sessionId: string): number {
+  const relay = relays.get(sessionId);
+  return relay === undefined ? 0 : relay.nextEventId - 1;
+}
+
+/**
  * End every open SSE stream across every session and clear each subscriber set. Called
  * from server shutdown: an SSE response holds its connection open indefinitely, so
  * `httpServer.close()` would otherwise hang waiting on it.
