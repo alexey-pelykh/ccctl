@@ -238,6 +238,37 @@
       .steer-actions {
         margin-top: 1rem;
       }
+      /* The optimistic offline-steer queue (#79): each row is a steer the operator submitted while the
+         connection was offline, held to fire in order on reconnect. Amber — the page's "in-flight /
+         attention" hue (as the reconnecting indicator and the degraded badge) — because it is a decision
+         waiting on the link. A row the fire-time stale-guard held (W5-21 / #80: the session moved on)
+         turns red, the stronger attention hue, and is cancel-only until #80 adds the "still send?" confirm. */
+      #steer-queue {
+        list-style: none;
+        padding: 0;
+      }
+      #steer-queue li {
+        padding: 0.25rem 0;
+        border-bottom: 1px solid #eee;
+      }
+      #steer-queue li[data-queued="pending"] {
+        color: #b45309;
+      }
+      #steer-queue li[data-queued="stale"] {
+        color: #b91c1c;
+      }
+      /* The target session a queued steer fires against — muted, since it is provenance, not the steer's
+         content (the bold verb + summary ahead of it are). */
+      #steer-queue [data-queue-target] {
+        color: #666;
+        font-size: 0.85rem;
+      }
+      #steer-queue [data-queue-cancel] {
+        margin-left: 0.5rem;
+        cursor: pointer;
+        padding: 0.05rem 0.4rem;
+        font-size: 0.8rem;
+      }
       /* The push-notification enablement outcome (#51), in the page's existing status hues: grey while
          requesting/subscribing, running-green once this device is subscribed, amber when the browser /
          OS blocks or has not granted permission, red on an outright failure. */
@@ -327,6 +358,16 @@
       <div class="steer-actions">
         <button id="approve-button" type="button">Approve</button>
       </div>
+      <!-- OPTIMISTIC OFFLINE-STEER QUEUE (#79, UI-B-011): a steer the operator submits while the
+           connection is offline (the #75 indicator above reads "offline") is held here — visibly
+           pending — and fired in order on the next reconnect, so a brief tunnel drop does not lose a
+           decision. Each row can be cancelled before it fires. The section stays hidden until something
+           is queued. The fire path routes every queued item through the stale-guard seam (W5-21 / #80);
+           `src/steer-queue.js` owns the pure queue decisions, `app.js` is the thin shell around them. -->
+      <section id="steer-queue-section" hidden>
+        <h2>Queued steering</h2>
+        <ul id="steer-queue" aria-live="polite"></ul>
+      </section>
       <!-- EMERGENCY STOP (#77, UI-B-012): kill the SELECTED session's terminal outright via
            `POST /api/sessions/{id}/stop` (#76). Deliberately its own section rather than a fourth
            `.steer-actions` button: a stop is not a steer — the three above ASK the worker to do
