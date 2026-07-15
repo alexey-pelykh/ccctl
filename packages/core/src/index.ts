@@ -1056,13 +1056,73 @@ export type SessionActivity =
 export const DEFAULT_REQUIRES_ACTION_DETAIL = "Awaiting input.";
 
 /**
- * Resolve a `requires_action` human `detail`, defaulting to
- * {@link DEFAULT_REQUIRES_ACTION_DETAIL}. Defensive over a decoded frame or a bare
- * status update: a `detail` that is absent, non-string, or blank falls back rather
- * than surfacing an empty line.
+ * Hard ceiling on a `requires_action` detail, in CODE POINTS. The detail is a ONE-LINE human
+ * label — it shares a terminal row with the session id in `ccctl attach`, and rides every
+ * `GET /api/sessions` response — so it is bounded rather than trusted to be short. The worker
+ * can put arbitrary bytes here within the 1 MiB body cap; a 512 KB detail re-served on every
+ * 2 s UI poll is not a label. 200 comfortably fits a real tool description ("Approve the edit to
+ * packages/server/src/worker-channel.ts?") while keeping the row a row.
+ */
+export const MAX_REQUIRES_ACTION_DETAIL_LENGTH = 200;
+
+/**
+ * Unicode FORMAT characters (general category Cf) — zero-width, yet not inert: U+202E reorders
+ * the text after it, U+200B pads a label invisibly, U+FEFF rides along as a stray BOM. Emoji
+ * variation selectors are marks (Mn), not Cf, so they survive.
+ */
+const FORMAT_CHARACTERS = /\p{Cf}/gu;
+
+/**
+ * Unicode CONTROL characters (general category Cc) — exactly the C0 and C1 ranges: a newline,
+ * tab, NUL, BEL, or the ESC that opens an ANSI/CSI escape sequence. Spelled as a property
+ * escape rather than the equivalent character class, because a class spelling the range out
+ * IS a control-character regex, which the `no-control-regex` lint rule rejects (rightly — it
+ * catches the accidental ones), and no source in this repo suppresses a lint rule.
+ */
+const CONTROL_CHARACTERS = /\p{Cc}/gu;
+
+/**
+ * Normalize a wire `detail` into ONE displayable line, or `undefined` when the frame said
+ * nothing usable (absent, non-string, or nothing left once normalized).
+ *
+ * This is the trust boundary for the detail: the string is worker-supplied and this is the
+ * single point where it enters the session model, so every consumer downstream — `ccctl
+ * attach`'s one-line-per-session list, `GET /api/sessions`, the persisted snapshot, a future
+ * "needs you" notification — inherits the guarantee rather than re-deriving it. Normalizing
+ * here, not at each renderer, is what makes the guarantee hold for consumers not yet written.
+ *
+ * Three passes, in order:
+ *  1. Zero-width FORMAT characters are dropped — a bidi override (U+202E) silently reorders the
+ *     rest of the line, and a detail made only of zero-width characters would be "non-empty" yet
+ *     invisible, which is not displayable.
+ *  2. Control characters become spaces — a newline forges a session row in a line-oriented list,
+ *     and the ESC opening an ANSI/CSI escape repaints or clears the operator's terminal. A space
+ *     (not deletion) keeps `a\nb` reading as `a b` rather than `ab`.
+ *  3. Whitespace runs collapse, and the result is clamped to
+ *     {@link MAX_REQUIRES_ACTION_DETAIL_LENGTH} code points.
+ */
+function displayableDetail(detail: string | undefined): string | undefined {
+  if (typeof detail !== "string") {
+    return undefined;
+  }
+  const flattened = detail.replace(FORMAT_CHARACTERS, "").replace(CONTROL_CHARACTERS, " ").replace(/\s+/g, " ").trim();
+  if (flattened === "") {
+    return undefined;
+  }
+  // Clamp by CODE POINT: `String.slice` counts UTF-16 code units, so it would cut a surrogate
+  // pair in half and leave a lone surrogate as the last character of the label.
+  const points = Array.from(flattened);
+  return points.length > MAX_REQUIRES_ACTION_DETAIL_LENGTH
+    ? `${points.slice(0, MAX_REQUIRES_ACTION_DETAIL_LENGTH - 1).join("")}…`
+    : flattened;
+}
+
+/**
+ * Resolve a `requires_action` human `detail` to a normalized single line, defaulting to
+ * {@link DEFAULT_REQUIRES_ACTION_DETAIL} when the frame supplies none.
  */
 function requiresActionDetail(detail: string | undefined): string {
-  return typeof detail === "string" && detail.trim() !== "" ? detail : DEFAULT_REQUIRES_ACTION_DETAIL;
+  return displayableDetail(detail) ?? DEFAULT_REQUIRES_ACTION_DETAIL;
 }
 
 /**
@@ -1143,26 +1203,72 @@ export function sessionLiveness(
   return isSessionStale(session, now, staleAfterMs) ? "stale" : "live";
 }
 
+// --- on AC4's "monotonic by the frame's timestamp" (#39) ---
+//
+// The classification is per-session (every transition below is pure, and the server keys one
+// map cell per session), but it is ordered by the server's RECEIPT of a frame, not by the
+// frame's own age — because the wire carries no frame age to order by. A `worker_status`
+// rides either the §4 `PUT …/worker` body (`{ worker_status, worker_epoch,
+// external_metadata }`) or a §5 {@link ControlEvent} (`{ type, subtype, payload }`); neither
+// carries a timestamp or a sequence number, and `worker_epoch` orders REGISTRATIONS, not the
+// frames within one.
+//
+// A guard comparing a server-read clock against `lastActivityAt` was tried and removed: reads
+// taken at apply time on a single-threaded event loop are non-decreasing by construction, so
+// it could never fire in production — while `Date.now()` is wall-clock, so one backward NTP
+// step made it refuse EVERY frame until real time caught up, silently swallowing the
+// `requires_action` that the notification wave exists to deliver.
+//
+// So: last-write-wins in receipt order, which is the only order the server can observe.
+// Detecting a genuinely stale frame needs the emitter to stamp one (a sequence number or a
+// timestamp) — a protocol change, since the emitter is the patched worker. Tracked in #201
+// rather than approximated here.
+
 /**
- * Explicit transition — apply a `worker_status` frame to a session. Returns a
- * NEW session with the derived {@link SessionActivity} and `lastActivityAt`
- * advanced to `now`. If `frame` is not a well-formed `worker_status` event the
- * session is returned unchanged (no transition). Pure: the input session is
- * never mutated, so applying a frame to one session cannot touch another.
+ * The `requires_action` detail already captured for this session, when the incoming frame
+ * supplies none — otherwise `undefined`, leaving {@link DEFAULT_REQUIRES_ACTION_DETAIL} to apply.
+ *
+ * The §4 `PUT …/worker` status gate reports a BARE status: its body has no detail field at
+ * all. The rich human detail rides the §5 `worker/events` leg. So a §4 re-affirmation of
+ * `requires_action` would otherwise degrade the tool description §5 captured back to the
+ * generic default, and the notification that reads it (#43) would never name the actual
+ * tool. Supplying no detail is not a statement that the detail is unknown — it is no
+ * statement at all, so the last one that WAS stated stands.
+ *
+ * Scoped to a `requires_action` → `requires_action` re-affirmation: any other status means
+ * the session moved on, so the question the detail named is gone and must not be resurrected.
  */
-export function applyWorkerStatusFrame(session: Session, frame: ControlFrame, now: number = Date.now()): Session {
-  const activity = sessionActivityFromFrame(frame);
-  if (activity === null) {
-    return session;
-  }
-  return { ...session, activity, lastActivityAt: now };
+function capturedRequiresActionDetail(session: Session, status: WorkerStatus): string | undefined {
+  return status === "requires_action" && session.activity.kind === "requires_action"
+    ? session.activity.detail
+    : undefined;
 }
 
 /**
- * Explicit transition — apply a {@link WorkerStatus} (from the §4/§5 `PUT …/worker`
- * status gate) to a session. Returns a NEW session with the derived
- * {@link SessionActivity} and `lastActivityAt` advanced to `now`. Pure: never
- * mutates the input, so one session's status cannot touch another's.
+ * Explicit transition — apply a `worker_status` frame to a session (the §5 `worker/events`
+ * leg, where the RICH frame carrying a human `detail` rides). Returns a NEW session with the
+ * derived {@link SessionActivity} and `lastActivityAt` advanced to `now`. A frame that is not
+ * a well-formed `worker_status` event returns the session unchanged (no transition). Pure:
+ * the input session is never mutated, so applying a frame to one session cannot touch another.
+ */
+export function applyWorkerStatusFrame(session: Session, frame: ControlFrame, now: number = Date.now()): Session {
+  if (!isWorkerStatusEvent(frame)) {
+    return session;
+  }
+  return applyWorkerStatus(session, frame.payload.status, frame.payload.detail, now);
+}
+
+/**
+ * Explicit transition — apply a {@link WorkerStatus} to a session. The single choke point
+ * every status application flows through: the §4 `PUT …/worker` gate calls it with a bare
+ * status, and {@link applyWorkerStatusFrame} folds a §5 frame through it, so the detail's
+ * normalization and carry-forward hold on BOTH legs from one place.
+ *
+ * Returns a NEW session with the derived {@link SessionActivity} and `lastActivityAt`
+ * advanced to `now`. An absent `detail` on a `requires_action` re-affirmation keeps the one
+ * already captured ({@link capturedRequiresActionDetail}). Applications are last-write-wins in
+ * receipt order — see the note above on why frame-age ordering is not enforced here. Pure:
+ * never mutates the input, so one session's status cannot touch another's.
  */
 export function applyWorkerStatus(
   session: Session,
@@ -1170,7 +1276,8 @@ export function applyWorkerStatus(
   detail?: string,
   now: number = Date.now(),
 ): Session {
-  return { ...session, activity: sessionActivityFromStatus(status, detail), lastActivityAt: now };
+  const resolved = displayableDetail(detail) ?? capturedRequiresActionDetail(session, status);
+  return { ...session, activity: sessionActivityFromStatus(status, resolved), lastActivityAt: now };
 }
 
 /**

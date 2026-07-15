@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  applyWorkerStatus,
   applyWorkerStatusFrame,
   createRegisteringSession,
   createSession,
@@ -12,6 +13,7 @@ import {
   isSessionStale,
   markSessionClosed,
   markSessionReady,
+  MAX_REQUIRES_ACTION_DETAIL_LENGTH,
   NON_PROMPTING_PERMISSION_MODES,
   PERMISSION_MODES,
   recordHeartbeat,
@@ -252,6 +254,198 @@ describe("explicit transitions (AC: per-session, one transition never mutates an
       const session = { ...createSession("sess-1", "default", T0), status };
       expect(markSessionClosed(session)).toBe(session);
     }
+  });
+});
+
+// #39 AC4 (per-session half): "Classification is per-session … " — a frame applied to one
+// session never moves another's. The frame-age half of AC4 is NOT enforced here: the wire
+// carries no frame timestamp to order by, so applications are last-write-wins in the server's
+// receipt order (see the note above `capturedRequiresActionDetail` in index.ts).
+describe("per-session classification (#39 AC4: one session's frame never moves another's)", () => {
+  it("applies each session's own frames independently, across both transitions", () => {
+    const a = applyWorkerStatusFrame(
+      createSession("sess-a", "default", T0),
+      statusFrame({ status: "running" }),
+      T0 + 100,
+    );
+    const b = createSession("sess-b", "default", T0);
+    const bSnapshot = structuredClone(b);
+    // Every transition on `a` — both legs — leaves `b` byte-for-byte untouched.
+    applyWorkerStatusFrame(a, statusFrame({ status: "idle" }), T0 + 200);
+    applyWorkerStatus(a, "requires_action", "Approve?", T0 + 300);
+    expect(b).toEqual(bSnapshot);
+    expect(a.activity).toEqual({ kind: "running" });
+  });
+
+  it("is last-write-wins in receipt order, so a later frame always lands", () => {
+    // No frame-age guard: the wire has no timestamp, and a clock-derived guard could only
+    // refuse frames it cannot prove are stale — silently dropping a `requires_action` is a
+    // far worse failure than applying an out-of-order one.
+    const running = applyWorkerStatusFrame(
+      createSession("sess-1", "default", T0),
+      statusFrame({ status: "running" }),
+      T0 + 100,
+    );
+    const idle = applyWorkerStatusFrame(running, statusFrame({ status: "idle" }), T0 + 50);
+    expect(idle.activity).toEqual({ kind: "idle" });
+  });
+});
+
+// #39 Reachable-state expansion: folding the §5 leg into the model means `activity.detail` now
+// holds an arbitrary WORKER-SUPPLIED string where it could previously only ever hold the fixed
+// `DEFAULT_REQUIRES_ACTION_DETAIL`. It is a one-line label rendered into `ccctl attach`'s
+// line-oriented session list and re-served on every `GET /api/sessions` poll, so it is
+// normalized at this trust boundary — the one point it enters the model.
+describe("requires_action detail normalization (#39: a worker-supplied detail is a bounded single line)", () => {
+  const withDetail = (detail: string) =>
+    applyWorkerStatusFrame(
+      createSession("sess-1", "default", T0),
+      statusFrame({ status: "requires_action", detail }),
+      T0 + 10,
+    );
+
+  it("flattens newlines so a detail cannot forge a row in a line-oriented list", () => {
+    // `ccctl attach` prints one line per session; an unflattened newline lets a worker-supplied
+    // detail render a session row that does not exist.
+    const activity = withDetail("Approve?\n  99999999-9999-9999-9999-999999999999  [ready] idle");
+    expect(activity.activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve? 99999999-9999-9999-9999-999999999999 [ready] idle",
+    });
+    expect((activity.activity as { detail: string }).detail).not.toContain("\n");
+  });
+
+  it("strips ANSI/CSI escapes and other control characters (they repaint the operator's terminal)", () => {
+    // "\u001b[2J\u001b[H" clears the screen and homes the cursor. Neutralizing the ESC that OPENS
+    // the sequence is what disarms it — the "[2J" / "[H" left behind are inert literal text.
+    // Each control character becomes a space, so "a\nb" reads "a b", never "ab".
+    const { detail } = withDetail("\u001b[2J\u001b[HApprove\u0007 the  edit?").activity as { detail: string };
+    expect(detail).toBe("[2J [HApprove the edit?");
+    // No C0/C1 control character survives, so the operator's terminal cannot be repainted.
+    const codes = Array.from(detail, (character) => character.codePointAt(0) ?? 0);
+    expect(codes.some((code) => code <= 0x1f || (code >= 0x7f && code <= 0x9f))).toBe(false);
+  });
+
+  it("clamps an over-long detail to MAX_REQUIRES_ACTION_DETAIL_LENGTH with an ellipsis", () => {
+    // A 512KB detail is within the 1 MiB body cap and would otherwise be re-served on every poll.
+    const { detail } = withDetail("A".repeat(500_000)).activity as { detail: string };
+    expect(detail).toHaveLength(MAX_REQUIRES_ACTION_DETAIL_LENGTH);
+    expect(detail.endsWith("…")).toBe(true);
+  });
+
+  it("keeps a detail exactly at the cap unclamped (boundary is strict `>`)", () => {
+    const exact = "A".repeat(MAX_REQUIRES_ACTION_DETAIL_LENGTH);
+    expect((withDetail(exact).activity as { detail: string }).detail).toBe(exact);
+  });
+
+  it("clamps by CODE POINT, so an astral character is never split into a lone surrogate", () => {
+    // Each emoji is ONE code point but TWO UTF-16 code units, so a code-unit clamp lands mid-pair
+    // and emits an unpaired surrogate — not well-formed UTF-16, and a replacement glyph on the wire.
+    const { detail } = withDetail("😀".repeat(250)).activity as { detail: string };
+    expect(detail.isWellFormed()).toBe(true);
+    expect(Array.from(detail)).toHaveLength(MAX_REQUIRES_ACTION_DETAIL_LENGTH);
+    expect(detail.endsWith("…")).toBe(true);
+  });
+
+  it("measures the cap in code points, not UTF-16 code units", () => {
+    // 101 emoji is 202 code units but only 101 code points: under the cap, so it must pass through
+    // WHOLE. A code-unit clamp would see 202 > 200 and truncate it mid-pair.
+    const under = "😀".repeat(101);
+    const { detail } = withDetail(under).activity as { detail: string };
+    expect(detail).toBe(under);
+    expect(detail.isWellFormed()).toBe(true);
+  });
+
+  it("drops zero-width format characters (a bidi override silently reorders the line)", () => {
+    // U+202E RIGHT-TO-LEFT OVERRIDE reverses the rendering of everything after it; U+200B is an
+    // invisible pad. Neither is content, and both survive a control-character filter (they are
+    // category Cf, not C0/C1).
+    const { detail } = withDetail("Approve\u202e\u200b the edit?").activity as { detail: string };
+    expect(detail).toBe("Approve the edit?");
+  });
+
+  it("falls back to the default when a detail is only zero-width characters (non-empty ≠ displayable)", () => {
+    expect(withDetail("\u200b\u202e\ufeff").activity).toEqual({
+      kind: "requires_action",
+      detail: DEFAULT_REQUIRES_ACTION_DETAIL,
+    });
+  });
+
+  it("falls back to the default when a detail normalizes away to nothing", () => {
+    // Control-characters-only is not a human-ready line; it must not surface as an empty label.
+    expect(withDetail("\u001b\u0007\n\t ").activity).toEqual({
+      kind: "requires_action",
+      detail: DEFAULT_REQUIRES_ACTION_DETAIL,
+    });
+  });
+
+  it("leaves an ordinary tool description untouched", () => {
+    expect(withDetail("Approve the edit to packages/server/src/worker-channel.ts?").activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve the edit to packages/server/src/worker-channel.ts?",
+    });
+  });
+});
+
+// #39 AC2: "A `requires_action` status classifies the session as requires_action AND captures
+// the human-ready detail (the tool/action description) for the notification." Two legs report a
+// status: the §5 events leg carries the RICH frame (`payload: { status, detail }`), the §4
+// `PUT …/worker` gate carries a BARE status with no detail field at all. So a bare re-affirmation
+// must not degrade a detail the rich leg already captured — otherwise the notification (#43)
+// reads the generic default and AC2 is met only until the next status report.
+describe("requires_action detail capture (#39 AC2: the session carries the human-ready action detail)", () => {
+  const blocked = (detail?: string) =>
+    applyWorkerStatusFrame(
+      createSession("sess-1", "default", T0),
+      statusFrame({ status: "requires_action", detail }),
+      T0 + 10,
+    );
+
+  it("captures the rich detail the frame supplies", () => {
+    expect(blocked("Approve the edit to src/index.ts?").activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve the edit to src/index.ts?",
+    });
+  });
+
+  it("RETAINS a captured detail when a BARE requires_action re-affirms it (the §4 gate carries none)", () => {
+    const captured = blocked("Approve the edit to src/index.ts?");
+    const reaffirmed = applyWorkerStatus(captured, "requires_action", undefined, T0 + 20);
+    expect(reaffirmed.activity).toEqual({ kind: "requires_action", detail: "Approve the edit to src/index.ts?" });
+    // It is a real application, not a refusal: the clock still advances.
+    expect(reaffirmed.lastActivityAt).toBe(T0 + 20);
+  });
+
+  it("treats a BLANK detail as absent and retains the captured one (blank is not a statement)", () => {
+    const captured = blocked("Approve the edit to src/index.ts?");
+    expect(applyWorkerStatus(captured, "requires_action", "   ", T0 + 20).activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve the edit to src/index.ts?",
+    });
+  });
+
+  it("lets an explicit detail REPLACE a previously captured one", () => {
+    const captured = blocked("Approve the edit to src/index.ts?");
+    expect(applyWorkerStatus(captured, "requires_action", "Approve the shell command?", T0 + 20).activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve the shell command?",
+    });
+  });
+
+  it("DROPS the captured detail once the session leaves requires_action (the question it named is gone)", () => {
+    const captured = blocked("Approve the edit to src/index.ts?");
+    const idle = applyWorkerStatus(captured, "idle", undefined, T0 + 20);
+    expect(idle.activity).toEqual({ kind: "idle" });
+    // A later BARE requires_action starts from nothing again — it must not resurrect the
+    // stale question the session already moved past.
+    expect(applyWorkerStatus(idle, "requires_action", undefined, T0 + 30).activity).toEqual({
+      kind: "requires_action",
+      detail: DEFAULT_REQUIRES_ACTION_DETAIL,
+    });
+  });
+
+  it("falls back to the default when nothing was ever captured", () => {
+    expect(blocked().activity).toEqual({ kind: "requires_action", detail: DEFAULT_REQUIRES_ACTION_DETAIL });
   });
 });
 
