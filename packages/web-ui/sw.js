@@ -63,19 +63,35 @@ self.addEventListener("push", (event) => {
   );
 });
 
-// Tapping a wake brings the operator back to the UI to attend the waiting session. The session
-// deep-link (#52) is a later slice; for now focus an already-open ccctl window, or open the app root.
+// Tapping a wake DEEP-LINKS the operator to the exact session that needs them (#52) — the tap→resolve
+// half of the push ladder. It is the notification BODY tap, never an inline action button: iOS does not
+// render custom PWA notification `actions` reliably (AC2), so this worker sets none and resolves the
+// tap here instead. The opaque #45 `data.session_id` pointer (stashed by the `push` handler above) is
+// resolved to the app root deep-linked to that session; the session's actual content is then fetched
+// over the tunnel by the app on selection (AC3 — `GET /api/sessions/{id}/events`), never carried here.
+//
+// Mirrors push.js § sessionDeepLinkUrl / § NAVIGATE_MESSAGE_TYPE inline (a classic worker cannot
+// `import` the ES module), the same "mirrored, not imported" tradeoff the `push` handler makes; those
+// functions are the tested authority (push.test.js). Two paths: an already-open window is told the
+// target session via `postMessage` (the live view switches in place — no reload) and focused; with no
+// window open, the app is cold-opened at `./?session=<id>`, which app.js reads on load.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
+  const rawSessionId = event.notification.data?.session_id;
+  const sessionId = typeof rawSessionId === "string" && rawSessionId.trim() !== "" ? rawSessionId : null;
+  const url = sessionId ? `./?session=${encodeURIComponent(sessionId)}` : "./";
   event.waitUntil(
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
       for (const client of clients) {
         if ("focus" in client) {
+          if (sessionId) {
+            client.postMessage({ type: "ccctl:navigate", session_id: sessionId });
+          }
           return client.focus();
         }
       }
       if (self.clients.openWindow) {
-        return self.clients.openWindow("./");
+        return self.clients.openWindow(url);
       }
       return undefined;
     }),
