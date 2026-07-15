@@ -1,7 +1,7 @@
 # @ccctl/web-ui
 
 The zero-build browser UI for [ccctl](../../README.md). Deliberately has **no
-framework and no bundler**: it is a single `index.html` plus ten vanilla ES
+framework and no bundler**: it is a single `index.html` plus eleven vanilla ES
 modules served statically — `src/app.js` (the thin DOM shell), `src/transcript.js`
 (the DOM-free downstream rendering logic), `src/command.js` (the DOM-free
 upstream steer-building logic), `src/sessions.js` (the DOM-free session-list
@@ -10,8 +10,9 @@ launch-body / typed-failure logic), `src/stop.js` (the DOM-free emergency-stop
 request / typed-refusal logic), `src/connection.js` (the DOM-free
 connection-health verdict), `src/pairing.js` (the DOM-free QR-pair
 token-application logic), `src/devices.js` (the DOM-free device-list
-label / last-seen / current-device logic) and `src/push.js` (the DOM-free
-Web-Push subscription / notification logic). For PWA install it also ships a
+label / last-seen / current-device logic), `src/push.js` (the DOM-free
+Web-Push subscription / notification logic) and `src/needs-you.js` (the DOM-free
+needs-you-queue reconcile / ack logic). For PWA install it also ships a
 `manifest.webmanifest`, a `sw.js` service worker and a scalable `icon.svg` (#51).
 There is nothing to compile; `build` just copies the static assets into `dist/`,
 and the modules can be served as-is by the daemon (or locally, e.g. `npx serve .`).
@@ -128,6 +129,22 @@ module `src/push.js`; it MIRRORS `notificationContent`'s few-line decision inlin
 the same "mirrored, not imported" tradeoff below, with `push.test.js` the tested
 authority.
 
+Because a push is **at-most-once** (coalesced away, dropped on expiry, or lost on a
+lapsed subscription), the notification ladder's non-negotiable backstop is the
+persisted **unread "needs-you" queue**, reconciled **over the tunnel on every
+reconnect** (#53) — so a blocking event is **never permanently missed**. `src/needs-you.js`
+owns the DOM-free decisions: decode the server's un-acked set (its membership is
+authoritative), **order each session's entries by `Last-Event-ID`**, and build the
+`(sessionId, eventId)` ack key. `app.js` is the glue: when the session-list heartbeat
+**(re)connects**, it GETs the hub-global queue and paints a red **"needs you"** badge on
+every session that still needs the operator; **viewing** a session **acks** its entries,
+so an acknowledged block is **not re-shown** while a seen-but-unacked one **re-surfaces on
+every reconnect** until attended. The reconcile + ack routes are served by a later server
+slice (#47 shipped the pure queue operations deliberately **unwired**), so — until then —
+the reconcile yields an empty queue and the surface stays quiet, the same **mirrored**
+mirror-ahead stance as push (#51), the device list (#85) and the QR-pair token (#74). Its
+tested authority is `needs-you.test.js`.
+
 The `@ccctl/core` frame shapes are **mirrored, not imported** — this UI is served
 to the browser as-is, so `src/*.js` stays dependency-free vanilla ESM. The
 downstream rendering logic in `src/transcript.js`, the upstream steer-building
@@ -136,8 +153,9 @@ logic in `src/command.js`, the session-list diff / label / selection logic in
 emergency-stop request / typed-refusal logic in `src/stop.js`, the
 connection-health verdict in `src/connection.js`, the
 QR-pair token application in `src/pairing.js`, the device-list logic in
-`src/devices.js` and the Web-Push subscription / notification logic in
-`src/push.js` are all
+`src/devices.js`, the Web-Push subscription / notification logic in
+`src/push.js` and the needs-you-queue reconcile / ack logic in `src/needs-you.js`
+are all
 unit-tested (`vitest`), and four of them are additionally driven against the **real
 server** — the yardstick a mirror needs, since a unit test can only check a module's
 copy of the contract against a fixture in the same package. `src/transcript.js` +
