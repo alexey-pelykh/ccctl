@@ -222,12 +222,47 @@ export interface HostEndpoint {
   port: number;
 }
 
-/** The loopback hosts that are always permitted without a tunnel. */
+/**
+ * The loopback hosts that are always permitted without a tunnel, in their exact
+ * canonical spellings — the hostname `localhost` plus the two canonical literals.
+ * {@link isLoopbackHost} ALSO accepts the rest of the IPv4 loopback block beyond
+ * `127.0.0.1` (see there); this list is the named, exact-match core.
+ */
 export const LOOPBACK_HOSTS: readonly string[] = ["localhost", "127.0.0.1", "::1"];
 
-/** Whether a host is one of the always-allowed loopback hosts. */
+/**
+ * Whether a host is a loopback host — one that never leaves the box, so it is always
+ * permitted without a tunnel and is the only kind {@link https://ccctl | @ccctl/server}'s
+ * `resolveBindHost` lets the daemon bind. Recognises the exact forms in
+ * {@link LOOPBACK_HOSTS} PLUS the WHOLE IPv4 loopback block `127.0.0.0/8`
+ * (RFC 1122 §3.2.1.3 — every `127.x.y.z`, not just `127.0.0.1`). `::1` is the IPv6
+ * loopback in its canonical form; a non-canonical spelling fails closed, because the
+ * bind guard that gates on this must over-refuse, never over-permit.
+ */
 export function isLoopbackHost(host: string): boolean {
-  return LOOPBACK_HOSTS.includes(host);
+  return LOOPBACK_HOSTS.includes(host) || isIpv4LoopbackHost(host);
+}
+
+/**
+ * Whether `host` is a dotted-quad in the IPv4 loopback block `127.0.0.0/8`. Strict by
+ * design: four decimal octets, each `0`–`255` with NO leading zeros (a leading-zero octet
+ * is an octal-ambiguity footgun — `0177` is 127 read as octal but 177 read as a plain
+ * integer), first octet exactly `127`. Anything else — `0.0.0.0`, a LAN or public address,
+ * a partial form like `127.1`, a hostname — is not a loopback bind here. Fails CLOSED: an
+ * ambiguous or non-canonical spelling is refused, never guessed into loopback, because the
+ * caller that gates on it (the server bind guard) must never over-permit a bind.
+ */
+function isIpv4LoopbackHost(host: string): boolean {
+  const octets = host.split(".");
+  if (octets.length !== 4) {
+    return false;
+  }
+  for (const octet of octets) {
+    if (!/^(0|[1-9]\d{0,2})$/.test(octet) || Number(octet) > 255) {
+      return false;
+    }
+  }
+  return octets[0] === "127";
 }
 
 /**

@@ -162,7 +162,8 @@ export { isStopFailureCode, STOP_FAILURE_CODES } from "./ui-session-stop.js";
 // Re-export the baseline startup guarantees (#14) on the public surface. The daemon
 // (@ccctl/cli's `serve`) applies them before binding, and any embedder gets the same
 // refuse-start-without-auth + localhost-bind baseline. Defined and unit-tested in
-// startup.ts; DEFAULT_HOST is also consumed internally below.
+// startup.ts; resolveBindHost is ALSO applied internally by startServer below, so the
+// localhost-bind guarantee holds on the programmatic bind path, not only the CLI edge (#58).
 export { DEFAULT_HOST, LOCAL_SERVER_AUTH_ENV, requireLocalServerAuth, resolveBindHost, WILDCARD_BIND_HOST };
 
 // Re-export the #57 config-file auth source that COMPLETES the refuse-start-without-auth
@@ -734,7 +735,23 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
  * (possibly ephemeral) port. Rejects if the socket fails to bind.
  */
 export function startServer(config: ServerConfig): Promise<CcctlServer> {
-  const host = config.host ?? DEFAULT_HOST;
+  // Localhost-bind guarantee (#58), enforced on the ACTUAL bind path so it is not silently
+  // overridable: an embedder passing a non-loopback `config.host` (`0.0.0.0`, `::`, a LAN or public
+  // IP) is refused HERE, exactly as `ccctl serve` refuses one at the CLI edge — the guarantee holds
+  // on every start path, not only through the daemon binary. `resolveBindHost` also supplies the
+  // loopback DEFAULT when `config.host` is absent (and refuses an empty-string host, which the prior
+  // `config.host ?? DEFAULT_HOST` silently let through). It THROWS on a non-loopback host; convert
+  // that to a REJECTION so this promise-returning entry point fails one way, always — the same
+  // mixed-contract footgun the maxSessions guard below avoids: `startServer(cfg).catch(…)` must catch
+  // a refused bind just as it catches a bad cap.
+  let host: string;
+  try {
+    host = resolveBindHost(config.host);
+  } catch (error) {
+    // resolveBindHost throws an Error; re-narrow the `unknown` catch binding to one so the
+    // rejection reason is statically an Error (and stays robust if that ever changes).
+    return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+  }
   // Refuse a nonsense session cap AT BOOT, before anything binds (#36). `??` only defends against an
   // absent value, and the values it lets through are not all harmless: `NaN` — trivially produced by
   // the very `Number(process.env.…)` an embedder writes to honor the cap's config-overridability —

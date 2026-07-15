@@ -33,6 +33,19 @@ describe("startServer", () => {
     const server = await startTestServer();
     expect(server.address.host).toBe(DEFAULT_HOST);
     expect(server.address.port).toBeGreaterThan(0);
+    expect(server.address.host).not.toBe("0.0.0.0");
+  });
+
+  it("refuses a non-loopback config.host on the bind path — the guarantee is not overridable (#58)", async () => {
+    // The localhost-bind guarantee holds on the ACTUAL bind path, not only the `ccctl serve` CLI
+    // edge: an embedder handing startServer a non-loopback host is REJECTED before any socket binds
+    // (never a live off-box listener), with the same branded ccctl guardrail. This is the AC that
+    // the prior slice missed — startServer took `config.host` straight to listen() ungated.
+    for (const host of ["0.0.0.0", "::", "192.168.1.10"]) {
+      const rejection = startServer({ port: 0, host });
+      await expect(rejection).rejects.toThrow(/refusing to bind/);
+      await expect(rejection).rejects.toThrow(/loopback only/);
+    }
   });
 
   it("routes an unknown path to a fail-closed 404", async () => {

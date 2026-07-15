@@ -10,13 +10,16 @@
  *     unauthenticated mode, not even on loopback. {@link requireLocalServerAuth}
  *     fails closed when no local-server auth is configured, so the daemon exits
  *     rather than serving open.
- *   - **Localhost-bind.** The listener binds loopback ({@link DEFAULT_HOST}) and
- *     never the `0.0.0.0` wildcard; nothing is reachable off-box until an explicit
- *     tunnel is attached. {@link resolveBindHost} refuses the wildcard.
+ *   - **Localhost-bind.** The listener binds a loopback address ({@link DEFAULT_HOST} by
+ *     default) and NEVER a non-loopback one; nothing is reachable off-box until an explicit
+ *     tunnel is attached. {@link resolveBindHost} refuses every non-loopback host.
  *
- * The localhost-bind guard is still the MINIMAL slice: refuse-`0.0.0.0` only; the full
- * localhost-bind guarantee (refuse EVERY non-loopback address — `::`, LAN, public — and
- * make it non-overridable) completes in #58. The refuse-start-without-auth guard is now
+ * The localhost-bind guard is now COMPLETE to spec (#58): {@link resolveBindHost} is an
+ * allowlist — it honours only a loopback bind (any `127.0.0.0/8` / `::1` / `localhost`) and
+ * refuses EVERY non-loopback address (the `0.0.0.0` wildcard, the `::` IPv6 wildcard, a LAN
+ * IP, a public IP), and {@link startServer} applies it on the actual bind path so the
+ * guarantee is not silently overridable by an embedder (it holds on every start path, not
+ * only the CLI edge). The baseline slice (#14) refused only `0.0.0.0`. The refuse-start-without-auth guard is now
  * COMPLETE to spec (#57): {@link requireLocalServerAuth} reads the secret from either the
  * {@link LOCAL_SERVER_AUTH_ENV} env var or the {@link resolveLocalServerAuthPath} config
  * file, treats a present-but-blank value on EITHER source as no auth, and — when neither
@@ -32,6 +35,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { isLoopbackHost } from "@ccctl/core";
 
 /**
  * Default loopback bind host — nothing is exposed without an explicit tunnel.
@@ -176,20 +180,26 @@ export function requireLocalServerAuth(
 }
 
 /**
- * Resolve the daemon's bind host, defaulting to loopback ({@link DEFAULT_HOST})
- * and refusing the {@link WILDCARD_BIND_HOST} wildcard so nothing is exposed
- * off-box (security-posture.md § "Localhost-bind by default"). Returns the host to
- * bind.
+ * Resolve the daemon's bind host, defaulting to loopback ({@link DEFAULT_HOST}) and
+ * refusing EVERY non-loopback address so nothing is exposed off-box
+ * (security-posture.md § "Localhost-bind by default": "no implicit LAN or `0.0.0.0`
+ * binding"). Returns the host to bind, or throws an actionable error.
  *
- * Baseline slice (#14): default loopback + refuse `0.0.0.0`. Refusing EVERY
- * non-loopback address (`::`, a LAN IP, a public IP) and making the guarantee
- * non-overridable on every start path completes it in #58.
+ * Complete to spec (#58): an ALLOWLIST, not a denylist. A host is honoured iff it is a
+ * loopback bind ({@link isLoopbackHost} — any `127.0.0.0/8` address, `::1`, or `localhost`);
+ * anything else is refused — the {@link WILDCARD_BIND_HOST} `0.0.0.0`, the IPv6 wildcard
+ * `::`, and any LAN or public address alike (the baseline slice #14 refused only `0.0.0.0`,
+ * letting `::`/LAN/public through). {@link startServer} applies this on the actual bind path,
+ * so the guarantee is NOT silently overridable by an embedder passing a non-loopback
+ * `config.host` — it holds on every start path, not only the CLI edge.
  */
 export function resolveBindHost(host: string = DEFAULT_HOST): string {
-  if (host === WILDCARD_BIND_HOST) {
+  if (!isLoopbackHost(host)) {
+    const label = host === "" ? "the empty host" : host;
     throw new Error(
-      `ccctl: refusing to bind ${WILDCARD_BIND_HOST} — the local server binds loopback only ` +
-        `(default ${DEFAULT_HOST}) and is reached off-box solely through an explicit tunnel.`,
+      `ccctl: refusing to bind ${label} — the local server binds loopback only ` +
+        `(default ${DEFAULT_HOST}; any 127.0.0.0/8 or ::1) and is reached off-box solely through an ` +
+        `explicit tunnel. ${WILDCARD_BIND_HOST}, ::, and any LAN or public address are refused.`,
     );
   }
   return host;

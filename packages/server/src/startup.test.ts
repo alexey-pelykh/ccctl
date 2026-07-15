@@ -132,14 +132,14 @@ describe("resolveLocalServerAuthPath — XDG config path for the auth secret (#5
   });
 });
 
-describe("resolveBindHost — localhost-bind, never 0.0.0.0 (#14 AC2)", () => {
+describe("resolveBindHost — localhost-bind, refuse every non-loopback (#58)", () => {
   it("defaults to the loopback host when no override is given (default binds loopback)", () => {
     expect(resolveBindHost()).toBe(DEFAULT_HOST);
     expect(DEFAULT_HOST).toBe("127.0.0.1");
   });
 
-  it("returns an explicit loopback host unchanged", () => {
-    for (const host of ["127.0.0.1", "::1", "localhost"]) {
+  it("returns an explicit loopback host unchanged — the whole 127.0.0.0/8, ::1, and localhost", () => {
+    for (const host of ["127.0.0.1", "127.0.0.2", "127.1.2.3", "::1", "localhost"]) {
       expect(resolveBindHost(host)).toBe(host);
     }
   });
@@ -150,12 +150,20 @@ describe("resolveBindHost — localhost-bind, never 0.0.0.0 (#14 AC2)", () => {
     expect(() => resolveBindHost(WILDCARD_BIND_HOST)).toThrow(/loopback only/);
   });
 
-  it("refuses only the 0.0.0.0 wildcard at this slice — the full non-loopback refusal is #58", () => {
-    // The minimal ride-along guards exactly the AC's wording ("never 0.0.0.0").
-    // Refusing every non-loopback address (`::`, LAN, public) and making the
-    // guarantee non-overridable is completed to spec in #58, so a routable host
-    // still passes through here rather than being refused prematurely.
-    expect(resolveBindHost("192.168.1.10")).toBe("192.168.1.10");
+  it("refuses EVERY non-loopback address — the `::` wildcard, a LAN IP, a public IP (#58)", () => {
+    // Complete to spec: the guard is an allowlist, not the #14 refuse-`0.0.0.0`-only denylist.
+    // A routable host is refused, not honoured — the exact gap #58 closes (the prior slice let
+    // `::`, LAN, and public addresses pass straight through).
+    for (const host of ["::", "192.168.1.10", "10.0.0.5", "8.8.8.8"]) {
+      expect(() => resolveBindHost(host)).toThrow(/refusing to bind/);
+      expect(() => resolveBindHost(host)).toThrow(/loopback only/);
+    }
+  });
+
+  it("refuses an empty host rather than binding it (the `?? DEFAULT_HOST` gap)", () => {
+    // `"" ?? DEFAULT_HOST` is `""` — nullish coalescing does not catch the empty string, so the
+    // prior bind path would have handed `""` to listen(). The allowlist refuses it outright.
+    expect(() => resolveBindHost("")).toThrow(/refusing to bind the empty host/);
   });
 });
 
