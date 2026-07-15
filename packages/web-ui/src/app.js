@@ -66,6 +66,14 @@ import {
   consumeDeepLinkSessionId,
   navigateMessageSessionId,
 } from "./push.js";
+import {
+  NEEDS_YOU_RECONCILE_PATH,
+  NEEDS_YOU_ACK_PATH,
+  reconcileNeedsYou,
+  needsYouAckBody,
+  needsYouKey,
+  needsYouDetail,
+} from "./needs-you.js";
 
 const connectionEl = document.getElementById("connection");
 const statusEl = document.getElementById("status");
@@ -99,6 +107,20 @@ let source = null;
 const sessionRows = new Map();
 /** The session summaries last applied to the picker — the "previous" side of each poll's diff. */
 let renderedSessions = [];
+/**
+ * The un-acked "needs-you" entries reconciled from the queue on reconnect (#53), keyed by session id →
+ * that session's un-acked {@link reconcileNeedsYou} entries. Populated by {@link reconcileNeedsYouQueue}
+ * (the server's un-acked set is authoritative), drained per session by {@link ackNeedsYou} when the
+ * operator views it, and painted onto the picker as a per-row "needs you" badge.
+ */
+const needsYou = new Map();
+/**
+ * The `${sessionId}:${eventId}` keys ({@link needsYouKey}) this client has already acked-by-viewing, so a
+ * reconcile that fires again before the server has processed the ack does not re-badge a session the
+ * operator already attended to. Grows for the page's life (bounded by a session's needs-you count) and
+ * clears on reload — where a still-server-queued entry honestly re-surfaces (the backstop guarantee).
+ */
+const ackedNeedsYou = new Set();
 /** How often the picker re-polls `/api/sessions` so each row's per-session status stays live (#25 AC3). */
 const SESSION_POLL_INTERVAL_MS = 2000;
 /** The pending next-poll timer id, or null when no poll is scheduled. */
@@ -230,6 +252,47 @@ function createDegradedBadge(sessionId) {
 }
 
 /**
+ * Build one "needs you" badge for a session with an un-acked reconciled blocking event (#53). A sibling
+ * of {@link createDegradedBadge}, and OUTSIDE the row button for the same reason (a poll relabels the
+ * button, which would wipe a nested child) — but unlike the life-long degraded marker this one is
+ * TRANSIENT: it is added on reconnect-reconcile and removed when the operator views the session (which
+ * acks it). It carries NO `aria-describedby`, deliberately: sitting in the `aria-live` picker list, its
+ * INSERTION is announced once — which is the right reading for news ("this session needs you"), unlike
+ * the degraded marker's standing property. The `title` carries the block's human detail.
+ */
+function createNeedsYouBadge(detail) {
+  const badge = document.createElement("span");
+  badge.dataset.badge = "needs-you";
+  badge.textContent = "needs you";
+  badge.title = detail;
+  return badge;
+}
+
+/**
+ * Paint the per-session "needs you" badges from {@link needsYou} onto the picker rows: a row whose
+ * session has un-acked reconciled entries gains a badge (its `title` the newest block's detail — entries
+ * are eventId-ascending, so the last is newest); a row without loses any stale badge. Idempotent, so it
+ * is safe to call after every reconcile AND after every poll's {@link applySessionList} (a row removed
+ * and re-added keeps its badge state consistent). Touches only the badge, never the button label.
+ */
+function renderNeedsYouBadges() {
+  for (const [sessionId, li] of sessionRows) {
+    const existing = li.querySelector('[data-badge="needs-you"]');
+    const entries = needsYou.get(sessionId);
+    if (entries === undefined || entries.length === 0) {
+      existing?.remove();
+      continue;
+    }
+    const detail = needsYouDetail(entries[entries.length - 1]);
+    if (existing === null) {
+      li.appendChild(createNeedsYouBadge(detail));
+    } else {
+      existing.title = detail;
+    }
+  }
+}
+
+/**
  * Build one picker row: a full-width button whose click views + steers that session, plus —
  * for a session carrying the degraded-notification marker (#26) — a standing badge (#27).
  *
@@ -277,6 +340,9 @@ function applySessionList(sessions) {
       emptyPlaceholderShown = true;
     }
     renderedSessions = [];
+    // No sessions → no needs-you to attend; drop any reconciled entries so a later reconcile rebuilds
+    // from the server's set rather than badging a session that has since gone.
+    needsYou.clear();
     return;
   }
   // Coming from the empty-state placeholder (which is not a tracked row): clear it first.
@@ -291,6 +357,8 @@ function applySessionList(sessions) {
   for (const id of diff.removed) {
     sessionRows.get(id)?.remove();
     sessionRows.delete(id);
+    // A vanished (closed) session's needs-you is moot — there is nothing left to view or ack.
+    needsYou.delete(id);
   }
   for (const { id, label } of diff.added) {
     const li = createSessionRow(id, label, notificationsDegraded(byId.get(id)));
@@ -319,6 +387,10 @@ function applySessionList(sessions) {
   }
   renderedSessions = sessions;
   markSelected();
+  // Re-paint needs-you badges after the row diff so a newly-added row is badged (and a removed one's
+  // badge is gone) — the badge is a sibling of the button, so a relabel never wipes it, but a row
+  // add/remove must reconcile the badge with the map.
+  renderNeedsYouBadges();
 }
 
 /** Move the selection highlight to the current session without re-fetching the list. */
@@ -335,6 +407,11 @@ function markSelected() {
 /** Fetch and reconcile the session list; auto-select the first on first load, drop a vanished selection. */
 async function loadSessions() {
   let payload;
+  // Whether THIS poll is a (re)connect — the heartbeat settling to reachable from a non-ok state (the
+  // first settle, or a recovery from a failure). Gates the needs-you reconcile below so it fires "on
+  // every reconnect over the tunnel" (#53), not on every 2s poll. Assigned in the try before its only
+  // read; a failed poll returns from the catch without reaching it, so no initializer is needed.
+  let reconnected;
   try {
     const response = await fetch(SESSIONS_PATH, { headers: authHeader(localStorage) });
     if (!response.ok) {
@@ -342,6 +419,7 @@ async function loadSessions() {
     }
     payload = await response.json();
     // The heartbeat beat: the phone can reach the server (#75).
+    reconnected = pollState !== "ok";
     pollState = "ok";
     renderConnection();
   } catch (error) {
@@ -385,6 +463,109 @@ async function loadSessions() {
       delete stopStatusEl.dataset.stop;
     }
     markSelected();
+  }
+  // On a (re)connect, reconcile the un-acked needs-you queue over the tunnel so a blocking event whose
+  // push was lost/coalesced re-surfaces (#53). Fire-and-forget: it paints badges when it resolves and
+  // never blocks the poll loop; it runs AFTER applySessionList so the rows it badges already exist.
+  if (reconnected) {
+    reconcileNeedsYouQueue();
+  }
+}
+
+/**
+ * Reconcile the unread "needs-you" queue over the tunnel (#53): GET the hub-global un-acked set, and
+ * re-badge each session that still needs the operator. The server's un-acked set is authoritative
+ * membership (`reconcileNeedsYou` returns it verbatim, ordered by `Last-Event-ID`); this only skips a
+ * key the operator already acked-by-viewing this page-life (so a reconcile racing an in-flight ack does
+ * not re-badge an attended session). REPLACES the local map from the server's set each round, so an
+ * entry the server has acked (removed) loses its badge — "acknowledged events are not re-shown".
+ *
+ * Degrades honestly like `push.js` / `devices.js`: the reconcile route is mirror-ahead of #47's
+ * still-unwired server route, so a non-2xx (404 until wired) reads as "no queue" and an unreachable
+ * server leaves the prior badges standing for the next reconnect to retry — never a throw.
+ */
+async function reconcileNeedsYouQueue() {
+  let entries;
+  try {
+    const response = await fetch(NEEDS_YOU_RECONCILE_PATH, { headers: authHeader(localStorage) });
+    if (!response.ok) {
+      // A non-2xx is NOT an authoritative empty queue — a 404 while the route is mirror-ahead unwired,
+      // or a transient 5xx once it is live. Leave any prior badges standing for the next reconnect (the
+      // same safe direction as the network throw below); only a 2xx mutates the set. For a reliability
+      // backstop the safe failure is "keep showing the un-acked cue", never "clear it".
+      return;
+    }
+    entries = reconcileNeedsYou(await readJson(response));
+  } catch {
+    // Unreachable server / tunnel error page: nothing to reconcile now; the next reconnect retries.
+    return;
+  }
+  needsYou.clear();
+  for (const entry of entries) {
+    const key = needsYouKey(entry);
+    // Skip entries already acked-by-viewing (their server removal may still be in flight) — otherwise
+    // sort the entry under its session, preserving the eventId-ascending order the reconcile returns.
+    if (key === null || ackedNeedsYou.has(key)) {
+      continue;
+    }
+    const list = needsYou.get(entry.sessionId);
+    if (list === undefined) {
+      needsYou.set(entry.sessionId, [entry]);
+    } else {
+      list.push(entry);
+    }
+  }
+  renderNeedsYouBadges();
+  // The session the operator is ALREADY viewing counts as attended: ack its reconciled entries now (a
+  // no-op if it has none) rather than badge a session they are looking at. Closes the case where the
+  // view PRECEDED this reconcile — a deep-linked / auto-selected-first / navigated-to session whose own
+  // selectSession → ackNeedsYou no-op'd on the not-yet-populated queue, then could not clear the badge
+  // without navigating away and back (they are already on it, so re-selecting is a no-op).
+  if (currentSessionId !== null) {
+    ackNeedsYou(currentSessionId);
+  }
+}
+
+/**
+ * Acknowledge a session's un-acked needs-you when the operator VIEWS it (#53) — viewing IS attending to
+ * what the session needed. Drops the badge and records each key as acked at once (so a reconcile racing
+ * this does not re-badge), then POSTs an ack per `(sessionId, eventId)` so the server removes it and a
+ * later reconnect no longer returns it ("acknowledged events are not re-shown"). No-op when the session
+ * has no un-acked entry. Ack is best-effort over the tunnel: an ack that never lands leaves the entry in
+ * the server's queue to re-surface on a later reconnect (the backstop holds) — and until the server
+ * wires the ack route (mirror-ahead), the POST 404s harmlessly, exactly as `push.js`'s upload does.
+ */
+async function ackNeedsYou(sessionId) {
+  const entries = needsYou.get(sessionId);
+  if (entries === undefined || entries.length === 0) {
+    return;
+  }
+  needsYou.delete(sessionId);
+  renderNeedsYouBadges();
+  // Record EVERY key as acked BEFORE any POST, so a reconcile that races this loop cannot re-badge the
+  // session for an entry whose ack has not been POSTed yet (all its keys are already suppressed). Then
+  // POST each ack; the two passes keep the suppression atomic with respect to a concurrent reconcile.
+  const bodies = [];
+  for (const entry of entries) {
+    const key = needsYouKey(entry);
+    const body = needsYouAckBody(entry);
+    if (key === null || body === null) {
+      continue;
+    }
+    ackedNeedsYou.add(key);
+    bodies.push(body);
+  }
+  for (const body of bodies) {
+    try {
+      await fetch(NEEDS_YOU_ACK_PATH, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeader(localStorage) },
+        body: JSON.stringify(body),
+      });
+    } catch {
+      // The ack didn't reach the server: the entry stays in its queue and re-surfaces on a later
+      // reconnect. `ackedNeedsYou` keeps it from re-badging THIS page-life; a reload honestly re-shows it.
+    }
   }
 }
 
@@ -645,6 +826,9 @@ function selectSession(sessionId) {
   stopStatusEl.replaceChildren();
   renderStopControl();
   markSelected();
+  // Viewing the session acknowledges its reconciled needs-you (#53): drop the badge and ack the
+  // entries so a later reconnect no longer re-surfaces them. No-op when the session had none.
+  ackNeedsYou(sessionId);
   connect(sessionId);
 }
 

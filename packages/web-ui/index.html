@@ -95,6 +95,21 @@
         border: 1px solid #f59e0b;
         border-radius: 0.25rem;
       }
+      /* A session with an un-acked reconciled "needs-you" event (#53). Red — the page's attention hue
+         (as offline / error) — a STRONGER signal than the amber degraded marker: this is an active
+         call to view the session, not a standing property. Same sibling-of-the-button layout so it
+         survives a poll's relabel; it clears when the operator views the session (which acks it). */
+      #session-list [data-badge="needs-you"] {
+        display: inline-block;
+        margin: 0.2rem 0 0 0.6rem;
+        padding: 0.05rem 0.4rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: #b91c1c;
+        background: #fee2e2;
+        border: 1px solid #ef4444;
+        border-radius: 0.25rem;
+      }
       /* The "New session" launch control (#37). Unlike the single-input steer rows below, this form
          carries three fields plus its submit, so it STACKS rather than sharing one flex row — three
          inputs abreast are unusable on the phone this UI is driven from. */
