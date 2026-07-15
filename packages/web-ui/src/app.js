@@ -74,6 +74,7 @@ import {
   needsYouKey,
   needsYouDetail,
 } from "./needs-you.js";
+import { shouldQueueSteer, queuedSteer, cancelQueued, partitionQueueForFire } from "./steer-queue.js";
 
 const connectionEl = document.getElementById("connection");
 const statusEl = document.getElementById("status");
@@ -92,6 +93,8 @@ const promptInputEl = document.getElementById("prompt-input");
 const redirectFormEl = document.getElementById("redirect-form");
 const redirectInputEl = document.getElementById("redirect-input");
 const approveButtonEl = document.getElementById("approve-button");
+const steerQueueSectionEl = document.getElementById("steer-queue-section");
+const steerQueueEl = document.getElementById("steer-queue");
 const stopButtonEl = document.getElementById("stop-button");
 const stopStatusEl = document.getElementById("stop-status");
 const deviceListEl = document.getElementById("device-list");
@@ -161,6 +164,25 @@ let launching = false;
  * two together are what make the sentence above true.
  */
 let stopping = false;
+/**
+ * The optimistic offline-steer queue (#79): steers the operator submitted while the connection was
+ * offline, held here and fired IN ORDER on the next reconnect so a brief tunnel drop does not lose a
+ * decision. A plain array the shell owns (as it owns `renderedSessions`); `steer-queue.js` provides its
+ * pure transforms. REASSIGNED, never mutated, by {@link enqueueSteer}, {@link cancelSteerQueued}, and
+ * {@link fireSteerQueue} so a re-render always reads a fresh list.
+ */
+let steerQueue = [];
+/**
+ * Monotonic source of the cancel handle each queued steer carries ({@link enqueueSteer}). A plain
+ * counter, deliberately not a timestamp: it needs only to be unique + stable for the page's life so a
+ * Cancel targets exactly its row (position would shift as earlier items fire or cancel).
+ */
+let steerSeq = 0;
+/**
+ * Whether a queue drain is already in flight, so two reconnects in quick succession (or a manual
+ * refresh racing the reconnect) do not both start firing the same queue — the mirror of `polling`.
+ */
+let firingQueue = false;
 
 /** Build one transcript `<li>`: a bold subtype label plus an optional human summary. */
 function transcriptItem(subtype, summary) {
@@ -469,6 +491,9 @@ async function loadSessions() {
   // never blocks the poll loop; it runs AFTER applySessionList so the rows it badges already exist.
   if (reconnected) {
     reconcileNeedsYouQueue();
+    // And drain any steers the operator queued while offline (#79), firing them in order now that the
+    // link is back. Fire-and-forget like the reconcile; its own sends are awaited internally to keep order.
+    fireSteerQueue();
   }
 }
 
@@ -833,18 +858,16 @@ function selectSession(sessionId) {
 }
 
 /**
- * POST one steer command upstream to the SELECTED session; the server re-frames it as
- * a control_request onto that session's worker channel and answers 202 with the minted
- * id. On success the accepted steer is echoed into the transcript (marked outbound), so
- * it is reflected in the viewed session even before the worker's own events flow back
- * down the SSE stream. A non-2xx answer surfaces as an error entry.
+ * POST one steer command upstream to a NAMED session; the server re-frames it as a control_request onto
+ * that session's worker channel and answers 202 with the minted id. On success the accepted steer is
+ * echoed into the transcript (marked outbound), so it is reflected in the viewed session even before the
+ * worker's own events flow back down the SSE stream — but ONLY when the target is the session currently
+ * on screen. A queued steer (#79) fires against the session it was composed for ({@link fireSteerQueue}),
+ * which the operator may have navigated away from by fire time; echoing it into a DIFFERENT session's
+ * transcript would misattribute it. A non-2xx answer throws, surfaced by the caller.
  */
-async function sendSteer(command) {
-  if (currentSessionId === null) {
-    appendTranscript("error", "select a session to steer");
-    return;
-  }
-  const response = await fetch(sessionCommandPath(currentSessionId), {
+async function sendSteerTo(sessionId, command) {
+  const response = await fetch(sessionCommandPath(sessionId), {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(localStorage) },
     body: JSON.stringify(command),
@@ -852,17 +875,159 @@ async function sendSteer(command) {
   if (!response.ok) {
     throw new Error(`ccctl: steer failed (${response.status})`);
   }
-  appendOutbound(command.subtype, describeCommand(command));
+  if (sessionId === currentSessionId) {
+    appendOutbound(command.subtype, describeCommand(command));
+  }
 }
 
-/** Send a steer built from a DOM control; no-op on a blank build, surface failures. */
+/**
+ * Send a steer built from a DOM control — or, when the link is offline (#79), QUEUE it to fire on the
+ * next reconnect rather than lose the operator's decision to a brief tunnel drop. No-op on a blank
+ * build. With no session selected there is nothing to steer or queue (a queued steer fires against a
+ * named session), so that surfaces as it always has. A live/reconnecting link sends now; only a
+ * confirmed-offline heartbeat queues.
+ */
 function steer(command) {
   if (command === null) {
     return;
   }
-  sendSteer(command).catch((error) => {
+  if (currentSessionId === null) {
+    appendTranscript("error", "select a session to steer");
+    return;
+  }
+  if (shouldQueueSteer(connectionHealth({ poll: pollState, stream: streamState }))) {
+    enqueueSteer(currentSessionId, command);
+    return;
+  }
+  sendSteerTo(currentSessionId, command).catch((error) => {
     appendTranscript("error", error.message);
   });
+}
+
+/**
+ * Queue a steer the operator submitted while offline (#79 AC1): append a pending item — a fresh cancel
+ * handle plus the session it was composed against — and paint the pending list. The form handler already
+ * cleared the input optimistically, so the operator sees their decision captured as a pending row rather
+ * than silently dropped. A malformed build is skipped by `queuedSteer` (defensive; the handlers only
+ * reach here with a valid command and a selected session).
+ */
+function enqueueSteer(sessionId, command) {
+  steerSeq += 1;
+  const item = queuedSteer({ id: steerSeq, sessionId, command });
+  if (item === null) {
+    return;
+  }
+  steerQueue = [...steerQueue, item];
+  renderSteerQueue();
+}
+
+/**
+ * Build one queued-steer row: the verb label + its human summary (as the transcript renders a frame),
+ * the target session it will fire against, and a Cancel that drops it before it fires (#79 AC3). The row
+ * carries `data-queued` (pending / stale) for its colour and the cancel handle in `data-queue-id`.
+ */
+function steerQueueItem(item) {
+  // Reuse the transcript-frame builder (as appendOutbound does) for the verb + summary, then augment.
+  const li = transcriptItem(item.command.subtype, describeCommand(item.command));
+  li.dataset.queued = item.status;
+  li.dataset.queueId = String(item.id);
+  // Name the target session: a queued steer fires against the session it was composed for, which may
+  // not be the one on screen when it fires, so the operator can tell which decision is waiting.
+  const target = document.createElement("span");
+  target.dataset.queueTarget = "true";
+  target.textContent = ` — for ${item.sessionId}`;
+  li.appendChild(target);
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.dataset.queueCancel = "true";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => cancelSteerQueued(item.id));
+  li.appendChild(cancel);
+  return li;
+}
+
+/**
+ * Paint the offline-steer queue (#79 AC1): a pending row per queued steer, or nothing when the queue is
+ * empty (the section hides so it never shows a bare heading). `aria-live`, so a newly-queued steer is
+ * announced once. Rebuilt wholesale on each change — the queue is small and moves only on operator
+ * action (submit while offline, cancel) or a reconnect drain, never on the 2s poll — so an in-place diff
+ * would be complexity the churn does not justify.
+ */
+function renderSteerQueue() {
+  if (steerQueue.length === 0) {
+    steerQueueSectionEl.hidden = true;
+    steerQueueEl.replaceChildren();
+    return;
+  }
+  steerQueueSectionEl.hidden = false;
+  steerQueueEl.replaceChildren(...steerQueue.map(steerQueueItem));
+}
+
+/**
+ * Cancel a still-pending queued steer before it fires (#79 AC3): drop it from the queue and repaint. A
+ * handle no longer present — a Cancel that raced the reconnect drain firing it — is a harmless no-op
+ * (`cancelQueued` is idempotent).
+ */
+function cancelSteerQueued(id) {
+  steerQueue = cancelQueued(steerQueue, id);
+  renderSteerQueue();
+}
+
+/**
+ * Drain the offline-steer queue on reconnect (#79 AC2): partition it through the stale-guard seam, POST
+ * each survivor to the session it was composed for IN ORDER, and leave any held item in the queue for
+ * the operator to cancel. Fire-and-forget from `loadSessions` (like the needs-you reconcile), but each
+ * POST is AWAITED in turn so the sends land in the order the operator made them — an out-of-order
+ * redirect could countermand a later input. Guarded against overlapping reconnects (the `polling` mirror).
+ *
+ * The stale-guard (#79 AC4) is `partitionQueueForFire`'s default — nothing is stale, so every queued
+ * decision fires — until W5-21 (#80, which depends on this item) exposes the per-session message cursor
+ * and replaces this call with a cursor-compare guard + a "session moved on — still send?" prompt. The
+ * fire path already routes every item through the guard; #80 only arms it. A held item would carry
+ * status `stale` and render red, cancel-only, until that prompt lands.
+ */
+async function fireSteerQueue() {
+  if (firingQueue || steerQueue.length === 0) {
+    return;
+  }
+  const { send, hold } = partitionQueueForFire(steerQueue);
+  // Drop the about-to-send items from the queue NOW, before any await, so a cancel or a second reconnect
+  // racing the in-flight sends cannot double-fire them; a held (stale) item stays visible + cancellable.
+  steerQueue = hold;
+  renderSteerQueue();
+  if (send.length === 0) {
+    return;
+  }
+  firingQueue = true;
+  try {
+    for (const item of send) {
+      try {
+        await sendSteerTo(item.sessionId, item.command);
+      } catch (error) {
+        // A send that fails on reconnect (a flap, or the session closed while offline) surfaces like any
+        // failed steer rather than throwing out of the drain and stranding the rest — and only into the
+        // transcript of the session it targeted, when that is the one on screen. The decision was
+        // attempted, not silently lost; the operator can re-issue it.
+        if (item.sessionId === currentSessionId) {
+          appendTranscript("error", error.message);
+        }
+      }
+    }
+  } finally {
+    firingQueue = false;
+    // Self-re-arm (the `scheduleNextPoll` idiom applied to the drain): a steer the operator queued
+    // DURING this drain — the link flapped offline mid-drain, so a new steer was queued — never fired,
+    // because the reconnect that would have drained it found `firingQueue` still set and skipped. If any
+    // such item remains AND the link is back, drain it NOW rather than strand it until the next
+    // offline→online edge, which may never come on a link that then stays healthy — the flaky-mobile
+    // case this feature exists for. Gated on online (a steer only queues while offline, so a leftover
+    // item means the link flapped): while still offline they wait for the next real reconnect. Bounded —
+    // a send removes its item and an all-held (stale) queue returns before re-entering, so a persistent
+    // failure cannot loop; the depth is one re-drain per mid-drain flap, each needing fresh operator input.
+    if (steerQueue.length > 0 && !shouldQueueSteer(connectionHealth({ poll: pollState, stream: streamState }))) {
+      fireSteerQueue();
+    }
+  }
 }
 
 /**
