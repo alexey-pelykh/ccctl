@@ -24,19 +24,31 @@ import type { SessionLaunchOptions } from "./session-launcher.js";
 // live-worker oracle — never faked here.
 
 /**
- * A recording in-memory fake {@link OwnedPty}. Counts `kill` calls and lets a test fire `onExit`
- * to simulate the child dying. `autoExitOnKill` (default true) models the real pty — a `kill`
- * signals the child, which exits and fires `onExit`; a test that wants to observe teardown mid-flight
- * sets it false and fires the exit by hand.
+ * A recording in-memory fake {@link OwnedPty}. Counts `kill` calls, records the SIGNAL each one
+ * carried, and lets a test fire `onExit` to simulate the child dying. `autoExitOnKill` (default true)
+ * models the real pty — a `kill` signals the child, which exits and fires `onExit`; a test that wants
+ * to observe teardown mid-flight sets it false and fires the exit by hand.
+ *
+ * `ignoresPoliteSignal` models the child the emergency-stop exists for: one that catches and IGNORES
+ * the default signal (SIGHUP on POSIX) and therefore only ever dies on the uncatchable escalation. A
+ * fake that always exited on the first `kill` cannot tell a backend that escalates from one that hangs
+ * forever, which is the whole property under test.
  */
-function makeFakePty(config?: { readonly pid?: number; readonly autoExitOnKill?: boolean }): {
+function makeFakePty(config?: {
+  readonly pid?: number;
+  readonly autoExitOnKill?: boolean;
+  readonly ignoresPoliteSignal?: boolean;
+}): {
   readonly pty: OwnedPty;
   readonly killCount: () => number;
+  readonly killSignals: () => ReadonlyArray<string | undefined>;
   readonly fireExit: () => void;
   readonly hasExitListener: () => boolean;
 } {
   const autoExitOnKill = config?.autoExitOnKill ?? true;
+  const ignoresPoliteSignal = config?.ignoresPoliteSignal ?? false;
   let killCalls = 0;
+  const signals: Array<string | undefined> = [];
   const exitListeners: Array<(event: { readonly exitCode: number; readonly signal?: number }) => void> = [];
   const fireExit = (): void => {
     for (const listener of exitListeners.splice(0)) {
@@ -48,8 +60,14 @@ function makeFakePty(config?: { readonly pid?: number; readonly autoExitOnKill?:
     onExit(listener): void {
       exitListeners.push(listener);
     },
-    kill(): void {
+    kill(signal?: string): void {
       killCalls += 1;
+      signals.push(signal);
+      // The polite signal is the one with no explicit name (the pty default). A child that ignores it
+      // simply does not exit — no `onExit`, nothing reaped — until something uncatchable arrives.
+      if (ignoresPoliteSignal && signal === undefined) {
+        return;
+      }
       if (autoExitOnKill) {
         fireExit();
       }
@@ -58,6 +76,7 @@ function makeFakePty(config?: { readonly pid?: number; readonly autoExitOnKill?:
   return {
     pty,
     killCount: (): number => killCalls,
+    killSignals: (): ReadonlyArray<string | undefined> => signals,
     fireExit,
     hasExitListener: (): boolean => exitListeners.length > 0,
   };
@@ -144,6 +163,44 @@ describe("createPtySessionLauncher (#30 owned-pty backend)", () => {
     await session.close();
 
     expect(fake.killCount()).toBe(1);
+  });
+
+  it("AC2: close() ESCALATES to an uncatchable signal when the child ignores the polite one", async () => {
+    // Given the child this whole backend's teardown is judged on: a free-running worker that catches
+    // and ignores SIGHUP. Without an escalation "the child is reaped" is a promise kept only for
+    // children that cooperate — this one never exits, never fires onExit, and leaves close() pending
+    // FOREVER, which takes the emergency-stop, its retry, and shutdown's reaping down with it.
+    const fake = makeFakePty({ ignoresPoliteSignal: true });
+    const launcher = createPtySessionLauncher({
+      workerCommand,
+      spawn: () => fake.pty,
+      killEscalationMs: 10,
+    });
+    const session = await launcher.launch(OPTIONS);
+
+    // When teardown asks it to go.
+    await session.close();
+
+    // Then it was asked politely FIRST and forced only after declining — the ordering is the point, so
+    // a cooperating worker still gets its chance to flush and exit on its own terms.
+    expect(fake.killSignals()).toEqual([undefined, "SIGKILL"]);
+    // And it really is gone: close() resolved, which it only does once onExit has reaped the child.
+    await expect(session.liveness()).resolves.toBe("exited");
+  });
+
+  it("AC2: does NOT escalate against a child that goes politely — SIGKILL is the exception, not the routine", async () => {
+    // The complement, and the one that keeps the escalation honest: a healthy worker exits on the
+    // first signal in milliseconds and must never be SIGKILLed for it. An escalation that fired
+    // anyway would be aimed at a dead pid — or, once the OS recycles it, at somebody else's process.
+    const fake = makeFakePty();
+    const launcher = createPtySessionLauncher({ workerCommand, spawn: () => fake.pty, killEscalationMs: 10 });
+    const session = await launcher.launch(OPTIONS);
+
+    await session.close();
+    // Well past the window the escalation would have fired in.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(fake.killSignals()).toEqual([undefined]);
   });
 
   it("AC2: close() awaits the reaping — it does not resolve until the child has actually exited", async () => {

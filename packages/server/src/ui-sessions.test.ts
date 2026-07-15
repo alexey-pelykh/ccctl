@@ -60,9 +60,10 @@ describe("matchUiSessionRoute — the /api/sessions namespace seam (#20)", () =>
     expect(matchUiSessionRoute("/api/sessions/")).toEqual({ kind: "list" });
   });
 
-  it("matches a per-session events / command leg and extracts the session id", () => {
+  it("matches a per-session events / command / stop leg and extracts the session id", () => {
     expect(matchUiSessionRoute("/api/sessions/sess-42/events")).toEqual({ kind: "events", sessionId: "sess-42" });
     expect(matchUiSessionRoute("/api/sessions/sess-42/command")).toEqual({ kind: "command", sessionId: "sess-42" });
+    expect(matchUiSessionRoute("/api/sessions/sess-42/stop")).toEqual({ kind: "stop", sessionId: "sess-42" });
   });
 
   it("fails to match a foreign path, an unknown leg, or a bare session id", () => {

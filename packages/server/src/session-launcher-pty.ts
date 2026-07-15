@@ -64,6 +64,25 @@ export const DEFAULT_PTY_COLS = 80;
 export const DEFAULT_PTY_ROWS = 24;
 
 /**
+ * The default window a child gets to exit on the polite signal before {@link LaunchedSession.close}
+ * escalates to {@link FORCED_CHILD_SIGNAL} (2s) — long enough for a cooperating worker to flush and go
+ * (a healthy one exits in milliseconds), short enough to stay well inside the emergency-stop's own 5s
+ * patience (`session-release.ts` § `STOP_TEARDOWN_TIMEOUT_MS`), which is the deadline that matters: an
+ * escalation that landed after the stop had already given up would kill the child while telling the
+ * operator it could not. Overridable per launcher ({@link PtySessionLauncherConfig.killEscalationMs})
+ * — a test passes a short value to exercise the escalation deterministically.
+ */
+export const DEFAULT_CHILD_KILL_ESCALATION_MS = 2_000;
+
+/**
+ * The signal a child gets when it ignored the polite one — UNCATCHABLE, which is the entire point and
+ * the reason it is not merely "a second SIGHUP". A worker that ignored the first signal ignores the
+ * tenth; only a signal it cannot handle ends it, and only a child that actually exits fires the
+ * `onExit` that reaps it and releases its pty fd.
+ */
+const FORCED_CHILD_SIGNAL = "SIGKILL";
+
+/**
  * The operator-facing note carried on the DEGRADED {@link TerminalAttachment}. It says plainly
  * that this surface has no direct desk-terminal attach (the owned-pty fallback's whole
  * distinction from a tmux window) and points the operator at the surface they CAN drive it from —
@@ -135,6 +154,12 @@ export interface PtySessionLauncherConfig {
   readonly cols?: number;
   /** Initial pty height; defaults to {@link DEFAULT_PTY_ROWS}. */
   readonly rows?: number;
+  /**
+   * How long a child gets to exit on the polite signal before `close()` escalates to
+   * {@link FORCED_CHILD_SIGNAL}; defaults to {@link DEFAULT_CHILD_KILL_ESCALATION_MS}. A test passes a
+   * short value to exercise the escalation deterministically.
+   */
+  readonly killEscalationMs?: number;
 }
 
 /**
@@ -238,6 +263,7 @@ export function createPtySessionLauncher(config: PtySessionLauncherConfig): ISes
   const termName = config.termName ?? DEFAULT_PTY_TERM_NAME;
   const cols = config.cols ?? DEFAULT_PTY_COLS;
   const rows = config.rows ?? DEFAULT_PTY_ROWS;
+  const killEscalationMs = config.killEscalationMs ?? DEFAULT_CHILD_KILL_ESCALATION_MS;
   const buildWorkerCommand = config.workerCommand;
 
   return {
@@ -336,8 +362,45 @@ export function createPtySessionLauncher(config: PtySessionLauncherConfig): ISes
             // The child may already be gone (kill → ESRCH): its onExit still fires and reaps it, so
             // we fall through to await it rather than treat the throw as a failure.
           }
-          // Resolve once the child is actually reaped — teardown is not "done" until it has exited.
-          await reaped;
+          // ESCALATE if the polite signal is ignored. Without this, "reaps the child" is a promise this
+          // backend keeps only for children that cooperate: SIGHUP is catchable and ignorable, and a
+          // worker that ignores it never exits, never fires onExit, and leaves the `await` below
+          // pending FOREVER. That is not an exotic child — it is the free-running runaway #76's
+          // emergency-stop exists to halt, and it is the one case where every layer above this fails
+          // together: the stop gives up (`STOP_TEARDOWN_TIMEOUT_MS`) and reports `stop-failed`, the
+          // `closed` latch above then makes every retry a no-op that signals nothing, and shutdown
+          // reaps nothing — so the child outlives the daemon with its pty fd, which is exactly the
+          // orphan AC2 forbids and the leak {@link liveness} calls out.
+          //
+          // SIGKILL is uncatchable, so the child exits and onExit fires: the await below settles well
+          // inside the stop's own patience, and the abandoned close that latches `closed` over a live
+          // child stops being the STANDING outcome for a signal-ignoring worker. It does not become
+          // impossible — a child that outlives even SIGKILL (wedged in an uninterruptible syscall) still
+          // reaches it — which is exactly why `stopLaunchedSession` re-reads the surface rather than
+          // trusting a close that resolved. Politeness first is still the rule: the escalation only
+          // fires after a full grace window in which the child was asked nicely and declined. That
+          // ordering (term, wait, kill) is what every supervisor does, for this reason.
+          const escalation = setTimeout(() => {
+            try {
+              pty.kill(FORCED_CHILD_SIGNAL);
+            } catch {
+              // Already gone in the same instant — onExit reaps it and the await settles regardless.
+            }
+          }, killEscalationMs);
+          // `.unref()` so a pending escalation alone never holds the process open — the same posture as
+          // this server's other background timers (`pending-launch.ts`, `worker-channel.ts`). It costs
+          // nothing here for a reason particular to this backend: the child's own pty fd is never
+          // `unref`ed ({@link liveness} spells out why), so for as long as there is a child left to
+          // kill, the loop is alive and the escalation gets to fire.
+          escalation.unref();
+          try {
+            // Resolve once the child is actually reaped — teardown is not "done" until it has exited.
+            await reaped;
+          } finally {
+            // The child is gone; a SIGKILL fired at its pid now would be aimed at nothing, or (once the
+            // pid is recycled) at somebody else entirely.
+            clearTimeout(escalation);
+          }
         },
       };
     },

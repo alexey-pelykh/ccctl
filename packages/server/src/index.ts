@@ -78,6 +78,12 @@ import {
   releaseLaunchedSessions,
   type LaunchOutcome,
 } from "./ui-session-launch.js";
+import {
+  handleSessionStop,
+  stopSession as stopTrackedSession,
+  type SessionStopOptions,
+  type StopOutcomeWire,
+} from "./ui-session-stop.js";
 import { DEFAULT_REGISTRATION_TIMEOUT_MS, type PendingLaunch } from "./pending-launch.js";
 // The §1 wire's own "is this a usable concurrent-session cap" guard, reused verbatim to validate this
 // server's `maxSessions` (#36) — one rule for both caps rather than two that drift (bridge-wire.ts).
@@ -123,9 +129,14 @@ export { toSessionCreateResponseWire, type SessionCreateResponseWire } from "./s
 // against the PINNED camelCase projection instead of re-transcribing its shape, so a wire drift
 // breaks the consumer's typecheck rather than silently mismatching at runtime. `SessionSummaryWire`
 // is one entry of the `GET /api/sessions` list; `LaunchAcceptedWire` is the `POST /api/sessions`
-// launch-accepted body. Both are defined + wire-tested in ui-sessions.ts / ui-session-launch.ts.
+// launch-accepted body; `StopAcceptedWire` / `StopFailureWire` + `StopFailureCode` are the
+// `POST /api/sessions/{id}/stop` bodies (#76) — re-exported ahead of their consumers because #77's
+// stop button and `ccctl stop` are BOTH required to branch on the same typed `code` rather than on
+// prose, which only a pinned type can hold them to. Defined + wire-tested in ui-sessions.ts /
+// ui-session-launch.ts / ui-session-stop.ts.
 export type { SessionSummaryWire } from "./ui-sessions.js";
 export type { LaunchAcceptedWire } from "./ui-session-launch.js";
+export type { StopAcceptedWire, StopFailureCode, StopFailureWire, StopOutcomeWire } from "./ui-session-stop.js";
 
 // Re-export the baseline startup guarantees (#14) on the public surface. The daemon
 // (@ccctl/cli's `serve`) applies them before binding, and any embedder gets the same
@@ -435,6 +446,38 @@ export interface CcctlServer {
    * launcher that could bring up no surface. A failed launch touches no state at all.
    */
   launchSession(options: SessionLaunchOptions): Promise<LaunchOutcome>;
+  /**
+   * EMERGENCY-STOP one session (#76) — kill the terminal this server launched it on and drive the
+   * session to its terminal state. The programmatic form of a `POST /api/sessions/{id}/stop`, and the
+   * same shared core, so this cannot stop a session the HTTP path would refuse (nor the reverse).
+   *
+   * Resolves with what the stop did — `stopped` (this server killed the surface) or `already-exited`
+   * (it was already gone) — plus the terminal {@link Session} it produced. On both, the session has
+   * left {@link CcctlServer.sessions} and its UI relay is reaped, so a slot frees under the
+   * `maxSessions` cap.
+   *
+   * Rejects with a {@link SessionStopError} carrying a {@link StopFailureCode} on every path that did
+   * NOT stop the session: no such session (`unknown-session`); this server never launched it, so it
+   * holds no handle to kill (`no-surface` — a UC1 attach); the operator has taken the surface over and
+   * `force` was not given (`taken-over`, the AC3 envelope); the terminal may be running another
+   * session's live worker (`ambiguous-surface`, which `force` deliberately does NOT override); the
+   * backend could not read the surface (`liveness-unknown`); or the teardown itself failed
+   * (`stop-failed`).
+   *
+   * A REFUSED stop touches no state — the session stays exactly as it was, which is what makes a
+   * refusal safe to retry. The one exception is `unknown-session` raised at the END rather than the
+   * gate: an eviction reaped the session while this stop was probing its surface, so the retirement
+   * had already begun. Nothing there is wrong or worth undoing — the operator asked for the session to
+   * be over and it is over, by another hand — but the same operator action can answer `already-exited`
+   * or `unknown-session` depending on which of the two got there first.
+   *
+   * `force` (default `false`) authorizes killing a session the OPERATOR has taken over, and only that
+   * — it is the explicit consent AC3 requires, and it is scoped to the session named here.
+   */
+  stopSession(
+    sessionId: string,
+    options?: SessionStopOptions,
+  ): Promise<{ readonly outcome: StopOutcomeWire; readonly session: Session }>;
   /** Stop accepting connections and release the port. */
   close(): Promise<void>;
 }
@@ -450,8 +493,13 @@ interface ServerState {
   readonly eventRelays: SessionEventRelays;
   /** The injected session launcher (#31), or `undefined` when this server was configured without one. */
   readonly launcher: ISessionLauncher | undefined;
-  /** Handles to the terminals this server launched (#31), tracked so shutdown tears them down. */
-  readonly launchedSessions: Set<LaunchedSession>;
+  /**
+   * Handles to the terminals this server launched (#31), keyed by the session id each was launched
+   * for — tracked so shutdown tears them down, and keyed so an emergency-stop can address ONE
+   * session's terminal (#76). See {@link PendingLaunchState.launchedSurfaces} for why the key is the
+   * launch-minted id and why an entry may outlive its session's row.
+   */
+  readonly launchedSurfaces: Map<string, LaunchedSession>;
   /**
    * Ceiling on live sessions (#36) — a launch past it is refused `at-capacity`. Counts `sessions`
    * plus `launchReservations`. Validated at {@link startServer}, so it is always a positive integer.
@@ -506,6 +554,9 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: ServerS
         return;
       case "command":
         handleUiCommand(req, res, state, uiSession.sessionId);
+        return;
+      case "stop":
+        handleSessionStop(req, res, state, uiSession.sessionId);
         return;
     }
   }
@@ -583,6 +634,14 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
     launchSession(options: SessionLaunchOptions): Promise<LaunchOutcome> {
       return launchTrackedSession(state, options);
     },
+    stopSession(
+      sessionId: string,
+      options: SessionStopOptions = { force: false },
+    ): Promise<{ readonly outcome: StopOutcomeWire; readonly session: Session }> {
+      // Defaulted, not required, so the non-destructive stop is the one a caller gets for free and
+      // force is a thing they had to type — the same default the HTTP body's absent `force` takes.
+      return stopTrackedSession(state, sessionId, options);
+    },
     close(): Promise<void> {
       return new Promise<void>((resolve, reject) => {
         httpServer.close((error) => {
@@ -652,7 +711,7 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     workerChannels: new Map<string, WorkerChannelRecord>(),
     eventRelays: createSessionEventRelays(),
     launcher: config.launcher,
-    launchedSessions: new Set<LaunchedSession>(),
+    launchedSurfaces: new Map<string, LaunchedSession>(),
     maxSessions: config.maxSessions ?? DEFAULT_MAX_SESSIONS,
     launchReservations: new Set<symbol>(),
     pendingLaunches: new Map<string, PendingLaunch>(),

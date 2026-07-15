@@ -196,7 +196,7 @@ export interface SessionLaunchState extends PendingLaunchState {
    * opposite of the loop it exists to bound.
    *
    * A `Set` of unique tokens rather than a counter, matching the shape of every other bookkeeping
-   * field on this state (`launchedSessions`, `pendingLaunches`): its `size` IS the reading, a token
+   * field on this state (`launchedSurfaces`, `pendingLaunches`): its `size` IS the reading, a token
    * cannot be released twice, and there is no `-= 1` to be forgotten on a path that throws — a leaked
    * decrement would permanently shrink the cap for the life of the process.
    */
@@ -361,7 +361,7 @@ export interface LaunchOutcome {
  * That the registry half needs no bookkeeping of its own is a property worth stating, because the
  * cheap-looking alternatives are each subtly wrong:
  *
- *   - `launchedSessions` counts only surfaces THIS server launched — a host filled by UC1 attaches
+ *   - `launchedSurfaces` counts only surfaces THIS server launched — a host filled by UC1 attaches
  *     would still launch its 9th terminal;
  *   - `pendingLaunches` counts only the not-yet-registered — it empties as workers check in, so a
  *     loop would be capped only while its sessions were still booting, which is no cap at all.
@@ -369,10 +369,12 @@ export interface LaunchOutcome {
  * Every write to the registry is one of: a launch placing its `registering` row from birth
  * (`pending-launch.ts`), a §2 registration minting a UC1 attach (`environments-bridge.ts`), a
  * rehydrated survivor of the across-restart reaper (`session-reconcile.ts`), or an in-place status
- * advance (`worker-channel.ts`) that changes no count. Every removal is an END: the ghost-reaper
- * evicting an unregistered launch, or a worker channel driving to `closed`. So the size rises with
- * every session that begins and falls with every session that ends, from either use case — which is
- * exactly the cap's contract, and is why a slot frees with no new plumbing (AC3).
+ * advance (`worker-channel.ts`) that changes no count. Every removal is an END, and all of them now
+ * run through the one terminal seam (`session-close.ts`): the ghost-reaper evicting an unregistered
+ * launch, a worker channel driving a terminally-gone session to `closed`, or the operator stopping one
+ * outright (#76). So the size rises with every session that begins and falls with every session that
+ * ends, from either use case — which is exactly the cap's contract, and is why a slot frees with no
+ * new plumbing (AC3), whether the session ended on its own or was stopped.
  *
  * Counting `registering` rows is load-bearing, not incidental. They are the whole hazard: a retry
  * loop's terminals are all still `registering` (nothing has had time to check in), so a cap that
@@ -557,8 +559,8 @@ export function handleSessionLaunch(req: IncomingMessage, res: ServerResponse, s
  */
 export function releaseLaunchedSessions(state: SessionLaunchState): void {
   clearPendingLaunches(state);
-  for (const launched of state.launchedSessions) {
+  for (const launched of state.launchedSurfaces.values()) {
     void releaseLaunchedSession(launched);
   }
-  state.launchedSessions.clear();
+  state.launchedSurfaces.clear();
 }
