@@ -1,17 +1,20 @@
 # @ccctl/web-ui
 
 The zero-build browser UI for [ccctl](../../README.md). Deliberately has **no
-framework and no bundler**: it is a single `index.html` plus eight vanilla ES
+framework and no bundler**: it is a single `index.html` plus ten vanilla ES
 modules served statically — `src/app.js` (the thin DOM shell), `src/transcript.js`
 (the DOM-free downstream rendering logic), `src/command.js` (the DOM-free
 upstream steer-building logic), `src/sessions.js` (the DOM-free session-list
 diff / label / selection logic), `src/launch.js` (the DOM-free "New session"
-launch-body / typed-failure logic), `src/connection.js` (the DOM-free
+launch-body / typed-failure logic), `src/stop.js` (the DOM-free emergency-stop
+request / typed-refusal logic), `src/connection.js` (the DOM-free
 connection-health verdict), `src/pairing.js` (the DOM-free QR-pair
-token-application logic) and `src/devices.js` (the DOM-free device-list
-label / last-seen / current-device logic). There is nothing to compile; `build` just copies
-the static assets into `dist/`, and the modules can be served as-is by the daemon
-(or locally, e.g. `npx serve .`).
+token-application logic), `src/devices.js` (the DOM-free device-list
+label / last-seen / current-device logic) and `src/push.js` (the DOM-free
+Web-Push subscription / notification logic). For PWA install it also ships a
+`manifest.webmanifest`, a `sw.js` service worker and a scalable `icon.svg` (#51).
+There is nothing to compile; `build` just copies the static assets into `dist/`,
+and the modules can be served as-is by the daemon (or locally, e.g. `npx serve .`).
 
 It talks to [`@ccctl/server`](../server) over a **per-session** namespace (#20), so
 more than one session can be carried at once. `GET /api/sessions` lists the carried
@@ -92,14 +95,43 @@ hashed + named + listable; the server-side token verification that computes
 contract — exactly as the QR-pair token application (#74) runs ahead of server-side
 enforcement.
 
+The UI is also a **PWA** with **Web-Push** (#51). A `manifest.webmanifest`, a
+`sw.js` service worker (registered from `app.js` on load) and a scalable
+`icon.svg` make it **installable**; an **"Enable notifications"** control then
+subscribes THIS device to Web-Push (VAPID) so the operator is **woken by a
+visible notification** when a session blocks on them while the app is
+backgrounded or closed. `src/push.js` owns the DOM-free decisions — the VAPID
+public key → `applicationServerKey` conversion, the browser `PushSubscription` →
+the server contract shaping, and the always-visible notification content — and
+`app.js` is the thin glue that requests permission, subscribes (**always**
+`userVisibleOnly`), and uploads the subscription. The uploaded shape is exactly
+the `WebPushSubscription` (`{ endpoint, keys: { p256dh, auth } }`) the server's
+**wake dispatch** consumes (#50), so a stored subscription is the one a wake is
+sent to. On **iOS** — where Web-Push is installed-PWA-only and a push that shows
+nothing gets the subscription revoked — the service worker's `push` handler
+**always** calls `showNotification`, for any payload, so there is **no silent
+push**; it reads only the pointer-only wake (#45), never session content. The
+VAPID-public-key and subscription-upload routes are served by a later server
+slice (#50 shipped the wake dispatch + VAPID handling but left "the PWA
+subscription is #51" as its wiring point), so — until then — the enable-push flow
+renders an honest "push isn't available yet" against the **mirrored** contract,
+exactly as the QR-pair token application (#74) and the device list (#85) run
+ahead of server-side enforcement. `sw.js` is a **classic** worker (the least
+uncertain ground for the iOS notification path), so it cannot `import` the ES
+module `src/push.js`; it MIRRORS `notificationContent`'s few-line decision inline,
+the same "mirrored, not imported" tradeoff below, with `push.test.js` the tested
+authority.
+
 The `@ccctl/core` frame shapes are **mirrored, not imported** — this UI is served
 to the browser as-is, so `src/*.js` stays dependency-free vanilla ESM. The
 downstream rendering logic in `src/transcript.js`, the upstream steer-building
 logic in `src/command.js`, the session-list diff / label / selection logic in
 `src/sessions.js`, the launch-body / typed-failure logic in `src/launch.js`, the
+emergency-stop request / typed-refusal logic in `src/stop.js`, the
 connection-health verdict in `src/connection.js`, the
-QR-pair token application in `src/pairing.js` and the device-list logic in
-`src/devices.js` are all
+QR-pair token application in `src/pairing.js`, the device-list logic in
+`src/devices.js` and the Web-Push subscription / notification logic in
+`src/push.js` are all
 unit-tested (`vitest`), and four of them are additionally driven against the **real
 server** — the yardstick a mirror needs, since a unit test can only check a module's
 copy of the contract against a fixture in the same package. `src/transcript.js` +
@@ -108,7 +140,9 @@ patched worker, so those specs run under `test:e2e`); `src/launch.js` +
 `src/sessions.js` drive the real launch path against the real `POST /api/sessions`
 ingress and its typed-failure branches (with a faked launcher, so that one needs no
 worker and runs on every `test`). The DOM
-shell in `src/app.js` is thin glue that is **not** directly exercised: it reads the
-DOM at module load and the repo ships no DOM driver, so it is verified by
-inspection. That is the split the modules exist to enable — every decision lives in
+shell in `src/app.js` — and the `sw.js` service worker — is thin glue that is
+**not** directly exercised: it reads the DOM / service-worker globals at load and
+the repo ships no driver for either, so it is verified by inspection (the
+substantive push decision lives in the unit-tested `src/push.js`, which `sw.js`
+mirrors). That is the split the modules exist to enable — every decision lives in
 a DOM-free module that a test can reach, leaving `app.js` with only the glue.

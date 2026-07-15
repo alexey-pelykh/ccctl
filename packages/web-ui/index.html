@@ -5,6 +5,17 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- PWA install (#51): the web app manifest makes the UI installable; theme-color tints the OS
+         chrome; the apple-* metas give iOS its standalone launch + home-screen title + icon (iOS
+         reads these rather than only the manifest). The service worker is registered from app.js.
+         Paths are relative so the app installs correctly however it is statically served. -->
+    <meta name="theme-color" content="#1d4ed8" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./icon.svg" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="ccctl" />
     <title>ccctl</title>
     <style>
       /* Minimal legibility only — zero-build, no framework and no bundler. */
@@ -212,6 +223,21 @@
       .steer-actions {
         margin-top: 1rem;
       }
+      /* The push-notification enablement outcome (#51), in the page's existing status hues: grey while
+         requesting/subscribing, running-green once this device is subscribed, amber when the browser /
+         OS blocks or has not granted permission, red on an outright failure. */
+      #push-status[data-push="working"] {
+        color: #666;
+      }
+      #push-status[data-push="enabled"] {
+        color: #047857;
+      }
+      #push-status[data-push="blocked"] {
+        color: #b45309;
+      }
+      #push-status[data-push="failed"] {
+        color: #b91c1c;
+      }
     </style>
   </head>
   <body>
@@ -304,6 +330,21 @@
         <h2>Stop session</h2>
         <button id="stop-button" type="button" disabled>Stop session</button>
         <p id="stop-status" aria-live="polite" hidden></p>
+      </section>
+      <!-- ENABLE NOTIFICATIONS (#51, UI-C-002): subscribe THIS device to Web-Push (VAPID) so the
+           operator is woken by a visible notification when a session blocks on them while the app is
+           backgrounded / closed. The button requests notification permission, fetches the server's
+           VAPID public key, subscribes via the PushManager, and uploads the subscription — the exact
+           shape the server's wake dispatch (#50) sends to. `userVisibleOnly` is always set and the
+           service worker always renders a notification, so there is NO silent push (which iOS would
+           punish by revoking the subscription). The outcome — subscribed, blocked by the browser / OS,
+           or unavailable until the server wires the push routes (this surface runs ahead of that, as
+           the QR-pair token #74 and device list #85 do) — lands in the `aria-live` status line.
+           `src/push.js` owns the pure decisions; this is the control they hang off. -->
+      <section id="notifications">
+        <h2>Notifications</h2>
+        <button id="enable-push" type="button">Enable notifications</button>
+        <p id="push-status" aria-live="polite" hidden></p>
       </section>
       <!-- The operator's PAIRED DEVICES (#85): a management surface listing each paired device
            (phone / tablet / laptop) by name + last-seen (AC1), with the current device clearly
