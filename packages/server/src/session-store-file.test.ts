@@ -44,10 +44,15 @@ const sessions: readonly Session[] = [
   createSession("sess-fresh", "default", T0 + 10),
 ];
 
-/** A representative unread queue, ordered by `at`. */
+/** A representative unread queue; each entry carries the SSE `eventId` it was broadcast under. */
 const unread: readonly UnreadEntry[] = [
-  { sessionId: "sess-blocked", at: T0 + 6, activity: { kind: "requires_action", detail: "Approve tool use?" } },
-  { sessionId: "sess-running", at: T0 + 7, activity: { kind: "idle" } },
+  {
+    sessionId: "sess-blocked",
+    eventId: 3,
+    at: T0 + 6,
+    activity: { kind: "requires_action", detail: "Approve tool use?" },
+  },
+  { sessionId: "sess-running", eventId: 4, at: T0 + 7, activity: { kind: "idle" } },
 ];
 
 /** A full, non-empty snapshot fixture. */
@@ -108,7 +113,10 @@ describe("createFileSessionStore", () => {
       // An `unread` entry keyed to the registering session. A build without this guard could persist
       // one; dropping the row but keeping this entry trades a ghost ROW for a ghost BADGE — an unread
       // count on a session the operator can never open, clear, or even see in the list.
-      const orphaning = [...unread, { sessionId: registering.id, at: T0 + 3, activity: { kind: "idle" as const } }];
+      const orphaning = [
+        ...unread,
+        { sessionId: registering.id, eventId: 5, at: T0 + 3, activity: { kind: "idle" as const } },
+      ];
       await writeFile(
         filePath,
         JSON.stringify({
@@ -278,7 +286,7 @@ describe("createFileSessionStore", () => {
       const snapshot: SessionStoreSnapshot = {
         version: SESSION_STORE_SNAPSHOT_VERSION,
         sessions: [served],
-        unread: [{ sessionId: served.id, at: T0 + 1, activity: { kind: "idle" } }],
+        unread: [{ sessionId: served.id, eventId: 1, at: T0 + 1, activity: { kind: "idle" } }],
       };
 
       const store = createFileSessionStore(filePath);
