@@ -494,7 +494,7 @@ describe("the maxSessions cap (#36)", () => {
 
     // Two UC1 ATTACH sessions: workers registering over §2 from a cwd NO launch is pending on, so each
     // mints its own id (`environments-bridge.ts`) — nothing here was launched by this server. This is
-    // the test that discriminates: a cap counting only `launchedSessions` or only `pendingLaunches`
+    // the test that discriminates: a cap counting only `launchedSurfaces` or only `pendingLaunches`
     // passes every other test in this file and fails this one.
     expect((await registerWorker(server, OTHER_CWD)).status).toBe(201);
     expect((await registerWorker(server, CWD)).status).toBe(201);

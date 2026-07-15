@@ -142,19 +142,56 @@ export interface PendingLaunch {
 }
 
 /**
+ * The slice of state a launch CONSUME touches ({@link consumePendingLaunch}) — the registry it drops
+ * from, and nothing else. Narrow deliberately: the emergency-stop (#76) is one of the three paths that
+ * consume a launch, and it holds none of this module's other state — it has no business knowing a
+ * registration timeout to disarm a timer. {@link PendingLaunchState} satisfies it structurally, so the
+ * two callers that DO hold the wide slice pass it unchanged.
+ */
+export interface PendingLaunchConsumeState {
+  /** Launches awaiting their worker's registration, keyed by the session id minted at launch. */
+  readonly pendingLaunches: Map<string, PendingLaunch>;
+}
+
+/**
  * The slice of server state the pending-launch registry operates on — held by the launch ingress
  * ({@link SessionLaunchState}) and, since the §2 registration is where a launch is CLAIMED, by the
  * bridge ({@link BridgeState}) too. A claim can retire a placeholder row outright (an ambiguous pair,
  * see {@link claimPendingLaunch}), so the claim leg genuinely needs the same reach eviction does —
  * a narrower "just the map" slice would be a lie about what registration can do.
  */
-export interface PendingLaunchState {
-  /** Launches awaiting their worker's registration, keyed by the session id minted at launch. */
-  readonly pendingLaunches: Map<string, PendingLaunch>;
+export interface PendingLaunchState extends PendingLaunchConsumeState {
   /** Sessions tracked by the server — a launch adds its `registering` session here; eviction removes it. */
   readonly sessions: Map<string, Session>;
-  /** Terminals this server owns — eviction closes the evicted launch's and drops it from the set. */
-  readonly launchedSessions: Set<LaunchedSession>;
+  /**
+   * Terminals this server owns, KEYED BY THE SESSION ID THEY WERE LAUNCHED FOR — eviction closes the
+   * evicted launch's and drops its entry.
+   *
+   * Keyed rather than a bare set of handles because a surface has two questions asked of it, and only
+   * one of them was ever answerable before #76:
+   *
+   *   - "what must shutdown release?" — the ORIGINAL job ({@link releaseLaunchedSessions}), which
+   *     iterates and needs no key at all;
+   *   - "what surface is session X running on?" — emergency-stop's job (#76), which is only answerable
+   *     by a key. It could not be answered at all before: the one keyed record that held a handle
+   *     ({@link PendingLaunch}) is CONSUMED the moment the worker registers, so from that instant a
+   *     LIVE session's surface existed only as an anonymous member of a set. A stop that cannot name a
+   *     specific session's terminal is not a stop.
+   *
+   * The key is the session id minted at launch — the same id the `registering` row carries and the
+   * same id it keeps for life once its registration claims it, so the mapping survives the claim
+   * without being re-established at it.
+   *
+   * **An entry may outlive its session's row, and that is correct rather than a leak.** An ambiguous
+   * (cwd, mode) claim drops its placeholder row ({@link claimPendingLaunch}) while deliberately KEEPING
+   * the handle for shutdown — so its entry stays here under an id `sessions` no longer knows. It is
+   * unreachable by a stop for free: a stop resolves the SESSION first and answers 404 when the row is
+   * gone, long before it would look here. The two collections answer different questions over
+   * different domains, and `sessions` is the one that says which ids are live — so this map is
+   * provenance ("the surface each launch brought up"), and `sessions` is addressing. Nothing here
+   * needs to know about ambiguity; the rule that already refused to lend the id did the work.
+   */
+  readonly launchedSurfaces: Map<string, LaunchedSession>;
   /** The per-session UI event relays — reaped on eviction so an evicted ghost leaves none behind. */
   readonly eventRelays: SessionEventRelays;
   /** How long a session may stay `registering` before it is evicted (ms). */
@@ -246,9 +283,11 @@ export function resolveLaunchCwd(cwd: string): string | undefined {
  * ever reap. Returns the minted session id (the caller answers it to the operator, who can then
  * address the row they just created).
  *
- * The terminal handle is recorded in BOTH `launchedSessions` (so shutdown tears it down even while
- * it is still registering) and the pending record (so eviction can close that one specific
- * terminal). The timer is `.unref()`ed: a pending eviction alone must never hold the process open.
+ * The terminal handle is recorded in BOTH `launchedSurfaces` — under the session id just minted, so
+ * shutdown tears it down even while it is still registering AND an emergency-stop can find this one
+ * session's terminal for the rest of its life (#76) — and the pending record (so eviction can close
+ * that one specific terminal). The timer is `.unref()`ed: a pending eviction alone must never hold the
+ * process open.
  */
 export function trackPendingLaunch(
   state: PendingLaunchState,
@@ -262,7 +301,7 @@ export function trackPendingLaunch(
   // session. Idempotent: the ingress already rooted the terminal at this same resolved path.
   const cwd = canonicalCwd(options.cwd);
   state.sessions.set(sessionId, createRegisteringSession(sessionId, options.permissionMode));
-  state.launchedSessions.add(launched);
+  state.launchedSurfaces.set(sessionId, launched);
   const timer = setTimeout(() => {
     // Fire-and-forget: the eviction's terminal half is asynchronous (it PROBES the surface before it
     // may close it, #35) and there is nobody here to await it. It never rejects, so nothing escapes.
@@ -279,6 +318,49 @@ export function trackPendingLaunch(
     mayHoldLiveWorker: false,
   });
   markAmbiguousGroup(state, cwd, options.permissionMode);
+}
+
+/**
+ * CONSUME a pending launch — disarm its eviction timer and drop its record — returning the record it
+ * consumed, or `undefined` when there was none. The ONE place a launch stops being pending.
+ *
+ * Three paths end a launch's pending state, and every one of them must do exactly this pair: the
+ * worker registered ({@link claimPendingLaunch}), the timer fired ({@link evictPendingLaunch}), or the
+ * operator stopped the session outright (#76, `ui-session-stop.ts`).
+ *
+ * **The DELETE is the correctness half, and it fails silently.** A record left behind keeps its
+ * `(cwd, mode)`, and that pair is the §2 correlation key — so the next launch in the same directory is
+ * grouped with a CORPSE by {@link markAmbiguousGroup}, both are marked {@link PendingLaunch.ambiguous}
+ * (a mark nothing ever lifts), and the relaunched session's own worker is then refused its id. The
+ * operator's row never advances past `registering` and the session is unstoppable for the rest of its
+ * life. That is not a hypothetical corner: stop-the-runaway-then-relaunch-it IS the emergency-stop
+ * workflow, and it is the first thing an operator does.
+ *
+ * **The `clearTimeout` is HYGIENE, and the distinction is worth keeping straight.** It is tempting to
+ * claim a stray timer would fire against a dead session and re-close its surface; it would not, and
+ * asserting so would be inventing a second hazard out of the first one's evidence. {@link
+ * evictPendingLaunch} looks its record up BEFORE it acts and finds nothing — the delete above already
+ * made the fire a no-op, which is the same race-safety that lets a claim outrun a timer. So this line
+ * buys the timer and its closure being released NOW rather than sitting out the rest of the window; it
+ * is worth doing, and it is not what makes this function correct.
+ *
+ * Hence a seam rather than the two lines at each of three call sites, for the reason this package
+ * keeps proving on itself: "a check per path is two copies of a rule, and the second copy is the one
+ * someone forgets" (`session-release.ts`). Two copies already existed here when the third path was
+ * added, and the third path forgot — exactly as predicted.
+ *
+ * A no-op on a session with no pending launch, which is the ordinary case for both of the callers
+ * that can be handed any session at all: a live UC1 attach was never pending, and a launch that
+ * registered long ago was consumed by its own claim.
+ */
+export function consumePendingLaunch(state: PendingLaunchConsumeState, sessionId: string): PendingLaunch | undefined {
+  const pending = state.pendingLaunches.get(sessionId);
+  if (pending === undefined) {
+    return undefined;
+  }
+  clearTimeout(pending.timer);
+  state.pendingLaunches.delete(sessionId);
+  return pending;
 }
 
 /**
@@ -339,8 +421,12 @@ function markAmbiguousGroup(state: PendingLaunchState, cwd: string, permissionMo
  * is a stray terminal window; the alternative is killing a live session, and those are not comparable.
  * (A launch token echoed back by the worker would remove the ambiguity entirely — see § Correlation.)
  *
- * A claimed terminal handle is deliberately NOT closed and NOT dropped from `launchedSessions` — the
- * session is alive now, and the server still owns its terminal until shutdown.
+ * A claimed terminal handle is deliberately NOT closed and NOT dropped from `launchedSurfaces` — the
+ * session is alive now, and the server still owns its terminal until shutdown. Since #76 that
+ * retention does a second job: the entry is keyed by the id the claim just handed back, so the live
+ * session it became is the one an emergency-stop can address. An ambiguous claim's entry stays too,
+ * under an id whose row this function just dropped — unreachable by a stop, which resolves the session
+ * before the surface (see {@link PendingLaunchState.launchedSurfaces}).
  */
 export function claimPendingLaunch(
   state: PendingLaunchState,
@@ -360,8 +446,7 @@ export function claimPendingLaunch(
   if (claimed === undefined) {
     return undefined;
   }
-  clearTimeout(claimed.timer);
-  state.pendingLaunches.delete(claimed.sessionId);
+  consumePendingLaunch(state, claimed.sessionId);
   if (!claimed.ambiguous) {
     return claimed.sessionId;
   }
@@ -452,7 +537,7 @@ function dropPlaceholder(state: PendingLaunchState, sessionId: string): void {
  * Reaping a stray window is a cost; killing a live session is a catastrophe, and between the two this
  * function does not gamble — at either guard.
  *
- * The handle is dropped from `launchedSessions` only when the surface is actually GONE (the release
+ * The handle is dropped from `launchedSurfaces` only when the surface is actually GONE (the release
  * tore it down, or found it already exited). A surface left running because the operator has it stays
  * owned by the server and is re-probed at shutdown — by then they may have detached and handed it
  * back. Forgetting it here would strand a live surface nothing will ever reap.
@@ -469,13 +554,11 @@ function dropPlaceholder(state: PendingLaunchState, sessionId: string): void {
  * eviction is fire-and-forget from the timer's side.
  */
 export async function evictPendingLaunch(state: PendingLaunchState, sessionId: string): Promise<void> {
-  const pending = state.pendingLaunches.get(sessionId);
+  const pending = consumePendingLaunch(state, sessionId);
   if (pending === undefined) {
-    // Already claimed (the worker registered) or already evicted — nothing to reap.
+    // Already claimed (the worker registered), already evicted, or stopped outright (#76) — nothing to reap.
     return;
   }
-  clearTimeout(pending.timer);
-  state.pendingLaunches.delete(sessionId);
   dropPlaceholder(state, sessionId);
   if (pending.mayHoldLiveWorker) {
     // A worker registered somewhere in this launch's (cwd, mode) group and could be sitting in THIS
@@ -489,7 +572,7 @@ export async function evictPendingLaunch(state: PendingLaunchState, sessionId: s
     return;
   }
   // The surface is gone — we closed it, or it had already exited. Nothing left for shutdown to do.
-  state.launchedSessions.delete(pending.launched);
+  state.launchedSurfaces.delete(sessionId);
 }
 
 /**

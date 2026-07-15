@@ -54,15 +54,15 @@ import {
   BRIDGE_PROTOCOL_API_VERSION,
   isSessionStale,
   isWorkerStatus,
-  markSessionClosed,
   markSessionReady,
   recordHeartbeat,
   type ControlRequest,
   type JsonValue,
   type Session,
 } from "@ccctl/core";
-import { broadcastEvent, closeSessionRelay, type SessionEventRelays } from "./event-stream.js";
+import { broadcastEvent, type SessionEventRelays } from "./event-stream.js";
 import { readJsonBody, writeError, writeJson } from "./http-response.js";
+import { closeSession } from "./session-close.js";
 
 /** Hard ceiling on a worker-channel request body (1 MiB) — a control-plane batch fits within it. */
 const MAX_WORKER_BODY_BYTES = 1024 * 1024;
@@ -132,12 +132,21 @@ export interface WorkerChannelRecord {
   evictionTimer: ReturnType<typeof setTimeout> | null;
 }
 
-/** The per-server state the worker channel reads and updates. */
-export interface WorkerChannelState {
-  /** Sessions tracked by the server, keyed by ccctl session id. */
-  readonly sessions: Map<string, Session>;
+/**
+ * The slice of state a channel REAP touches ({@link reapWorkerChannel}) — the registry it empties, and
+ * nothing else. Narrow on purpose: the emergency-stop (#76) holds no worker-channel state of its own
+ * and has no business knowing this module's timers or grace windows, so it depends on the one field
+ * the reap actually needs. {@link WorkerChannelState} satisfies it structurally.
+ */
+export interface WorkerChannelReapState {
   /** The live per-session worker channel, keyed by session id (epoch + downstream + seq). */
   readonly workerChannels: Map<string, WorkerChannelRecord>;
+}
+
+/** The per-server state the worker channel reads and updates. */
+export interface WorkerChannelState extends WorkerChannelReapState {
+  /** Sessions tracked by the server, keyed by ccctl session id. */
+  readonly sessions: Map<string, Session>;
   /**
    * Interval (ms) between per-session downstream liveness frames (#166). Resolved once at
    * server start ({@link ServerConfig.workerLivenessIntervalMs} ??
@@ -693,6 +702,41 @@ function scheduleEviction(state: WorkerChannelState, sessionId: string, record: 
 }
 
 /**
+ * REAP a session's worker channel — end its held-open downstream, clear its armed timers, drop the
+ * record. The ONE place a channel leaves {@link WorkerChannelReapState.workerChannels} while the
+ * server is still running.
+ *
+ * Two paths retire a channel, and until #76 there was one: the grace-delayed eviction
+ * ({@link considerEviction}) that fires when a worker is terminally gone. The operator's
+ * emergency-stop (`ui-session-stop.ts`) is the second, and it does not arrive through that timer at
+ * all — it arrives having ALREADY dropped the session's row through `session-close.ts`. That ordering
+ * is precisely what makes a second copy of these two lines a trap rather than a duplication: the
+ * eviction check bails the moment the row is gone (`state.sessions.get(sessionId) === undefined` — "a
+ * prior pass already evicted it"), so a stopped session's channel is the one channel that timer can
+ * NEVER come back and finish. Whatever a stop does not reap here is never reaped at all, and this
+ * module's "the registry does not grow unbounded across worker exits" promise quietly stops holding —
+ * one inert record per stopped session, each still holding whatever downstream and timers it had.
+ *
+ * Idempotent, and a no-op for a session that never registered a worker — the ordinary case for a stop,
+ * which can be handed a session still `registering`.
+ *
+ * Lives HERE rather than in `session-close.ts` beside the row-and-relay teardown, where it would read
+ * more naturally as one terminal seam: that module would have to import {@link endDownstream}, and this
+ * one already imports {@link closeSession} from it — a cycle. The channel registry is this module's
+ * state, so the seam that empties it stays with it and the terminal seam calls out to it.
+ */
+export function reapWorkerChannel(state: WorkerChannelReapState, sessionId: string): void {
+  const record = state.workerChannels.get(sessionId);
+  if (record === undefined) {
+    return;
+  }
+  // Canonical record teardown — ends the downstream and clears any residual timers before dropping it,
+  // so nothing is left armed against a record nobody holds.
+  endDownstream(record);
+  state.workerChannels.delete(sessionId);
+}
+
+/**
  * The grace-delayed eviction DECISION (#173): CLOSE + evict a terminally-gone session, RETAIN a
  * transiently-reconnecting or still-beating one. Fires one grace window after the downstream went
  * null ({@link scheduleEviction}). Evicts ONLY when ALL of the following hold — otherwise it
@@ -705,10 +749,21 @@ function scheduleEviction(state: WorkerChannelState, sessionId: string, record: 
  *   - the session is STALE — no heartbeat within the grace window ({@link isSessionStale}). A fresh
  *     heartbeat means the worker is alive though its downstream dropped, so a null downstream ALONE
  *     never evicts (the reconnect-safety AC).
- * On eviction it drives the session to its terminal `closed` state ({@link markSessionClosed}, the
- * reverse leg of #172's `connecting`→`ready`) and deletes BOTH the session and its worker channel,
- * so `GET /api/sessions` ("`ccctl attach`") stops listing it and the registry does not grow
- * unbounded across worker exits.
+ * On eviction it ENDS the session through the one terminal seam ({@link closeSession},
+ * `session-close.ts` — the reverse leg of #172's `connecting`→`ready`: terminal status, row dropped,
+ * relay reaped) and reaps its worker channel through the one reap seam ({@link reapWorkerChannel}), so
+ * `GET /api/sessions` ("`ccctl attach`") stops listing it and the registry does not grow unbounded
+ * across worker exits.
+ *
+ * Both seams were extracted in #76, when the operator's emergency-stop became the SECOND path that
+ * ends a session — and each extraction surfaced a bug the duplication had been hiding. The terminal
+ * transition here used to `set` the closed session and `delete` it on the very next line, so the
+ * status was computed and thrown away against a `Map` nothing observes: it READ as a transition and
+ * was not one. The channel teardown was the mirror image — correct here, and unreachable from the stop
+ * path, because this check bails on a row the stop has already dropped (see {@link reapWorkerChannel}).
+ * Both seams return the caller to one copy of the sequence; `closeSession`'s return value is ignored
+ * here, correctly, since an eviction timer has nobody to answer and the reflection a client gets is the
+ * one it always was (the row leaves the list, the stream ends).
  */
 function considerEviction(state: WorkerChannelState, sessionId: string, record: WorkerChannelRecord): void {
   record.evictionTimer = null; // this one-shot has fired.
@@ -732,15 +787,13 @@ function considerEviction(state: WorkerChannelState, sessionId: string, record: 
     scheduleEviction(state, sessionId, record);
     return;
   }
-  // Terminally gone: no downstream and no heartbeat for a full grace window. Drive to the terminal
-  // `closed` lifecycle (the reverse leg of #172's `connecting`→`ready`), retire the record's timers,
-  // then evict from the session + worker-channel maps so `GET /api/sessions` ("ccctl attach") stops
-  // listing it, and reap the session's UI event relay (#176) so it does not accumulate across evictions.
-  endDownstream(record); // canonical record teardown — clears any residual timers before dropping it.
-  state.sessions.set(sessionId, markSessionClosed(session));
-  state.sessions.delete(sessionId);
-  state.workerChannels.delete(sessionId);
-  closeSessionRelay(state.eventRelays, sessionId); // #176: end subscribers + drop the relay entry.
+  // Terminally gone: no downstream and no heartbeat for a full grace window. END the session through
+  // the one terminal seam — terminal status, row dropped so `GET /api/sessions` ("ccctl attach") stops
+  // listing it, relay reaped (#176) so it does not accumulate across evictions — then reap its channel
+  // through the one reap seam. The returned closed session is ignored: nobody is waiting on this timer
+  // to be told what it became (`session-close.ts`).
+  closeSession(state, sessionId);
+  reapWorkerChannel(state, sessionId);
 }
 
 /**

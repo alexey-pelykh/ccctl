@@ -49,7 +49,7 @@ function fakeLaunched(liveness: SurfaceLiveness = "alive-server-owned") {
 function makeState(registrationTimeoutMs = 60_000): PendingLaunchState {
   return {
     sessions: new Map<string, Session>(),
-    launchedSessions: new Set<LaunchedSession>(),
+    launchedSurfaces: new Map<string, LaunchedSession>(),
     pendingLaunches: new Map<string, PendingLaunch>(),
     eventRelays: createSessionEventRelays(),
     registrationTimeoutMs,
@@ -180,8 +180,10 @@ describe("trackPendingLaunch", () => {
 
     // Visible in the registry from LAUNCH — honestly marked as not-yet-live.
     expect(state.sessions.get("sess-1")?.status).toBe("registering");
-    // Owned for shutdown teardown from the moment it exists (a registering terminal is a real one).
-    expect(state.launchedSessions.has(launched)).toBe(true);
+    // Owned for shutdown teardown from the moment it exists (a registering terminal is a real one),
+    // and owned UNDER THIS SESSION'S ID — which is what makes it addressable by an emergency-stop
+    // (#76). A handle tracked but not keyed to its session is one shutdown can reap and nothing else.
+    expect(state.launchedSurfaces.get("sess-1")).toBe(launched);
     // Pending, with the launch identity the §2 registration will be matched against.
     expect(state.pendingLaunches.get("sess-1")).toMatchObject({
       sessionId: "sess-1",
@@ -235,8 +237,10 @@ describe("claimPendingLaunch", () => {
     expect(claimed).toBe("sess-1");
     expect(state.pendingLaunches.size).toBe(0);
     // The claimed terminal is NOT closed and NOT un-tracked: the session is alive now, and the server
-    // still owns its terminal until shutdown.
-    expect(state.launchedSessions.has(launched)).toBe(true);
+    // still owns its terminal until shutdown. It stays keyed by the id the claim just handed back —
+    // the pending record is consumed here, so this map is the ONLY thing that still knows which
+    // terminal the now-live session is running on, and #76's stop is addressed by exactly that.
+    expect(state.launchedSurfaces.get("sess-1")).toBe(launched);
 
     // The eviction timer was disarmed — a claimed session is never reaped as a ghost. (Without this,
     // the timer would fire and close a LIVE session's terminal out from under it.)
@@ -357,10 +361,15 @@ describe("claimPendingLaunch", () => {
     expect(state.sessions.has("sess-second")).toBe(false);
     expect(state.pendingLaunches.size).toBe(0);
     // But NO terminal was closed — closing either would be a coin flip against the live session.
-    // The surfaces stay owned by the server (`launchedSessions`) and are torn down at shutdown.
+    // The surfaces stay owned by the server (`launchedSurfaces`) and are torn down at shutdown.
     expect(first.closeCount()).toBe(0);
     expect(second.closeCount()).toBe(0);
-    expect(state.launchedSessions.has(second.launched)).toBe(true);
+    expect(state.launchedSurfaces.get("sess-second")).toBe(second.launched);
+    // Their entries OUTLIVE their rows — both rows are gone (asserted above) while both handles stay
+    // owned for shutdown. That is what keeps the surface map safe to consult by key without knowing
+    // anything about ambiguity: an emergency-stop resolves the SESSION first, so an entry whose row
+    // was dropped is unreachable by construction rather than by a rule someone has to remember (#76).
+    expect(state.launchedSurfaces.get("sess-first")).toBe(first.launched);
   });
 });
 
@@ -377,7 +386,7 @@ describe("evictPendingLaunch", () => {
 
     expect(state.sessions.has("sess-1")).toBe(false); // "the session list no longer shows it"
     expect(closeCount()).toBe(1); // the spawned child is reaped, not orphaned
-    expect(state.launchedSessions.has(launched)).toBe(false); // shutdown will not re-close it
+    expect(state.launchedSurfaces.has("sess-1")).toBe(false); // shutdown will not re-close it
     expect(state.pendingLaunches.has("sess-1")).toBe(false);
     expect(state.eventRelays.has("sess-1")).toBe(false);
   });
@@ -459,7 +468,7 @@ describe("evictPendingLaunch", () => {
     expect(closeCount()).toBe(0);
     // And the server KEEPS the handle: if they detach before shutdown, shutdown's own release finds it
     // server-owned again and tears it down properly. Forgetting it here would strand a live surface.
-    expect(state.launchedSessions.has(launched)).toBe(true);
+    expect(state.launchedSurfaces.get("sess-1")).toBe(launched);
   });
 
   it("evicts the ROW but does NOT kill a surface whose liveness could not be read (#35 AC5)", async () => {
@@ -471,7 +480,7 @@ describe("evictPendingLaunch", () => {
 
     expect(state.sessions.has("sess-1")).toBe(false);
     expect(closeCount()).toBe(0);
-    expect(state.launchedSessions.has(launched)).toBe(true);
+    expect(state.launchedSurfaces.get("sess-1")).toBe(launched);
   });
 
   it("un-tracks an already-exited surface without closing it — teardown is a no-op (#35 AC4)", async () => {
@@ -486,7 +495,7 @@ describe("evictPendingLaunch", () => {
     expect(closeCount()).toBe(0);
     // The surface IS gone, so — unlike the taken-over case above — the handle is dropped: there is
     // nothing left for shutdown to re-probe.
-    expect(state.launchedSessions.has(launched)).toBe(false);
+    expect(state.launchedSurfaces.has("sess-1")).toBe(false);
   });
 
   // The converse of the "never closes a terminal in a claimed group" rule — it must not over-apply.
@@ -505,7 +514,7 @@ describe("evictPendingLaunch", () => {
     expect(state.sessions.size).toBe(0);
     expect(first.closeCount()).toBe(1);
     expect(second.closeCount()).toBe(1);
-    expect(state.launchedSessions.size).toBe(0);
+    expect(state.launchedSurfaces.size).toBe(0);
   });
 });
 
@@ -520,7 +529,7 @@ describe("clearPendingLaunches", () => {
     expect(state.pendingLaunches.size).toBe(0);
     // The handle stays tracked — shutdown's own teardown closes it, so evicting here would only
     // double-close it.
-    expect(state.launchedSessions.has(launched)).toBe(true);
+    expect(state.launchedSurfaces.get("sess-1")).toBe(launched);
 
     // And the disarmed timer never fires against a dead server's state.
     await sleep(120);

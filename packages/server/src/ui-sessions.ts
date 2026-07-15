@@ -13,9 +13,11 @@
  *   - `GET  /api/sessions/{id}/events`   → subscribe to that session's SSE stream (VIEW).
  *                                          Served by `event-stream.ts`.
  *   - `POST /api/sessions/{id}/command`  → steer that session (STEER). Served by `ui-command.ts`.
+ *   - `POST /api/sessions/{id}/stop`     → emergency-stop that session (#76). Served by
+ *                                          `ui-session-stop.ts`.
  *
  * {@link matchUiSessionRoute} is the single seam that classifies a `/api/sessions…`
- * path into `list` / `events` / `command` (+ the addressed session id), mirroring the
+ * path into `list` / `events` / `command` / `stop` (+ the addressed session id), mirroring the
  * worker channel's {@link matchWorkerRoute} (`/v1/code/sessions/{id}/worker/…`). The
  * session id is a server-minted UUID (no embedded `/`), so segment splitting is exact.
  *
@@ -42,15 +44,17 @@ export const UI_SESSIONS_PATH = "/api/sessions";
 export type UiSessionRoute =
   | { readonly kind: "list" }
   | { readonly kind: "events"; readonly sessionId: string }
-  | { readonly kind: "command"; readonly sessionId: string };
+  | { readonly kind: "command"; readonly sessionId: string }
+  | { readonly kind: "stop"; readonly sessionId: string };
 
 /**
  * Match a path against the browser-facing session namespace — `/api/sessions` (list),
- * `/api/sessions/{id}/events` (view), `/api/sessions/{id}/command` (steer) — returning
- * the matched leg (+ the addressed session id), or `null` when it is not one of them.
- * Mirrors {@link matchWorkerRoute}: the session id is a server-minted UUID (no embedded
- * `/`), so segment splitting is exact, and an unknown sub-leg fails to match (→ a
- * fail-closed 404 at the caller) rather than being served.
+ * `/api/sessions/{id}/events` (view), `/api/sessions/{id}/command` (steer),
+ * `/api/sessions/{id}/stop` (emergency-stop, #76) — returning the matched leg (+ the
+ * addressed session id), or `null` when it is not one of them. Mirrors
+ * {@link matchWorkerRoute}: the session id is a server-minted UUID (no embedded `/`), so
+ * segment splitting is exact, and an unknown sub-leg fails to match (→ a fail-closed 404
+ * at the caller) rather than being served.
  */
 export function matchUiSessionRoute(pathname: string): UiSessionRoute | null {
   const segments = pathname.split("/");
@@ -72,6 +76,9 @@ export function matchUiSessionRoute(pathname: string): UiSessionRoute | null {
   }
   if (tail.length === 2 && tail[1] === "command") {
     return { kind: "command", sessionId };
+  }
+  if (tail.length === 2 && tail[1] === "stop") {
+    return { kind: "stop", sessionId };
   }
   return null;
 }
