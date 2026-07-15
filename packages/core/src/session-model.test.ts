@@ -9,6 +9,7 @@ import {
   createSession,
   DEFAULT_HEARTBEAT_STALE_AFTER_MS,
   DEFAULT_REQUIRES_ACTION_DETAIL,
+  isInputAwaited,
   isNonPromptingPermissionMode,
   isSessionStale,
   markSessionClosed,
@@ -71,6 +72,69 @@ describe("sessionActivityFromFrame (AC: tri-state derivation)", () => {
     const noPayload: ControlFrame = { type: "control_event", subtype: "worker_status" };
     expect(sessionActivityFromFrame(unknown)).toBeNull();
     expect(sessionActivityFromFrame(noPayload)).toBeNull();
+  });
+});
+
+describe("isInputAwaited (AC: needs-you derives from requires_action worker-status only, #40)", () => {
+  // Rule: requires-action worker status is the only source of needs-you.
+  it("fires when the worker-status feed reports requires_action for a session", () => {
+    const session = applyWorkerStatusFrame(
+      createSession("sess-1", "default", T0),
+      statusFrame({ status: "requires_action", detail: "Approve the edit?" }),
+      T0 + 10,
+    );
+    expect(isInputAwaited(session.activity)).toBe(true);
+  });
+
+  it("is detail-agnostic — any requires_action fires it, including the default detail", () => {
+    expect(isInputAwaited({ kind: "requires_action", detail: "Approve the edit?" })).toBe(true);
+    expect(isInputAwaited({ kind: "requires_action", detail: DEFAULT_REQUIRES_ACTION_DETAIL })).toBe(true);
+  });
+
+  // Rule: output absence does not fire needs-you.
+  it("does not fire for running or idle — the non-requires_action feed states", () => {
+    expect(isInputAwaited({ kind: "running" })).toBe(false);
+    expect(isInputAwaited({ kind: "idle" })).toBe(false);
+  });
+
+  it("does not fire for a freshly created session (born idle, no frame applied yet)", () => {
+    expect(isInputAwaited(createSession("sess-1", "default", T0).activity)).toBe(false);
+  });
+
+  it("stream silence does not fire it — a stale session (heartbeat lapsed) is not input-awaited", () => {
+    // Liveness is an ORTHOGONAL dimension: silence marks the session stale, never requires_action.
+    const running = applyWorkerStatusFrame(
+      createSession("sess-1", "default", T0),
+      statusFrame({ status: "running" }),
+      T0,
+    );
+    const later = T0 + DEFAULT_HEARTBEAT_STALE_AFTER_MS + 1;
+    expect(isSessionStale(running, later)).toBe(true); // it IS silent/stale …
+    expect(isInputAwaited(running.activity)).toBe(false); // … yet needs-you does not fire.
+  });
+
+  // Rule: a hook alone does not fire needs-you.
+  it("a hook / progress frame alone does not fire it — a non-worker_status event never transitions activity", () => {
+    const idle = createSession("sess-1", "default", T0);
+    const hook: ControlFrame = { type: "control_event", subtype: "message", payload: { text: "progress" } };
+    const afterHook = applyWorkerStatusFrame(idle, hook, T0 + 10);
+    expect(afterHook).toBe(idle); // no-op: the hook cannot move the session.
+    expect(isInputAwaited(afterHook.activity)).toBe(false);
+  });
+
+  it("a hook cannot resurrect the signal after requires_action was cleared by idle", () => {
+    // requires_action → idle → hook: the hook must not re-raise the blocking signal.
+    let session = applyWorkerStatusFrame(
+      createSession("sess-1", "default", T0),
+      statusFrame({ status: "requires_action", detail: "Approve?" }),
+      T0 + 10,
+    );
+    expect(isInputAwaited(session.activity)).toBe(true);
+    session = applyWorkerStatusFrame(session, statusFrame({ status: "idle" }), T0 + 20);
+    expect(isInputAwaited(session.activity)).toBe(false);
+    const hook: ControlFrame = { type: "control_event", subtype: "message", payload: {} };
+    session = applyWorkerStatusFrame(session, hook, T0 + 30);
+    expect(isInputAwaited(session.activity)).toBe(false);
   });
 });
 
