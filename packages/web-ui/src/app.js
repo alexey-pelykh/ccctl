@@ -55,6 +55,7 @@ import { connectionHealth } from "./connection.js";
 import { applyPairingToken, authHeader } from "./pairing.js";
 import { DEVICES_PATH, deviceLabel, isCurrentDevice, isRenderableDevice } from "./devices.js";
 import { launchRequest, launchFailure, describeLaunchAccepted } from "./launch.js";
+import { sessionStopPath, stopRequest, stopFailure, describeStopAccepted, keepStopControlDisabled } from "./stop.js";
 
 const connectionEl = document.getElementById("connection");
 const statusEl = document.getElementById("status");
@@ -73,6 +74,8 @@ const promptInputEl = document.getElementById("prompt-input");
 const redirectFormEl = document.getElementById("redirect-form");
 const redirectInputEl = document.getElementById("redirect-input");
 const approveButtonEl = document.getElementById("approve-button");
+const stopButtonEl = document.getElementById("stop-button");
+const stopStatusEl = document.getElementById("stop-status");
 const deviceListEl = document.getElementById("device-list");
 const refreshDevicesEl = document.getElementById("refresh-devices");
 
@@ -107,6 +110,23 @@ let renderedConnection = null;
  * see); this simply stops the UI from being the thing that asks.
  */
 let launching = false;
+/**
+ * Whether a stop POST is already in flight, so the control cannot stack a second one.
+ *
+ * The mirror of `launching` above, and it guards the same shape of mistake from the opposite end of
+ * a session's life: a double-tap on a phone is the cheapest way to send two of anything. A second
+ * stop is not destructive twice over — the server's guards are the authority, and a refused stop
+ * touches no state — but the answers race, so the operator could be shown `unknown-session` (the
+ * first stop's own success, seen by the second) as if their stop had failed. That is exactly the
+ * wrong thing to tell someone who just killed a runaway.
+ *
+ * This flag alone does NOT close that window: it only covers the CONCURRENT one (a second tap while
+ * the first POST is in flight). The window that outlives it is the one AFTER a successful stop —
+ * the picker's refresh is still in flight, so the session is still selected and still looks
+ * stoppable. {@link stop} closes that half by not re-enabling the control on a confirmed stop; the
+ * two together are what make the sentence above true.
+ */
+let stopping = false;
 
 /** Build one transcript `<li>`: a bold subtype label plus an optional human summary. */
 function transcriptItem(subtype, summary) {
@@ -330,6 +350,28 @@ async function loadSessions() {
     disconnect();
     currentSessionId = null;
     statusEl.textContent = "no session selected";
+    // The current-turn indicator is a LIVE claim about a session that no longer exists, so it goes.
+    // Leaving it is how an operator who just emergency-stopped a runaway ends up reading "working…"
+    // over the session they killed. (#173's eviction timer reached this branch before #77; the stop
+    // control makes it this feature's HAPPY path, which is what promotes it from an edge case.)
+    //
+    // The TRANSCRIPT deliberately stays, and the asymmetry with `selectSession` — which drops both —
+    // is the point: `activityEl` asserts what a session is doing NOW and is simply false once it is
+    // gone, while `eventsEl` is a historical record that is still true, and is the last evidence of
+    // what the runaway actually did. `selectSession` clears it because a DIFFERENT session's stream
+    // is about to write there; here nothing is, so there is nothing to confuse it with.
+    activityEl.hidden = true;
+    // Nothing selected: there is nothing to stop.
+    renderStopControl();
+    // Drop a REFUSAL — its subject is gone, so it is stale news, and (for `taken-over`) it carries a
+    // live "Stop anyway" button that would otherwise outlive the session it points at. A SUCCESS
+    // line stays: this is the branch a successful stop itself arrives on, so clearing it would wipe
+    // the "stopped … — closed" answer the operator is reading.
+    if (stopStatusEl.dataset.stop === "failed") {
+      stopStatusEl.hidden = true;
+      stopStatusEl.replaceChildren();
+      delete stopStatusEl.dataset.stop;
+    }
     markSelected();
   }
 }
@@ -409,6 +451,130 @@ async function submitLaunch(request) {
   refreshSessionsNow();
 }
 
+/**
+ * Paint the stop outcome (#77). `data-stop` carries the state for colour; a TYPED refusal also
+ * renders its `code` as a bold chip ahead of the sentence — the same treatment the launch status
+ * gives its own code, so the operator SEES which refusal it is rather than pattern-matching prose.
+ * The region is `aria-live`, so each outcome is announced once.
+ *
+ * `onForce`, when given, appends the escalation button. It is passed ONLY for a refusal `stop.js`
+ * marked forceable (`taken-over`), so force is never a standing control — it exists for one refusal,
+ * for as long as that refusal is on screen, and the next outcome replaces it. That makes the
+ * two-step (stop → refused → stop anyway) a confirm by construction rather than a dialog bolted on.
+ */
+function renderStopStatus(state, text, code, onForce) {
+  stopStatusEl.hidden = false;
+  stopStatusEl.dataset.stop = state;
+  const nodes = [];
+  if (code !== undefined) {
+    const chip = document.createElement("strong");
+    chip.dataset.stopCode = code;
+    chip.textContent = code;
+    nodes.push(chip, document.createTextNode(` ${text}`));
+  } else {
+    nodes.push(document.createTextNode(text));
+  }
+  if (onForce !== undefined) {
+    const force = document.createElement("button");
+    force.id = "stop-force-button";
+    force.type = "button";
+    force.textContent = "Stop anyway";
+    force.addEventListener("click", onForce);
+    nodes.push(force);
+  }
+  stopStatusEl.replaceChildren(...nodes);
+}
+
+/**
+ * POST one stop upstream for the SELECTED session: the server kills its terminal (honouring its own
+ * safety envelope) and drives the session to its terminal state.
+ *
+ * On success the picker is refreshed at once, so the stopped session leaves the list rather than
+ * lingering up to a poll interval — the mirror of what an accepted launch does, and the list's own
+ * reflection of the terminal state: `session-close.ts` DROPS the row rather than retaining a
+ * readable `closed` one (a retained row would hold its `maxSessions` slot forever, so stopping
+ * sessions would walk the server into a permanent `at-capacity` — the emergency-stop's own promise,
+ * end one and free a slot, would be the first thing it broke). The terminal STATUS is reflected in
+ * the status line here, from the server's own answer.
+ *
+ * The refresh also clears the selection: `nextSelection` reads the vanished session as `clear`, so
+ * `loadSessions` disconnects its stream and drops the current-turn indicator, which is a live claim
+ * about a session that no longer exists. The TRANSCRIPT deliberately stays (see the `clear` branch).
+ *
+ * A refusal surfaces the server's TYPED code plus its actionable sentence — and, for the ONE refusal
+ * force overrides (`taken-over`: someone is driving it at a terminal), an escalation that re-sends
+ * the same stop with the operator's explicit consent. That consent is the whole of what force means:
+ * the server refuses because it cannot know whether a human is at that terminal, and the operator
+ * pressing this IS that human, saying they want it stopped.
+ *
+ * Resolves TRUE when the server confirmed the session is over, and FALSE when it refused — which is
+ * what {@link stop} re-enables the control from. The distinction is exactly the one that makes a
+ * refusal safe to retry: a refused stop touches no state, so the session is still there to stop.
+ */
+async function submitStop(sessionId, options) {
+  const response = await fetch(sessionStopPath(sessionId), {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeader(localStorage) },
+    body: JSON.stringify(stopRequest(options)),
+  });
+  const payload = await readJson(response);
+  if (!response.ok) {
+    const failure = stopFailure(response.status, payload);
+    // The escalation re-sends THIS session's stop — never the currently-selected one, which may have
+    // moved on by the time the operator reads the refusal. A stop addresses the session it named.
+    renderStopStatus(
+      "failed",
+      failure.message,
+      failure.code,
+      failure.forceable ? () => stop(sessionId, { force: true }) : undefined,
+    );
+    return false;
+  }
+  renderStopStatus("stopped", describeStopAccepted(payload));
+  refreshSessionsNow();
+  return true;
+}
+
+/**
+ * Stop one session from a DOM control: guard the double-tap, disable for the in-flight window, and
+ * surface a network throw (no answer at all, distinct from a typed refusal) in the same line rather
+ * than as an unhandled rejection. The shell half of {@link submitStop}, shared by the button and the
+ * force escalation.
+ */
+async function stop(sessionId, options) {
+  if (stopping) {
+    return;
+  }
+  stopping = true;
+  stopButtonEl.disabled = true;
+  renderStopStatus("stopping", options?.force === true ? "stopping (forced)…" : "stopping…");
+  let stopped = false;
+  try {
+    stopped = await submitStop(sessionId, options);
+  } catch (error) {
+    renderStopStatus("failed", `ccctl: could not reach the server — ${error.message}`);
+  } finally {
+    stopping = false;
+    // The rule — and the race that makes it necessary — lives with the predicate in `stop.js`, where
+    // it is pinned by tests; this is the wiring onto it.
+    if (keepStopControlDisabled({ stopped, currentSessionId, sessionId })) {
+      stopButtonEl.disabled = true;
+    } else {
+      renderStopControl();
+    }
+  }
+}
+
+/**
+ * Reflect the current selection onto the stop control: it names the session it will kill, and is
+ * disabled when there is nothing selected to kill (#20 — never inferred). A selection CHANGE also
+ * drops the prior session's stop outcome, which is not news about the newly-viewed one.
+ */
+function renderStopControl() {
+  stopButtonEl.disabled = currentSessionId === null || stopping;
+  stopButtonEl.textContent = currentSessionId === null ? "Stop session" : `Stop ${currentSessionId}`;
+}
+
 /** Close the active EventSource, if any, and drop the stream leg to idle. */
 function disconnect() {
   if (source !== null) {
@@ -458,9 +624,14 @@ function selectSession(sessionId) {
   }
   disconnect();
   currentSessionId = sessionId;
-  // A fresh session view starts clean — the prior session's transcript / activity is not ours.
+  // A fresh session view starts clean — the prior session's transcript / activity is not ours, and
+  // neither is its stop outcome (a refusal about a session we are no longer looking at, still
+  // offering to force-kill it, is the worst thing this control could leave on screen).
   eventsEl.replaceChildren();
   activityEl.hidden = true;
+  stopStatusEl.hidden = true;
+  stopStatusEl.replaceChildren();
+  renderStopControl();
   markSelected();
   connect(sessionId);
 }
@@ -658,6 +829,17 @@ redirectFormEl.addEventListener("submit", (event) => {
 // approve: let the pending action proceed.
 approveButtonEl.addEventListener("click", () => {
   steer(approveCommand());
+});
+
+// stop: kill the SELECTED session's terminal outright (#77). Never forced from here — the plain stop
+// is the non-destructive-by-default one, and the server's `taken-over` refusal is what offers the
+// escalation. The button is disabled with no selection, so the guard below is the defensive second
+// half of that pair (for a click that raced a selection being cleared).
+stopButtonEl.addEventListener("click", () => {
+  if (currentSessionId === null) {
+    return;
+  }
+  stop(currentSessionId);
 });
 
 // devices: re-list the operator's paired devices on demand (#85).

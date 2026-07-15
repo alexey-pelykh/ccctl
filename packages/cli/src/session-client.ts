@@ -29,10 +29,14 @@
 import { formatAuthority, type HostEndpoint } from "@ccctl/core";
 import {
   isLaunchFailureCode,
+  isStopFailureCode,
   type LaunchAcceptedWire,
   type LaunchFailureCode,
   type SessionLaunchOptions,
+  type SessionStopOptions,
   type SessionSummaryWire,
+  type StopAcceptedWire,
+  type StopFailureCode,
 } from "@ccctl/server";
 
 /** How long a CLI round-trip to the daemon waits before it is treated as hung (matches the e2e harness). */
@@ -71,6 +75,16 @@ export interface SessionClient {
    * minted correlation id (the `202` body's `{ id }`).
    */
   steer(target: HostEndpoint, sessionId: string, command: SteerCommand): Promise<string>;
+  /**
+   * `POST /api/sessions/{id}/stop` on `target` — STOP the ONE addressed session (#77): kill its
+   * terminal and drive it to its terminal state. Resolve with what the stop DID
+   * ({@link StopAcceptedWire}); reject on every path that did not stop it.
+   *
+   * The opposite of {@link steer} despite the adjacent route: a steer ASKS the worker to do
+   * something and needs it listening; a stop kills the surface the worker runs on and needs only
+   * the handle the daemon has held since it launched it.
+   */
+  stop(target: HostEndpoint, sessionId: string, options: SessionStopOptions): Promise<StopAcceptedWire>;
 }
 
 /** Render a loopback `host:port` target as its `http://…/api/sessions` URL (IPv6-bracketing via formatAuthority). */
@@ -86,6 +100,17 @@ function sessionsUrl(target: HostEndpoint): string {
  */
 function sessionCommandUrl(target: HostEndpoint, sessionId: string): string {
   return `${sessionsUrl(target)}/${sessionId}/command`;
+}
+
+/**
+ * Render the per-session stop URL — `…/api/sessions/{id}/stop` (#76). The same verbatim-id
+ * construction as {@link sessionCommandUrl}, and the same server-side matcher (`…/{id}/{leg}`) —
+ * `stop` is simply another leg of the namespace, and deliberately NOT a `/command` subtype: a
+ * command needs a live worker channel, and a session whose worker stopped answering is exactly what
+ * an emergency-stop is for.
+ */
+function sessionStopUrl(target: HostEndpoint, sessionId: string): string {
+  return `${sessionsUrl(target)}/${sessionId}/stop`;
 }
 
 /**
@@ -146,6 +171,72 @@ async function readLaunchFailure(res: Response): Promise<LaunchFailure | null> {
     // A non-JSON body (a proxy's HTML error page, a truncated response) — nothing to type.
     return null;
   }
+}
+
+/** The parsed `{ error, code }` a failed stop answers — the daemon's `StopFailureWire` (#76). */
+interface StopFailure {
+  readonly error: string;
+  readonly code: StopFailureCode;
+}
+
+/**
+ * The CLI-specific next-move hint per {@link StopFailureCode}, ADDED to the daemon's own sentence
+ * (which already says what went wrong). Only the codes where the CLI knows something the daemon does
+ * not — that this is a `ccctl` command, run from a shell, with flags — earn a hint; for the rest the
+ * daemon's own sentence is what the operator needs, and adding to it would be noise.
+ *
+ * `taken-over` is the hint that matters, and it is a TRANSLATION rather than an addition: the
+ * daemon's sentence names its remedy in WIRE words — "re-send this stop with `{ force: true }`" —
+ * which is exactly right for the browser and curl, and not something anyone can type at a shell.
+ * `--force` is that same remedy spelled for this surface. Without it the daemon's advice is a dead
+ * end for the operator who is holding the one thing that can act on it.
+ */
+const STOP_FAILURE_HINTS: Partial<Record<StopFailureCode, string>> = {
+  "unknown-session": "Run `ccctl attach` to see the running sessions",
+  "taken-over": "Re-run with `--force` if you are sure",
+};
+
+/** Read a failed stop's `{ error, code }` body, or `null` when it is not one (an older daemon, a proxy). */
+async function readStopFailure(res: Response): Promise<StopFailure | null> {
+  try {
+    const body: unknown = await res.json();
+    if (typeof body !== "object" || body === null) {
+      return null;
+    }
+    const { error, code } = body as { error?: unknown; code?: unknown };
+    // `isStopFailureCode` is the SERVER's own guard, imported rather than re-transcribed — so a code
+    // it grows is a typecheck failure here, not a silent mismatch. It fails closed on anything
+    // outside the pinned set, which also stops an errno-bearing throw (those carry a string `code`
+    // too) from being read as a refusal the daemon never made.
+    if (typeof error !== "string" || !isStopFailureCode(code)) {
+      return null;
+    }
+    return { error, code };
+  } catch {
+    // A non-JSON body (a proxy's HTML error page, a truncated response) — nothing to type.
+    return null;
+  }
+}
+
+/**
+ * Turn a failed `POST /api/sessions/{id}/stop` into a clear, actionable CLI error, branching on the
+ * TYPED {@link StopFailureCode} rather than the HTTP status — the exact shape of
+ * {@link launchError}, and for a sharper reason: four distinct refusals share `409`, so the status
+ * alone cannot tell "someone is driving it" from "the backend could not be read", and those are
+ * fixed by completely different actions (one by `--force`, the other by nothing this shell can do).
+ *
+ * The daemon's own `error` sentence is already actionable, so it is carried through verbatim as the
+ * message; the code selects the ADDED hint. A body with no recognizable code — an older daemon, a
+ * proxy that ate it, or the ingress's own `405` (which answers no code, because no stop was
+ * attempted) — degrades to a status-shaped message rather than throwing: a client that cannot parse
+ * the failure must still report the failure.
+ */
+function stopError(status: number, sessionId: string, failure: StopFailure | null): Error {
+  if (failure === null) {
+    return new Error(`ccctl: stop failed — POST /api/sessions/${sessionId}/stop returned ${status}`);
+  }
+  const hint = STOP_FAILURE_HINTS[failure.code];
+  return new Error(hint === undefined ? failure.error : `${failure.error}. ${hint}`);
 }
 
 /**
@@ -231,5 +322,37 @@ export const defaultSessionClient: SessionClient = {
       throw new Error("ccctl: POST /api/sessions/{id}/command did not return an { id } body");
     }
     return (body as { id: string }).id;
+  },
+  async stop(target: HostEndpoint, sessionId: string, options: SessionStopOptions): Promise<StopAcceptedWire> {
+    const res = await fetch(sessionStopUrl(target, sessionId), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // `force` rides the body as a literal boolean: the daemon's parse refuses anything else rather
+      // than coercing it, so this must never stringify it (`"false"` is truthy, and truthiness in
+      // the destructive direction is the one failure this verb may not have).
+      body: JSON.stringify(options),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (res.status !== 200) {
+      // EVERY non-200 is a throw, deliberately: a refused stop must not resolve. The operator's whole
+      // reason for running this is to stop watching the session, so `ccctl stop X && echo done` must
+      // not print `done` for a session that is still running — and `cli.ts` turns this rejection into
+      // the non-zero exit that makes the `&&` hold.
+      throw stopError(res.status, sessionId, await readStopFailure(res));
+    }
+    const body: unknown = await res.json();
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      typeof (body as { sessionId?: unknown }).sessionId !== "string" ||
+      typeof (body as { outcome?: unknown }).outcome !== "string" ||
+      typeof (body as { status?: unknown }).status !== "string"
+    ) {
+      // A 200 whose body we cannot read is NOT a stop we may report: the shape is how we know what
+      // happened to the session, and reporting an unreadable answer as a kill is the one lie an
+      // emergency-stop must never tell.
+      throw new Error("ccctl: POST /api/sessions/{id}/stop did not return a { sessionId, outcome, status } body");
+    }
+    return body as StopAcceptedWire;
   },
 };
