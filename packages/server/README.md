@@ -73,7 +73,18 @@ generic "a session needs you". These are the two firewalled **notification class
 notification is **blocking** (high-urgency, re-nudgeable, never batched), the idle nudge
 **informational** (quiet, batchable, never re-nudged) — so a consumer keys its handling on
 the class instead of re-deriving urgency from the event type, and an informational event can
-never escalate into or masquerade as the blocking class. Upstream, the browser steers a
+never escalate into or masquerade as the blocking class.
+
+A blocking needs-input notification is also what a **push wake** is derived from
+([#45](https://github.com/alexey-pelykh/ccctl/issues/45)), and that derivation is a firewall
+(`push-payload.ts`): a push necessarily transits an external gateway the operator does not own,
+so it carries only a **pointer** — an opaque session id plus a minimal generic line ("A session
+needs your input") — never the `detail` or any session content, and the gateway itself sees only
+bounded metadata (a wake's existence, timing, and cadence, plus a stable subscription id) — never
+the pointer or the content. The actual session content is fetched back over the **tunnel** on tap
+(the opaque id is the deep-link target), so nothing a session is saying ever leaves the box in a
+push. This slice fixes only that pointer-only SHAPE and its firewall; the wake dispatch itself
+(and its VAPID/`Urgency`/collapse-id handling) is a later item. Upstream, the browser steers a
 chosen session with a `fetch` **POST** to `/api/sessions/{id}/command`: a `prompt`
 becomes a `{ type: "user" }` turn injected on that session's worker downstream, any
 other verb a `control_request` — both pushed as a `client_event` frame. Naming the
