@@ -20,6 +20,7 @@ import {
   DEFAULT_SESSION_IDLE_THRESHOLD_MS,
   DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
   SESSION_IDLE_EVENT_TYPE,
+  SESSION_NEEDS_INPUT_EVENT_TYPE,
 } from "./worker-channel.js";
 
 const ACCOUNT_BEARER = "oauth-account-secret-worker-abc123";
@@ -497,11 +498,15 @@ describe("§5 worker_status fold — the events leg feeds the classification (#3
 
     const frame = statusEvent("requires_action", "Approve the edit to src/index.ts?");
     await postWorkerEvents(server, sessionId, epoch, [frame]);
-    await waitFor(() => ui.received().length === 1);
+    // The §5 fold relays the frame verbatim AND #43 raises a server-originated "needs input" notification
+    // off the SAME requires_action transition — a separate `ccctl_session_needs_input`-typed event, not a
+    // rewrite of this one — so two events reach the stream; the verbatim relay is one of them.
+    await waitFor(() => ui.received().length >= 2);
+    const payloads = ui.received().map((event) => JSON.parse(event.data ?? "null"));
 
     // Byte-identical to what the worker sent: the UI decodes this frame itself (#15), so the
     // fold must not rewrite, enrich, or swallow it.
-    expect(JSON.parse(ui.received()[0]?.data ?? "null")).toEqual(frame);
+    expect(payloads).toContainEqual(frame);
     // …and the model was fed by the SAME payload.
     expect(server.sessions.get(sessionId)?.activity).toEqual({
       kind: "requires_action",
@@ -1244,5 +1249,145 @@ describe("§4/§5 per-session idle timer — raises an 'idle > X' informational 
     await expect(startServer({ port: 0, host: DEFAULT_HOST, sessionIdleThresholdMs: Number.NaN })).rejects.toThrow(
       /NaN/,
     );
+  });
+});
+
+// --- #43: blocking "needs input" notification — name the session on a transition into requires_action ---
+
+/**
+ * The parsed blocking "needs input" payloads a UI subscriber received (#43): each event's `data` JSON is
+ * parsed and the set filtered to the {@link SESSION_NEEDS_INPUT_EVENT_TYPE} frames the SERVER raises — so
+ * the verbatim §5 `worker_status` frame relayed onto the same stream (`type: "control_event"`) is
+ * excluded, leaving only the server-originated notifications.
+ */
+function needsInputEvents(ui: { received(): UiSseEvent[] }): { type: string; session_id: string; detail: string }[] {
+  return ui
+    .received()
+    .map((event) => JSON.parse(event.data) as { type: string; session_id: string; detail: string })
+    .filter((payload) => payload.type === SESSION_NEEDS_INPUT_EVENT_TYPE);
+}
+
+describe("§4/§5 blocking needs-input notification — names the session on a transition INTO requires_action (#43)", () => {
+  it("raises a 'needs input' notification NAMING the session when it enters requires_action via the §4 gate (AC1/AC3)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // A born-idle session moves into requires_action: the transition raises the blocking notification.
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+
+    await waitFor(() => needsInputEvents(ui).length >= 1);
+    const events = needsInputEvents(ui);
+    expect(events).toHaveLength(1);
+    // The notification NAMES the session (AC1/AC3) and carries a detail — the bare §4 gate supplies none,
+    // so it defaults to the human-ready fallback rather than an empty label.
+    expect(events[0].session_id).toBe(sessionId);
+    expect(events[0].detail).toBe(DEFAULT_REQUIRES_ACTION_DETAIL);
+  });
+
+  it("carries the human-ready detail the §5 rich frame captured, so the notification names what input is awaited (AC1)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // Drive requires_action via the §5 upstream leg (the rich-frame path) carrying a tool description.
+    const res = await postWorkerEvents(server, sessionId, epoch, [
+      {
+        type: "control_event",
+        subtype: "worker_status",
+        payload: { status: "requires_action", detail: "Approve the edit to foo.ts?" },
+      },
+    ]);
+    expect(res.status).toBe(200);
+
+    await waitFor(() => needsInputEvents(ui).length >= 1);
+    const events = needsInputEvents(ui);
+    expect(events).toHaveLength(1);
+    expect(events[0].session_id).toBe(sessionId);
+    expect(events[0].detail).toBe("Approve the edit to foo.ts?");
+  });
+
+  it("fires EXACTLY ONCE across a redundant requires_action re-affirmation — one blocking event per stretch, not one per frame (AC1)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // Two back-to-back requires_action observations: only the first is a TRANSITION into the state; the
+    // second is a re-affirmation and must NOT re-notify (the blocking analogue of the idle arm-once rule).
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+
+    await waitFor(() => needsInputEvents(ui).length >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 30)); // give any wrongful second event time to arrive.
+    expect(needsInputEvents(ui)).toHaveLength(1);
+  });
+
+  it("does NOT raise the notification for a status that is not requires_action — running / idle are not blocking (AC1)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "running")).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(needsInputEvents(ui)).toEqual([]);
+  });
+
+  it("raises a SECOND notification when the session re-enters requires_action after leaving it — each blocking stretch is its own event (AC1)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // requires_action → running (leaves the blocking state) → requires_action again: two DISTINCT blocking
+    // events, because the operator resolved the first and the worker blocked anew.
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "running")).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+
+    await waitFor(() => needsInputEvents(ui).length >= 2);
+    expect(needsInputEvents(ui)).toHaveLength(2);
+    expect(needsInputEvents(ui).map((event) => event.session_id)).toEqual([sessionId, sessionId]);
+  });
+
+  it("does NOT raise the notification for a session gone stale — 'needs input' means awaiting AND alive (liveness)", async () => {
+    // A short staleness window and no heartbeat since registration: by the time the worker reports
+    // requires_action the session is already heartbeat-stale, so the notification is suppressed (a stale
+    // awaiter is eviction's job, #173, not a nudge) — the same liveness rule the idle nudge applies.
+    const server = await startEvictionServer(20);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // Let the heartbeat lapse past the (short) staleness window ...
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    // ... then the worker blocks: suppressed, because the session is heartbeat-stale.
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(needsInputEvents(ui)).toEqual([]);
+  });
+
+  it("notifies each session INDEPENDENTLY — two blocking sessions each raise their OWN notification, never cross-wired (AC3)", async () => {
+    const server = await startTestServer();
+    const a = await registerSession(server);
+    const b = await registerSession(server);
+    const epochA = await registerWorker(server, a);
+    const epochB = await registerWorker(server, b);
+    const uiA = await openUiEventStream(server, a);
+    const uiB = await openUiEventStream(server, b);
+
+    expect((await putStatus(server, a, epochA, "requires_action")).status).toBe(200);
+    expect((await putStatus(server, b, epochB, "requires_action")).status).toBe(200);
+
+    await waitFor(() => needsInputEvents(uiA).length >= 1 && needsInputEvents(uiB).length >= 1);
+    // Each session's notification names ITSELF on ITS OWN stream, and never reaches the other's subscribers (#20).
+    expect(needsInputEvents(uiA).map((event) => event.session_id)).toEqual([a]);
+    expect(needsInputEvents(uiB).map((event) => event.session_id)).toEqual([b]);
   });
 });
