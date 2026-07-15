@@ -19,6 +19,8 @@ import {
   DEFAULT_SESSION_EVICTION_GRACE_MS,
   DEFAULT_SESSION_IDLE_THRESHOLD_MS,
   DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
+  NOTIFICATION_CLASS_BLOCKING,
+  NOTIFICATION_CLASS_INFORMATIONAL,
   SESSION_IDLE_EVENT_TYPE,
   SESSION_NEEDS_INPUT_EVENT_TYPE,
 } from "./worker-channel.js";
@@ -1059,6 +1061,18 @@ describe("§ UI event relay eviction — a terminally-gone session's relay is re
   });
 });
 
+/**
+ * The notification-class marking (#44) every server-raised session event now carries — the class
+ * discriminant plus the handling policy derived from it. Shared by the {@link idleEvents} and
+ * {@link needsInputEvents} parsers so both suites read the same shape off the wire.
+ */
+type NotificationClassFields = {
+  notification_class: string;
+  urgency: string;
+  renudge: boolean;
+  batchable: boolean;
+};
+
 // --- #41: per-session idle timer — raise an "idle > X" informational event ---
 
 /**
@@ -1080,12 +1094,21 @@ async function startIdleServer(
  * is parsed and the set filtered to the {@link SESSION_IDLE_EVENT_TYPE} frames the server raises — so a
  * verbatim worker payload relayed onto the same stream (e.g. the §5 worker_status frame) is excluded.
  */
-function idleEvents(ui: {
-  received(): UiSseEvent[];
-}): { type: string; session_id: string; idle_threshold_ms: number }[] {
+function idleEvents(ui: { received(): UiSseEvent[] }): (NotificationClassFields & {
+  type: string;
+  session_id: string;
+  idle_threshold_ms: number;
+})[] {
   return ui
     .received()
-    .map((event) => JSON.parse(event.data) as { type: string; session_id: string; idle_threshold_ms: number })
+    .map(
+      (event) =>
+        JSON.parse(event.data) as NotificationClassFields & {
+          type: string;
+          session_id: string;
+          idle_threshold_ms: number;
+        },
+    )
     .filter((payload) => payload.type === SESSION_IDLE_EVENT_TYPE);
 }
 
@@ -1107,6 +1130,24 @@ describe("§4/§5 per-session idle timer — raises an 'idle > X' informational 
     // The event NAMES the session (AC2) and carries the threshold it crossed.
     expect(events[0].session_id).toBe(sessionId);
     expect(events[0].idle_threshold_ms).toBe(IDLE_MS);
+  });
+
+  it("marks the idle event INFORMATIONAL — quiet, batchable, never re-nudged (#44 AC2)", async () => {
+    const server = await startIdleServer(IDLE_MS);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+
+    await waitFor(() => idleEvents(ui).length >= 1);
+    const [event] = idleEvents(ui);
+    // The informational class and the handling policy it fixes: quiet (low urgency), batchable, and
+    // NEVER re-nudged — the marking a consumer reads instead of re-deriving urgency from the `type`.
+    expect(event.notification_class).toBe(NOTIFICATION_CLASS_INFORMATIONAL);
+    expect(event.urgency).toBe("low");
+    expect(event.renudge).toBe(false);
+    expect(event.batchable).toBe(true);
   });
 
   it("resets the timer on a status change off idle — no event is raised (AC3)", async () => {
@@ -1260,10 +1301,17 @@ describe("§4/§5 per-session idle timer — raises an 'idle > X' informational 
  * the verbatim §5 `worker_status` frame relayed onto the same stream (`type: "control_event"`) is
  * excluded, leaving only the server-originated notifications.
  */
-function needsInputEvents(ui: { received(): UiSseEvent[] }): { type: string; session_id: string; detail: string }[] {
+function needsInputEvents(ui: { received(): UiSseEvent[] }): (NotificationClassFields & {
+  type: string;
+  session_id: string;
+  detail: string;
+})[] {
   return ui
     .received()
-    .map((event) => JSON.parse(event.data) as { type: string; session_id: string; detail: string })
+    .map(
+      (event) =>
+        JSON.parse(event.data) as NotificationClassFields & { type: string; session_id: string; detail: string },
+    )
     .filter((payload) => payload.type === SESSION_NEEDS_INPUT_EVENT_TYPE);
 }
 
@@ -1284,6 +1332,24 @@ describe("§4/§5 blocking needs-input notification — names the session on a t
     // so it defaults to the human-ready fallback rather than an empty label.
     expect(events[0].session_id).toBe(sessionId);
     expect(events[0].detail).toBe(DEFAULT_REQUIRES_ACTION_DETAIL);
+  });
+
+  it("marks the needs-input notification BLOCKING — high-urgency, re-nudgeable, never batched (#44 AC1)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+
+    await waitFor(() => needsInputEvents(ui).length >= 1);
+    const [event] = needsInputEvents(ui);
+    // The blocking class and the handling policy it fixes: high-urgency, eligible for re-nudge, and
+    // never batched — the escalation the informational idle nudge deliberately is not.
+    expect(event.notification_class).toBe(NOTIFICATION_CLASS_BLOCKING);
+    expect(event.urgency).toBe("high");
+    expect(event.renudge).toBe(true);
+    expect(event.batchable).toBe(false);
   });
 
   it("carries the human-ready detail the §5 rich frame captured, so the notification names what input is awaited (AC1)", async () => {
@@ -1389,5 +1455,61 @@ describe("§4/§5 blocking needs-input notification — names the session on a t
     // Each session's notification names ITSELF on ITS OWN stream, and never reaches the other's subscribers (#20).
     expect(needsInputEvents(uiA).map((event) => event.session_id)).toEqual([a]);
     expect(needsInputEvents(uiB).map((event) => event.session_id)).toEqual([b]);
+  });
+});
+
+// --- #44: two firewalled notification classes — blocking vs informational ---
+
+describe("§4/§5 notification classes — blocking and informational are firewalled (#44)", () => {
+  const IDLE_MS = 40;
+
+  it("classes the two events DISJOINTLY — no policy field of one matches the other, so neither can masquerade as the other (AC3)", async () => {
+    // One session raises BOTH server-originated classes on one stream: it blocks (requires_action →
+    // blocking), then — resolved — sits idle past the threshold (→ informational). The two markings are
+    // then compared head-to-head.
+    const server = await startIdleServer(IDLE_MS);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+    await waitFor(() => needsInputEvents(ui).length >= 1);
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+    await waitFor(() => idleEvents(ui).length >= 1);
+
+    const [blocking] = needsInputEvents(ui);
+    const [informational] = idleEvents(ui);
+
+    // Each event carries its OWN class, and the informational one is NOT the blocking class.
+    expect(blocking.notification_class).toBe(NOTIFICATION_CLASS_BLOCKING);
+    expect(informational.notification_class).toBe(NOTIFICATION_CLASS_INFORMATIONAL);
+    expect(informational.notification_class).not.toBe(NOTIFICATION_CLASS_BLOCKING);
+    // Every handling-policy field differs across the two classes — the firewall: there is no field on
+    // which an informational event could be (mis)read as blocking.
+    expect(blocking.urgency).not.toBe(informational.urgency); // high vs low
+    expect(blocking.renudge).not.toBe(informational.renudge); // re-nudgeable vs never
+    expect(blocking.batchable).not.toBe(informational.batchable); // never-batched vs batchable
+  });
+
+  it("holds the firewall per-emission across repeated blocking↔idle cycles — EVERY idle event is informational, EVERY needs-input event blocking (AC3)", async () => {
+    // Cycle requires_action → idle → requires_action → idle so BOTH classes are raised twice. The class
+    // is a fixed property of the builder, so it must never leak across a transition — no idle event ever
+    // carries blocking, no needs-input event ever carries informational.
+    const server = await startIdleServer(IDLE_MS);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+    await waitFor(() => needsInputEvents(ui).length >= 1);
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+    await waitFor(() => idleEvents(ui).length >= 1);
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+    await waitFor(() => needsInputEvents(ui).length >= 2);
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+    await waitFor(() => idleEvents(ui).length >= 2);
+
+    expect(idleEvents(ui).every((event) => event.notification_class === NOTIFICATION_CLASS_INFORMATIONAL)).toBe(true);
+    expect(needsInputEvents(ui).every((event) => event.notification_class === NOTIFICATION_CLASS_BLOCKING)).toBe(true);
   });
 });

@@ -52,6 +52,15 @@
  * the blocking class ("it is waiting on you") the idle nudge ("you left this sitting") is not; the two
  * are discriminated by their event `type`.
  *
+ * **Two firewalled notification classes (#44).** The two events above are not merely two `type`s — they
+ * are two CLASSES a consumer must HANDLE differently, so each payload now also carries its class and the
+ * handling policy that rides with it ({@link NotificationClassPolicy}): the needs-input notification is
+ * {@link NOTIFICATION_CLASS_BLOCKING} (high-urgency, re-nudgeable, never batched), the idle nudge is
+ * {@link NOTIFICATION_CLASS_INFORMATIONAL} (quiet, batchable, never re-nudged). The two are FIREWALLED —
+ * each builder stamps one whole frozen policy ({@link BLOCKING_NOTIFICATION} / {@link INFORMATIONAL_NOTIFICATION})
+ * by name and every policy field is derived from the class, so an informational event can never escalate
+ * into or masquerade as the blocking class (there is no seam that mixes the two).
+ *
  * **Turn injection** ({@link injectUserTurn}) pushes a `client_event` frame down the
  * held-open downstream. The event name is `client_event`; the `data` is
  * `{ sequence_num, event_id, event_type: "message", payload }`, and `payload.type`
@@ -170,6 +179,68 @@ export const SESSION_IDLE_EVENT_TYPE = "ccctl_session_idle";
  * from the informational idle nudge by this `type`.
  */
 export const SESSION_NEEDS_INPUT_EVENT_TYPE = "ccctl_session_needs_input";
+
+/**
+ * The BLOCKING notification class (#44): "it is waiting on you". The value of the `notification_class`
+ * field the {@link needsInputEvent} payload carries — the discriminant a consumer keys ITS HANDLING on,
+ * one level above the per-event {@link SESSION_NEEDS_INPUT_EVENT_TYPE} `type`. Its handling policy
+ * ({@link BLOCKING_NOTIFICATION}) is high-urgency and re-nudgeable: an unaddressed blocking event may be
+ * re-raised, and is never quietly batched.
+ */
+export const NOTIFICATION_CLASS_BLOCKING = "blocking";
+
+/**
+ * The INFORMATIONAL notification class (#44): "you left this sitting". The value of the
+ * `notification_class` field the {@link idleEvent} payload carries — the firewalled counterpart of
+ * {@link NOTIFICATION_CLASS_BLOCKING}. Its handling policy ({@link INFORMATIONAL_NOTIFICATION}) is quiet
+ * (low urgency) and batchable, and NEVER re-nudged.
+ */
+export const NOTIFICATION_CLASS_INFORMATIONAL = "informational";
+
+/**
+ * The handling policy a notification class fixes (#44) — the fields a consumer reads to decide HOW to
+ * surface a server-raised session event, independent of the per-event `type`:
+ *   - `notification_class` — {@link NOTIFICATION_CLASS_BLOCKING} | {@link NOTIFICATION_CLASS_INFORMATIONAL};
+ *   - `urgency` — `"high"` (blocking: surface now) vs `"low"` (informational: quiet);
+ *   - `renudge` — whether an unaddressed event of this class may be RE-raised (AC1 eligible / AC2 never);
+ *   - `batchable` — whether it may be coalesced into a batch rather than surfaced immediately (AC2).
+ *
+ * Every field is DERIVED from the class in the two frozen policies below, never set per-event — which is
+ * exactly what firewalls the two classes (AC3): an event's marking can only ever be one of those two
+ * whole policies, so an informational event cannot acquire a blocking event's urgency/renudge policy (or
+ * vice-versa) — there is no seam that mixes them.
+ */
+export interface NotificationClassPolicy {
+  readonly notification_class: typeof NOTIFICATION_CLASS_BLOCKING | typeof NOTIFICATION_CLASS_INFORMATIONAL;
+  readonly urgency: "high" | "low";
+  readonly renudge: boolean;
+  readonly batchable: boolean;
+}
+
+/**
+ * The BLOCKING policy (#44 AC1): high-urgency, eligible for re-nudge, never batched. The single
+ * source-of-truth the {@link needsInputEvent} builder stamps — frozen so the shared policy cannot be
+ * mutated in place into the informational shape (the runtime half of the firewall; each emitted event is
+ * a fresh spread copy besides).
+ */
+const BLOCKING_NOTIFICATION: NotificationClassPolicy = Object.freeze({
+  notification_class: NOTIFICATION_CLASS_BLOCKING,
+  urgency: "high",
+  renudge: true,
+  batchable: false,
+});
+
+/**
+ * The INFORMATIONAL policy (#44 AC2): quiet (low urgency), NEVER re-nudged, batchable. The firewalled
+ * counterpart of {@link BLOCKING_NOTIFICATION} the {@link idleEvent} builder stamps — frozen for the same
+ * reason.
+ */
+const INFORMATIONAL_NOTIFICATION: NotificationClassPolicy = Object.freeze({
+  notification_class: NOTIFICATION_CLASS_INFORMATIONAL,
+  urgency: "low",
+  renudge: false,
+  batchable: true,
+});
 
 /**
  * The live per-session worker channel: its current epoch, its held-open downstream
@@ -944,11 +1015,18 @@ function fireIdleEvent(state: WorkerChannelState, sessionId: string, record: Wor
 /**
  * The "idle > X" informational event payload (#41): a {@link SESSION_IDLE_EVENT_TYPE}-typed object that
  * NAMES the session (AC2) and carries the threshold it crossed, self-describing so a consumer needs no
- * out-of-band context. A {@link JsonValue}, so it rides the same per-session UI relay as a verbatim
- * worker payload.
+ * out-of-band context. Marked {@link INFORMATIONAL_NOTIFICATION} (#44): a consumer reads the spread-in
+ * `notification_class` / `urgency` / `renudge` / `batchable` fields to handle it as quiet + batchable +
+ * never-re-nudged, WITHOUT re-deriving urgency from the `type`. A {@link JsonValue}, so it rides the same
+ * per-session UI relay as a verbatim worker payload.
  */
 function idleEvent(sessionId: string, thresholdMs: number): JsonValue {
-  return { type: SESSION_IDLE_EVENT_TYPE, session_id: sessionId, idle_threshold_ms: thresholdMs };
+  return {
+    type: SESSION_IDLE_EVENT_TYPE,
+    session_id: sessionId,
+    idle_threshold_ms: thresholdMs,
+    ...INFORMATIONAL_NOTIFICATION,
+  };
 }
 
 /**
@@ -957,11 +1035,19 @@ function idleEvent(sessionId: string, thresholdMs: number): JsonValue {
  * frame captured — already normalized to one bounded, displayable line at the core model boundary
  * (`@ccctl/core` § `displayableDetail`: zero-width / control characters stripped, clamped to
  * `MAX_REQUIRES_ACTION_DETAIL_LENGTH`), so the notification inherits that guarantee rather than
- * re-sanitizing worker-supplied text here. A {@link JsonValue}, so it rides the same per-session UI relay
- * as a verbatim worker payload — the blocking sibling of {@link idleEvent}, discriminated by its `type`.
+ * re-sanitizing worker-supplied text here. Marked {@link BLOCKING_NOTIFICATION} (#44): a consumer reads
+ * the spread-in `notification_class` / `urgency` / `renudge` / `batchable` fields to handle it as
+ * high-urgency + re-nudgeable + never batched. A {@link JsonValue}, so it rides the same per-session UI
+ * relay as a verbatim worker payload — the blocking sibling of {@link idleEvent}, discriminated by its
+ * `type` AND, one level up, by its firewalled `notification_class`.
  */
 function needsInputEvent(sessionId: string, detail: string): JsonValue {
-  return { type: SESSION_NEEDS_INPUT_EVENT_TYPE, session_id: sessionId, detail };
+  return {
+    type: SESSION_NEEDS_INPUT_EVENT_TYPE,
+    session_id: sessionId,
+    detail,
+    ...BLOCKING_NOTIFICATION,
+  };
 }
 
 /**
