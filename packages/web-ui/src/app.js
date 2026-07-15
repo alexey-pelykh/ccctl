@@ -56,6 +56,14 @@ import { applyPairingToken, authHeader } from "./pairing.js";
 import { DEVICES_PATH, deviceLabel, isCurrentDevice, isRenderableDevice } from "./devices.js";
 import { launchRequest, launchFailure, describeLaunchAccepted } from "./launch.js";
 import { sessionStopPath, stopRequest, stopFailure, describeStopAccepted, keepStopControlDisabled } from "./stop.js";
+import {
+  PUSH_VAPID_PUBLIC_KEY_PATH,
+  PUSH_SUBSCRIPTION_PATH,
+  urlBase64ToUint8Array,
+  pushSubscribeOptions,
+  vapidPublicKeyFromResponse,
+  toServerSubscription,
+} from "./push.js";
 
 const connectionEl = document.getElementById("connection");
 const statusEl = document.getElementById("status");
@@ -78,6 +86,8 @@ const stopButtonEl = document.getElementById("stop-button");
 const stopStatusEl = document.getElementById("stop-status");
 const deviceListEl = document.getElementById("device-list");
 const refreshDevicesEl = document.getElementById("refresh-devices");
+const enablePushEl = document.getElementById("enable-push");
+const pushStatusEl = document.getElementById("push-status");
 
 /** The session currently viewed + steered, or null when none is selected. */
 let currentSessionId = null;
@@ -770,6 +780,115 @@ async function loadDevices() {
   applyDeviceList(devices);
 }
 
+/**
+ * Paint the push-enablement outcome (#51). `data-push` carries the state for colour; the region is
+ * `aria-live`, so each outcome is announced once. States: `working` (requesting / subscribing),
+ * `enabled` (this device is subscribed), `blocked` (the browser / OS can't or withheld permission —
+ * an amber "not available / you said no", not a red error to retry blindly), `failed` (an outright
+ * error). Every decision that shapes the wake itself lives in `./push.js`; this only paints the line.
+ */
+function renderPushStatus(state, text) {
+  pushStatusEl.hidden = false;
+  pushStatusEl.dataset.push = state;
+  pushStatusEl.textContent = text;
+}
+
+/**
+ * Register the service worker (#51) — the background half that makes the UI installable and renders
+ * every push wake as a visible notification. Best-effort and SILENT on failure (a browser without
+ * service workers, or a non-secure context, simply isn't a PWA); it returns the registration so the
+ * enable-push flow can subscribe against it, or `null` when there is none. Served from `/sw.js`, so
+ * its scope is the whole app.
+ */
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) {
+    return null;
+  }
+  try {
+    return await navigator.serviceWorker.register("./sw.js");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Enable Web-Push on THIS device (#51): request notification permission, fetch the server's VAPID
+ * public key, subscribe via the PushManager (always `userVisibleOnly` — no silent push, AC2), and
+ * upload the subscription in the shape the server's wake dispatch consumes (#50, AC3).
+ *
+ * Each failure mode surfaces its own honest line rather than a generic "failed":
+ *   - no service worker / PushManager → this browser can't (an old browser, or iOS Safari before the
+ *     app is installed to the home screen — Web-Push on iOS is installed-PWA only);
+ *   - permission not granted → BLOCKED (amber: the operator said no, or the OS withheld it);
+ *   - the VAPID-key route not wired yet → unavailable, said plainly rather than thrown — this surface
+ *     runs AHEAD of the server, exactly as `pairing.js` (#74) and `devices.js` (#85) do;
+ *   - the subscribe / upload rejected → failed.
+ * An existing subscription is reused rather than re-created, so a second tap is idempotent.
+ */
+async function enablePush() {
+  const registration = await registerServiceWorker();
+  if (registration === null || !("pushManager" in registration)) {
+    renderPushStatus(
+      "blocked",
+      "ccctl: this browser can't receive push notifications (on iOS, install the app first).",
+    );
+    return;
+  }
+  renderPushStatus("working", "enabling notifications…");
+  // Permission first: a subscribe without it throws, and a denied permission is a "you said no", not
+  // an error to retry blindly.
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    renderPushStatus("blocked", `ccctl: notifications are ${permission} — allow them in your browser to be woken.`);
+    return;
+  }
+  // The server's VAPID public key binds the subscription to this application server (#50). Until the
+  // server wires GET /api/push/vapid-public-key this yields no key, and the surface says so.
+  let vapidKey;
+  try {
+    const response = await fetch(PUSH_VAPID_PUBLIC_KEY_PATH, { headers: authHeader(localStorage) });
+    vapidKey = response.ok ? vapidPublicKeyFromResponse(await readJson(response)) : null;
+  } catch {
+    vapidKey = null;
+  }
+  if (vapidKey === null) {
+    renderPushStatus("blocked", "ccctl: push isn't available yet — the server hasn't published its VAPID key.");
+    return;
+  }
+  // Reuse an existing subscription (idempotent re-tap), else create one — always userVisibleOnly.
+  let subscription;
+  try {
+    subscription =
+      (await registration.pushManager.getSubscription()) ??
+      (await registration.pushManager.subscribe(pushSubscribeOptions(urlBase64ToUint8Array(vapidKey))));
+  } catch (error) {
+    renderPushStatus("failed", `ccctl: could not subscribe to push — ${error.message}`);
+    return;
+  }
+  const serverSubscription = toServerSubscription(subscription.toJSON());
+  if (serverSubscription === null) {
+    renderPushStatus("failed", "ccctl: the browser returned an unusable subscription.");
+    return;
+  }
+  // Upload the subscription the server's wake dispatch (#50) sends to (AC3). This route is wired with
+  // the same later server slice as the VAPID key; a non-2xx is surfaced, not thrown.
+  try {
+    const response = await fetch(PUSH_SUBSCRIPTION_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeader(localStorage) },
+      body: JSON.stringify(serverSubscription),
+    });
+    if (!response.ok) {
+      renderPushStatus("failed", `ccctl: the server refused the subscription (${response.status}).`);
+      return;
+    }
+  } catch (error) {
+    renderPushStatus("failed", `ccctl: could not reach the server — ${error.message}`);
+    return;
+  }
+  renderPushStatus("enabled", "Notifications enabled — you'll be woken when a session needs you.");
+}
+
 // refresh: re-list the sessions on demand.
 refreshSessionsEl.addEventListener("click", refreshSessionsNow);
 
@@ -847,6 +966,17 @@ refreshDevicesEl.addEventListener("click", () => {
   loadDevices();
 });
 
+// enable notifications: subscribe THIS device to Web-Push so a blocked session can wake the operator
+// while the app is backgrounded / closed (#51). Disabled for the in-flight window so a double-tap
+// can't stack two permission/subscribe flows; re-enabled whatever the outcome so a blocked/failed
+// attempt can be retried after the operator fixes it (grants permission, installs the app).
+enablePushEl.addEventListener("click", () => {
+  enablePushEl.disabled = true;
+  enablePush().finally(() => {
+    enablePushEl.disabled = false;
+  });
+});
+
 // Apply a scanned QR-pair token (#74) BEFORE the first request: read it from the URL fragment,
 // persist it, and scrub it from the URL so the secret does not linger in the address bar / history.
 // A returning paired device reuses its stored token; every fetch above then carries it as an
@@ -861,3 +991,9 @@ pollSessions();
 
 // List the operator's paired devices (#85); re-listed on demand via the Devices Refresh button.
 loadDevices();
+
+// Register the service worker on load so the UI is installable as a PWA and ready to render push
+// wakes (#51); a browser without service workers simply isn't a PWA (best-effort, silent). Enabling
+// push — subscribing this device — is an explicit operator action via the "Enable notifications"
+// button above.
+registerServiceWorker();

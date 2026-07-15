@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 Oleksii PELYKH -->
+<!-- The PWA / home-screen icon (#51). A single scalable SVG serves every size the manifest needs
+     ("sizes": "any"); the mark — a terminal prompt in the page's accent blue — sits well inside the
+     maskable safe zone (a centred circle of ~40% radius) so "purpose": "any maskable" holds and the
+     OS can round/crop the full-bleed background without clipping the glyph. Zero-build: no raster
+     pipeline, no binary asset. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="ccctl">
+  <rect width="512" height="512" rx="96" fill="#1d4ed8" />
+  <g fill="none" stroke="#ffffff" stroke-width="30" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="196,192 272,256 196,320" />
+    <line x1="288" y1="320" x2="344" y2="320" />
+  </g>
+</svg>

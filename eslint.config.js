@@ -92,6 +92,13 @@ export default tseslint.config(
         location: "readonly",
         history: "readonly",
         localStorage: "readonly",
+        // PWA install + Web-Push subscription (#51): `navigator` registers the service worker,
+        // `Notification` requests permission, and `atob`/`btoa` convert the VAPID key base64url ⇄
+        // bytes for the `applicationServerKey` (in `push.js` and its round-trip test).
+        navigator: "readonly",
+        Notification: "readonly",
+        atob: "readonly",
+        btoa: "readonly",
       },
     },
   },
