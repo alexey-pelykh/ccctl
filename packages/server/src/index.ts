@@ -50,6 +50,7 @@ import { ENVIRONMENTS_BRIDGE_PATH, SESSIONS_PATH, type HostEndpoint, type Sessio
 import {
   closeWorkerChannels,
   DEFAULT_SESSION_EVICTION_GRACE_MS,
+  DEFAULT_SESSION_IDLE_THRESHOLD_MS,
   DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
   handleWorkerDelivery,
   handleWorkerEvents,
@@ -353,6 +354,15 @@ export interface ServerConfig {
    */
   sessionEvictionGraceMs?: number;
   /**
+   * Threshold (ms) a session may stay continuously idle — observed `worker_status: idle`, still
+   * heartbeat-live — before the server raises the "idle > X" informational event that names it (#41).
+   * Defaults to {@link DEFAULT_SESSION_IDLE_THRESHOLD_MS} (5 min), deliberately well above the
+   * liveness/eviction windows so the nudge fires only after a genuine lull, not after every turn settles.
+   * Activity — a status change off idle, or an injected turn — resets the per-session timer. A test
+   * passes a short value to exercise it deterministically.
+   */
+  sessionIdleThresholdMs?: number;
+  /**
    * The session launcher a `POST /api/sessions` "New session" request runs (#31) to bring up a
    * headful, locally-attachable terminal running the patched `claude`. An injected
    * {@link ISessionLauncher} port — the daemon composes the primary tmux backend (#29) with any
@@ -541,6 +551,8 @@ interface ServerState {
   readonly workerLivenessIntervalMs: number;
   /** Grace window (ms) before a downstream-null, heartbeat-stale session is closed + evicted (#173). */
   readonly sessionEvictionGraceMs: number;
+  /** Threshold (ms) a session may stay continuously idle before the "idle > X" event is raised (#41). */
+  readonly sessionIdleThresholdMs: number;
   /** Provisional at construction; finalized with the resolved port once bound. */
   address: HostEndpoint;
 }
@@ -739,6 +751,7 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     workPollTimeoutMs: config.workPollTimeoutMs ?? DEFAULT_WORK_POLL_TIMEOUT_MS,
     workerLivenessIntervalMs: config.workerLivenessIntervalMs ?? DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
     sessionEvictionGraceMs: config.sessionEvictionGraceMs ?? DEFAULT_SESSION_EVICTION_GRACE_MS,
+    sessionIdleThresholdMs: config.sessionIdleThresholdMs ?? DEFAULT_SESSION_IDLE_THRESHOLD_MS,
     address: { host, port: config.port },
   };
 

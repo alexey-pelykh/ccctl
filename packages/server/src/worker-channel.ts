@@ -35,6 +35,14 @@
  *     `{ worker_epoch, updates: [{ event_id, status }] }` → the worker's per-event
  *     downstream acks ({@link handleWorkerDelivery}).
  *
+ * **Idle-threshold nudge (#41).** From the observed `worker_status: idle` and the heartbeat — the only
+ * two idle-relevant signals a worker that emits no headless "idle for X" gives — the server times how
+ * long each session stays CONTINUOUSLY idle. Idle past {@link WorkerChannelState.sessionIdleThresholdMs}
+ * while still heartbeat-live raises a per-session "idle > X" informational event onto the UI relay
+ * ({@link reconcileIdleTimer} arms/resets it off the observed status; {@link fireIdleEvent} raises it).
+ * Activity — a status change off idle, or a turn injected down the channel — resets it. This is the
+ * SEPARATE informational class the blocking needs-you (`requires_action`) trigger is NOT.
+ *
  * **Turn injection** ({@link injectUserTurn}) pushes a `client_event` frame down the
  * held-open downstream. The event name is `client_event`; the `data` is
  * `{ sequence_num, event_id, event_type: "message", payload }`, and `payload.type`
@@ -110,6 +118,39 @@ export const DEFAULT_WORKER_LIVENESS_INTERVAL_MS = 20_000;
 export const DEFAULT_SESSION_EVICTION_GRACE_MS = 30_000;
 
 /**
+ * Default threshold (ms) a session may stay continuously idle before the server raises the "idle > X"
+ * informational event that names it (#41).
+ *
+ * The `--sdk-url` worker sends no headless "idle for X" signal — it reports the discrete
+ * `worker_status: idle` ("ready for a turn") and keeps heart-beating, but never "still idle, X later".
+ * So the server times it: it arms a per-session one-shot the moment it OBSERVES the session go idle
+ * ({@link WorkerChannelRecord.idleTimer}), and — X later, if the session is STILL idle AND still
+ * heartbeat-live ({@link isSessionStale}) — raises the event. Activity resets it (a status change off
+ * idle, or a turn injected down the channel), so it measures a CONTINUOUS idle stretch, not cumulative
+ * idle. This is the SEPARATE informational class the needs-you (`requires_action`) trigger is NOT
+ * (`@ccctl/core` § `isInputAwaited`): idle-too-long is a soft "you left this session sitting" nudge, not
+ * a blocking "it is waiting on you".
+ *
+ * Chosen at 300_000 ms (5 min): a DELIBERATE design value, not a derived one. It is deliberately well
+ * above the liveness/eviction windows (20s / 30s) — those bound a worker presumed GONE; this bounds one
+ * that is demonstrably ALIVE yet unused — so the nudge fires only after a genuine lull an operator would
+ * want flagged, never right after every turn settles to idle. INJECTABLE per server
+ * ({@link ServerConfig.sessionIdleThresholdMs}); a test passes a short value to exercise it
+ * deterministically, never a hidden magic number.
+ */
+export const DEFAULT_SESSION_IDLE_THRESHOLD_MS = 300_000;
+
+/**
+ * The `type` discriminant of the "idle > X" informational event (#41) the server broadcasts onto a
+ * session's UI stream when it has stayed idle past {@link WorkerChannelState.sessionIdleThresholdMs}.
+ * `ccctl_`-namespaced — like the {@link LIVENESS_PAYLOAD} `ccctl_liveness` frame — so it never collides
+ * with a real worker `stream-json` payload; the UI transcript decoder keys on `control_event` and
+ * surfaces everything else verbatim, so this server-originated event rides the relay without being
+ * mistaken for a transcript frame.
+ */
+export const SESSION_IDLE_EVENT_TYPE = "ccctl_session_idle";
+
+/**
  * The live per-session worker channel: its current epoch, its held-open downstream
  * SSE (or `null` when the worker has not opened / has dropped the stream), and the
  * next downstream `client_event` sequence number.
@@ -136,6 +177,17 @@ export interface WorkerChannelRecord {
    * fires against a session whose worker came back or a server that is shutting down.
    */
   evictionTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * The armed per-session **idle-threshold check** (#41): a one-shot armed when the session is
+   * OBSERVED to go `idle` and firing {@link WorkerChannelState.sessionIdleThresholdMs} later to raise
+   * the "idle > X" informational event; `null` when the session is not idle (or already fired).
+   * Armed ONLY on a transition INTO idle — a redundant `idle` re-affirmation leaves the running timer
+   * untouched, so it measures ONE continuous idle stretch, not a restart-on-every-frame clock. Cleared
+   * the moment the session leaves idle (a status change, {@link reconcileIdleTimer}) or a turn/steer is
+   * injected ({@link pushClientEvent}), and on every downstream teardown / supersede / shutdown via
+   * {@link endDownstream} — so it never fires against a session that has moved on or been reaped.
+   */
+  idleTimer: ReturnType<typeof setTimeout> | null;
 }
 
 /**
@@ -169,11 +221,19 @@ export interface WorkerChannelState extends WorkerChannelReapState {
    */
   readonly sessionEvictionGraceMs: number;
   /**
+   * Threshold (ms) a session may stay continuously idle before the "idle > X" informational event is
+   * raised (#41). Resolved once at server start ({@link ServerConfig.sessionIdleThresholdMs} ??
+   * {@link DEFAULT_SESSION_IDLE_THRESHOLD_MS}); a test passes a short value to exercise the timer
+   * deterministically.
+   */
+  readonly sessionIdleThresholdMs: number;
+  /**
    * The per-session UI Server-Sent Events relays. Every payload read off a session's
    * upstream `worker/events` leg (§5) is fanned out to the UI clients subscribed to THAT
    * SESSION's stream (#13/#20), so the upstream read path is also the source of the
    * browser's per-session stream — and a session's output never reaches another
-   * session's subscribers.
+   * session's subscribers. The "idle > X" informational event (#41) is raised onto this
+   * same per-session stream ({@link fireIdleEvent}).
    */
   readonly eventRelays: SessionEventRelays;
 }
@@ -304,6 +364,7 @@ export function handleWorkerRegister(
     nextSeq: prev?.nextSeq ?? 1,
     livenessTimer: null,
     evictionTimer: null,
+    idleTimer: null,
   });
   writeJson(res, 200, { worker_epoch: epoch });
 }
@@ -416,6 +477,11 @@ function foldWorkerStatus(state: WorkerChannelState, sessionId: string, payload:
   const next = applyWorkerStatusFrame(session, payload as ControlFrame);
   if (next !== session) {
     state.sessions.set(sessionId, next);
+    // A worker_status was observed (#41): arm the idle timer on a move INTO idle, clear it on any move
+    // off idle. `applyWorkerStatusFrame` returns a NEW session for every well-formed worker_status
+    // frame (it advances `lastActivityAt`), so `next !== session` is exactly "a status frame applied";
+    // a non-status payload leaves the session untouched and rightly skips the reconcile.
+    reconcileIdleTimer(state, sessionId, next);
   }
 }
 
@@ -476,7 +542,11 @@ export function handleWorkerStatus(
     }
     const session = state.sessions.get(sessionId);
     if (session !== undefined) {
-      state.sessions.set(sessionId, applyWorkerStatus(session, workerStatus));
+      const next = applyWorkerStatus(session, workerStatus);
+      state.sessions.set(sessionId, next);
+      // The §4 gate is the other place `idle` is observed (#41) — reconcile the idle timer off the
+      // resulting activity exactly as the §5 leg does, so one derivation governs both legs.
+      reconcileIdleTimer(state, sessionId, next);
     }
     writeJson(res, 200, {});
   });
@@ -668,6 +738,11 @@ function pushClientEvent(state: WorkerChannelState, sessionId: string, payload: 
   if (record === undefined || record.downstream === null) {
     throw new Error(`ccctl: no live worker channel for session ${sessionId}`);
   }
+  // A turn / steer pushed at the operator's hand is ACTIVITY (#41 AC3 "a new turn … resets the timer"):
+  // reset the idle clock now rather than wait for the worker's echoing status change, so an actively-
+  // driven session never trips the "idle > X" nudge in the gap. The no-op liveness frame is NOT a turn —
+  // it reaches {@link writeClientEventFrame} directly, never here, so it rightly leaves the timer running.
+  clearIdleTimer(record);
   writeClientEventFrame(record, payload);
 }
 
@@ -710,17 +785,119 @@ function clearEvictionTimer(record: WorkerChannelRecord): void {
 }
 
 /**
- * End a record's held-open downstream and clear its armed timers — the liveness interval (#166) AND
- * any pending eviction check (#173) — the single teardown every downstream-ending path routes
- * through: a supersede (a re-register in {@link handleWorkerRegister}, a duplicate open in
- * {@link handleWorkerEventsStream}) and shutdown ({@link closeWorkerChannels}). Ending the stream
- * and clearing its timers are kept inseparable here so no new downstream inherits a stale interval,
- * no timer is left to dangle, and a reconnect cancels a pending eviction. Leaves `record.downstream`
- * set for the caller to null or reassign.
+ * Clear a record's armed idle-threshold check (#41), if any, and null the field. Idempotent — safe on a
+ * record whose idle timer is already null (a move off idle, a turn injection, and a downstream teardown
+ * can each reach it). The counterpart of {@link armIdleTimer}: together the only two writers of
+ * {@link WorkerChannelRecord.idleTimer}.
+ */
+function clearIdleTimer(record: WorkerChannelRecord): void {
+  if (record.idleTimer !== null) {
+    clearTimeout(record.idleTimer);
+    record.idleTimer = null;
+  }
+}
+
+/**
+ * Arm the per-session idle-threshold check (#41) — but ONLY if one is not already armed. A one-shot
+ * fires {@link WorkerChannelState.sessionIdleThresholdMs} later and calls {@link fireIdleEvent}. The
+ * "arm only when null" guard is what makes this measure ONE continuous idle stretch: a redundant `idle`
+ * re-affirmation (the worker re-`PUT`s idle, or another idle §5 frame lands) finds the timer already
+ * armed and leaves it running rather than restarting the clock — otherwise a heart-beating idle session
+ * re-affirming idle every few seconds would never reach the threshold. `.unref()` so a pending check
+ * alone never blocks process exit, matching the sibling liveness / eviction timers.
+ */
+function armIdleTimer(state: WorkerChannelState, sessionId: string, record: WorkerChannelRecord): void {
+  if (record.idleTimer !== null) {
+    return;
+  }
+  const timer = setTimeout(() => {
+    fireIdleEvent(state, sessionId, record);
+  }, state.sessionIdleThresholdMs);
+  timer.unref();
+  record.idleTimer = timer;
+}
+
+/**
+ * Reconcile a session's idle-threshold timer against its just-applied {@link Session.activity} (#41) —
+ * the single seam both the §4 status gate ({@link handleWorkerStatus}) and the §5 events leg
+ * ({@link foldWorkerStatus}) route their observed status through, so "arm on idle, reset off idle" holds
+ * once for both legs. Idle → arm (via {@link armIdleTimer}, a no-op when already counting); any other
+ * activity (`running` / `requires_action`) → clear, which IS AC3's "a status change resets the timer".
+ * A no-op when the session has no channel record — the status legs cannot reach here without one (their
+ * epoch gate requires it), so this only guards a torn-down race.
+ */
+function reconcileIdleTimer(state: WorkerChannelState, sessionId: string, session: Session): void {
+  const record = state.workerChannels.get(sessionId);
+  if (record === undefined) {
+    return;
+  }
+  if (session.activity.kind === "idle") {
+    armIdleTimer(state, sessionId, record);
+  } else {
+    clearIdleTimer(record);
+  }
+}
+
+/**
+ * Fire the "idle > X" informational event (#41): the one-shot armed by {@link armIdleTimer} has elapsed,
+ * so raise the event naming the session onto its UI stream — but only if it is STILL genuinely idle and
+ * alive. Nulls the field first (the one-shot is spent), then fails closed on each way the world may have
+ * moved during the wait:
+ *   - a re-register swapped in a fresh channel record — this stale closure is not the session's current
+ *     timer, so it bows out and lets the new registration own the lifecycle;
+ *   - the session was evicted / stopped — its row is gone, so there is nothing to nudge (and a broadcast
+ *     would lazily resurrect a relay for a session that no longer exists);
+ *   - it already left idle — a status change that raced the fire; the reset it should have caused wins;
+ *   - it has gone STALE — no heartbeat within the window ({@link isSessionStale}). This is the
+ *     "+ heartbeat" half of the AC: "idle > X" means idle AND alive; a silent-then-idle worker is
+ *     eviction's job (#173), not something to nudge as though it were sitting ready. The window reuses
+ *     {@link WorkerChannelState.sessionEvictionGraceMs} so ONE staleness rule governs both.
+ * Only a session clearing all four gets the event, broadcast onto its own per-session relay (#20) — so
+ * it inherently reaches only that session's subscribers, and names the session in the payload besides.
+ */
+function fireIdleEvent(state: WorkerChannelState, sessionId: string, record: WorkerChannelRecord): void {
+  record.idleTimer = null; // the one-shot has fired.
+  if (state.workerChannels.get(sessionId) !== record) {
+    return; // superseded by a re-register — not this session's current timer.
+  }
+  const session = state.sessions.get(sessionId);
+  if (session === undefined) {
+    return; // evicted / stopped while idle — nothing to nudge.
+  }
+  if (session.activity.kind !== "idle") {
+    return; // moved off idle in a race with the fire — the reset wins.
+  }
+  if (isSessionStale(session, Date.now(), state.sessionEvictionGraceMs)) {
+    return; // idle but no longer heart-beating — eviction's job, not a nudge.
+  }
+  broadcastEvent(state.eventRelays, sessionId, idleEvent(sessionId, state.sessionIdleThresholdMs));
+}
+
+/**
+ * The "idle > X" informational event payload (#41): a {@link SESSION_IDLE_EVENT_TYPE}-typed object that
+ * NAMES the session (AC2) and carries the threshold it crossed, self-describing so a consumer needs no
+ * out-of-band context. A {@link JsonValue}, so it rides the same per-session UI relay as a verbatim
+ * worker payload.
+ */
+function idleEvent(sessionId: string, thresholdMs: number): JsonValue {
+  return { type: SESSION_IDLE_EVENT_TYPE, session_id: sessionId, idle_threshold_ms: thresholdMs };
+}
+
+/**
+ * End a record's held-open downstream and clear ALL its armed timers — the liveness interval (#166),
+ * any pending eviction check (#173), AND any armed idle-threshold check (#41) — the single teardown
+ * every downstream-ending path routes through: a supersede (a re-register in
+ * {@link handleWorkerRegister}, a duplicate open in {@link handleWorkerEventsStream}), a channel reap
+ * ({@link reapWorkerChannel}, the eviction + emergency-stop paths), and shutdown
+ * ({@link closeWorkerChannels}). Ending the stream and clearing its timers are kept inseparable here so
+ * no new downstream inherits a stale interval, no timer is left to dangle, a reconnect cancels a pending
+ * eviction, and a reaped session can never fire an "idle > X" event onto a relay that is being torn
+ * down. Leaves `record.downstream` set for the caller to null or reassign.
  */
 function endDownstream(record: WorkerChannelRecord): void {
   clearLivenessTimer(record);
   clearEvictionTimer(record);
+  clearIdleTimer(record);
   if (record.downstream !== null) {
     record.downstream.end();
   }
