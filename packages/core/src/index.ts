@@ -1160,6 +1160,37 @@ export function sessionActivityFromStatus(status: WorkerStatus, detail?: string)
 }
 
 /**
+ * THE single source of the blocking "input-awaited / needs-you" signal (SRV-C-002, #40): a session
+ * needs you when, and ONLY when, its {@link SessionActivity} is `requires_action`. That activity is
+ * derived — through {@link sessionActivityFromStatus}, the choke point both the §5 event leg
+ * ({@link applyWorkerStatusFrame}) and the §4 `PUT …/worker` gate ({@link applyWorkerStatus}) fold
+ * through — from the `worker_status` feed and nothing else, so this predicate structurally CANNOT fire
+ * from any other source. It reads one field of one worker-status-derived value; it has no way to see:
+ *
+ *   - **Stream silence / absence of output** — liveness is an ORTHOGONAL dimension keyed on
+ *     {@link Session.lastHeartbeatAt} ({@link isSessionStale}). A quiet session goes *stale*, never
+ *     `requires_action`; absence of frames leaves `activity` at whatever the last frame set (a fresh
+ *     session is born `idle`, see {@link createSession}), so no output can *promote* a session here.
+ *   - **A hook / progress event alone** — a hook is a non-`worker_status` {@link ControlEvent};
+ *     {@link applyWorkerStatusFrame} is a no-op on it (the session, and thus its `activity`, is
+ *     returned unchanged), so a hook cannot move a session into — or out of — the needs-you signal.
+ *     Hooks may at most feed the SEPARATE informational class (idle > X, #41); they never feed this
+ *     blocking one.
+ *
+ * Detail-agnostic: any `requires_action` fires it, whatever the human `detail` (the emitter, #43,
+ * reads the detail for the message; whether the needs-you TRIGGER holds is decided HERE). This is the
+ * single-DIMENSION trigger, not the whole fire decision: #43 still composes it with liveness and
+ * lifecycle — a `requires_action` session that has since gone *stale* ({@link isSessionStale}) or
+ * *closed* ({@link markSessionClosed}) must not notify. A session created under a non-prompting mode
+ * never emits `requires_action` ({@link Session.notificationsDegraded}), so this naturally returns
+ * `false` for it — no suppression gate needed. Keeping this one derivation single-sourced is what lets
+ * #43 compose the notification without re-deriving (and possibly re-sourcing) the trigger.
+ */
+export function isInputAwaited(activity: SessionActivity): boolean {
+  return activity.kind === "requires_action";
+}
+
+/**
  * How long the hub tolerates silence — no heartbeat — before it marks a session
  * stale. The worker channel emits a periodic heartbeat; a session stays live
  * while beats keep arriving, and a gap wider than this window means the worker
