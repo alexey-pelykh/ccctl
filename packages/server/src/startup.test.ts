@@ -2,14 +2,20 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { describe, expect, it } from "vitest";
+import { join } from "node:path";
 import {
   ADDRESS_IN_USE_CODE,
   brandListenError,
+  CCCTL_CONFIG_DIR,
   DEFAULT_HOST,
   LOCAL_SERVER_AUTH_ENV,
+  LOCAL_SERVER_AUTH_FILE_NAME,
   requireLocalServerAuth,
   resolveBindHost,
+  resolveLocalServerAuthPath,
   WILDCARD_BIND_HOST,
+  XDG_CONFIG_HOME_ENV,
+  type AuthFileReader,
 } from "./startup.js";
 
 /** A Node-style `listen()` error (an ErrnoException with a `.code`), built without binding a socket. */
@@ -17,30 +23,112 @@ function listenError(code: string, message: string): NodeJS.ErrnoException {
   return Object.assign(new Error(message), { code });
 }
 
-describe("requireLocalServerAuth — refuse-start-without-auth (#14 AC1)", () => {
-  it("returns the configured secret (trimmed)", () => {
-    expect(requireLocalServerAuth({ [LOCAL_SERVER_AUTH_ENV]: "  s3cret  " })).toBe("s3cret");
+describe("requireLocalServerAuth — refuse-start-without-auth complete to spec (#57, #14 AC1)", () => {
+  // No auth file on disk — every env-source / refusal case injects this so the unit stays
+  // hermetic (it never reads the real ~/.config/ccctl/local-server-auth).
+  const noAuthFile: AuthFileReader = () => null;
+  // A deterministic config home so the resolved auth-file path is assertable without the
+  // real environment or home directory.
+  const XDG = { [XDG_CONFIG_HOME_ENV]: "/xdg-config" };
+  const authFilePath = resolveLocalServerAuthPath(XDG);
+
+  describe("source 1 — the env var (primary)", () => {
+    it("returns the configured secret (trimmed)", () => {
+      expect(requireLocalServerAuth({ [LOCAL_SERVER_AUTH_ENV]: "  s3cret  " }, { readAuthFile: noAuthFile })).toBe(
+        "s3cret",
+      );
+    });
+
+    it("takes precedence over the config file when both are set (12-factor override)", () => {
+      expect(requireLocalServerAuth({ [LOCAL_SERVER_AUTH_ENV]: "from-env" }, { readAuthFile: () => "from-file" })).toBe(
+        "from-env",
+      );
+    });
+
+    it("reads from the injected env only — never mutates process.env", () => {
+      const before = process.env[LOCAL_SERVER_AUTH_ENV];
+      requireLocalServerAuth({ [LOCAL_SERVER_AUTH_ENV]: "isolated" }, { readAuthFile: noAuthFile });
+      expect(process.env[LOCAL_SERVER_AUTH_ENV]).toBe(before);
+    });
   });
 
-  it("throws a clear error stating auth is required when the key is absent", () => {
-    // The message must state that local-server auth is required (S1: "the error
-    // message states that local-server auth is required").
-    expect(() => requireLocalServerAuth({})).toThrow(/local-server auth is required/);
+  describe("source 2 — the config file (fallback, #57)", () => {
+    it("returns the file's secret (trimmed) when the env var is absent", () => {
+      expect(requireLocalServerAuth({}, { readAuthFile: () => "  file-s3cret  \n" })).toBe("file-s3cret");
+    });
+
+    it("looks for the file at the resolved XDG config path", () => {
+      let readPath: string | undefined;
+      requireLocalServerAuth(XDG, {
+        readAuthFile: (path) => {
+          readPath = path;
+          return "ok";
+        },
+      });
+      expect(readPath).toBe(authFilePath);
+    });
+
+    it("propagates a real file I/O error (not ENOENT) rather than masquerading as no-auth", () => {
+      const eacces: AuthFileReader = () => {
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      };
+      expect(() => requireLocalServerAuth({}, { readAuthFile: eacces })).toThrow(/EACCES/);
+    });
   });
 
-  it("names the config key in the refusal so the skeleton is provisionable", () => {
-    expect(() => requireLocalServerAuth({})).toThrow(LOCAL_SERVER_AUTH_ENV);
+  describe("no auth on any source → refuse to start (S1: absent)", () => {
+    it("throws a clear error stating auth is required when neither source is configured", () => {
+      expect(() => requireLocalServerAuth({}, { readAuthFile: noAuthFile })).toThrow(/local-server auth is required/);
+    });
+
+    it("is actionable: names the env key, the config-file path it looked for, and how to configure either (AC2)", () => {
+      let message = "";
+      try {
+        requireLocalServerAuth(XDG, { readAuthFile: noAuthFile });
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain(LOCAL_SERVER_AUTH_ENV); // the exact expected config key
+      expect(message).toContain(authFilePath); // the exact file path it looked for
+      expect(message).toMatch(/writing the secret to/); // how to configure the file source
+    });
   });
 
-  it("treats a present-but-blank value as no auth (empty secret is not a secret)", () => {
-    expect(() => requireLocalServerAuth({ [LOCAL_SERVER_AUTH_ENV]: "" })).toThrow(/auth is required/);
-    expect(() => requireLocalServerAuth({ [LOCAL_SERVER_AUTH_ENV]: "   " })).toThrow(/auth is required/);
+  describe("present-but-empty is not valid auth (S2 / AC3: malformed-or-empty → no auth, refused)", () => {
+    it("treats a present-but-blank env value as no auth", () => {
+      expect(() => requireLocalServerAuth({ [LOCAL_SERVER_AUTH_ENV]: "" }, { readAuthFile: noAuthFile })).toThrow(
+        /auth is required/,
+      );
+      expect(() => requireLocalServerAuth({ [LOCAL_SERVER_AUTH_ENV]: "   " }, { readAuthFile: noAuthFile })).toThrow(
+        /auth is required/,
+      );
+    });
+
+    it("treats a present-but-blank config file as no auth (an empty file is not a secret)", () => {
+      expect(() => requireLocalServerAuth({}, { readAuthFile: () => "" })).toThrow(/auth is required/);
+      expect(() => requireLocalServerAuth({}, { readAuthFile: () => "   \n  " })).toThrow(/auth is required/);
+    });
+
+    it("falls through a blank env to a valid config file (blank env ≠ auth, but the file still counts)", () => {
+      expect(requireLocalServerAuth({ [LOCAL_SERVER_AUTH_ENV]: "  " }, { readAuthFile: () => "file-secret" })).toBe(
+        "file-secret",
+      );
+    });
+  });
+});
+
+describe("resolveLocalServerAuthPath — XDG config path for the auth secret (#57)", () => {
+  it("honours an absolute $XDG_CONFIG_HOME", () => {
+    expect(resolveLocalServerAuthPath({ [XDG_CONFIG_HOME_ENV]: "/cfg" }, "/home/op")).toBe(
+      join("/cfg", CCCTL_CONFIG_DIR, LOCAL_SERVER_AUTH_FILE_NAME),
+    );
   });
 
-  it("reads from the injected env only — never mutates process.env", () => {
-    const before = process.env[LOCAL_SERVER_AUTH_ENV];
-    requireLocalServerAuth({ [LOCAL_SERVER_AUTH_ENV]: "isolated" });
-    expect(process.env[LOCAL_SERVER_AUTH_ENV]).toBe(before);
+  it("falls back to ~/.config when $XDG_CONFIG_HOME is unset, empty, or relative (a relative XDG base is spec-invalid)", () => {
+    const expected = join("/home/op", ".config", CCCTL_CONFIG_DIR, LOCAL_SERVER_AUTH_FILE_NAME);
+    expect(resolveLocalServerAuthPath({}, "/home/op")).toBe(expected);
+    expect(resolveLocalServerAuthPath({ [XDG_CONFIG_HOME_ENV]: "" }, "/home/op")).toBe(expected);
+    expect(resolveLocalServerAuthPath({ [XDG_CONFIG_HOME_ENV]: "relative/cfg" }, "/home/op")).toBe(expected);
   });
 });
 

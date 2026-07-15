@@ -165,6 +165,19 @@ export { isStopFailureCode, STOP_FAILURE_CODES } from "./ui-session-stop.js";
 // startup.ts; DEFAULT_HOST is also consumed internally below.
 export { DEFAULT_HOST, LOCAL_SERVER_AUTH_ENV, requireLocalServerAuth, resolveBindHost, WILDCARD_BIND_HOST };
 
+// Re-export the #57 config-file auth source that COMPLETES the refuse-start-without-auth
+// guarantee above: the XDG-config path resolver, its named constants, and the injectable
+// reader seam. Same contract-consumer reason as the sibling session-store path resolver —
+// an embedder (or a test) can name exactly WHERE the daemon looks for the secret rather
+// than re-transcribing the path. Defined and unit-tested in startup.ts.
+export {
+  CCCTL_CONFIG_DIR,
+  LOCAL_SERVER_AUTH_FILE_NAME,
+  resolveLocalServerAuthPath,
+  XDG_CONFIG_HOME_ENV,
+  type AuthFileReader,
+} from "./startup.js";
+
 // Re-export the session-launcher port (#28) on the public surface — the backend-agnostic
 // contract for bringing up a headful, locally-attachable terminal session. The tmux (#29)
 // and owned-pty (#30) backends implement it; a caller (the daemon) depends only on the

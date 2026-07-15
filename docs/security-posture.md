@@ -65,9 +65,14 @@ LAN or `0.0.0.0` binding.
 
 Authentication is required for the local server, and the server refuses to
 start when no auth is configured. There is no unauthenticated mode — not even
-on loopback. How the auth secret is provisioned, scoped, stored, and rotated
-is the credential-boundary spec deferred below; this page only fixes the
-refuse-start-without-auth guarantee.
+on loopback. The secret is read from either the `CCCTL_LOCAL_SERVER_AUTH`
+environment variable or a config file at `$XDG_CONFIG_HOME/ccctl/local-server-auth`
+(default `~/.config/ccctl/local-server-auth`); a present-but-empty value on either
+source counts as no auth, and when neither is configured the refusal names the env
+key, the file path it looked for, and how to configure either. How the secret is
+generated, scoped, stored (its at-rest format and permissions), and rotated is the
+credential-boundary spec deferred below; this page fixes the refuse-start-without-auth
+guarantee and where the secret is read from, not its lifecycle.
 
 ### Tunnel-only exposure
 
@@ -105,9 +110,10 @@ baseline is specified in a later item and will cover, at minimum:
 
 - **Transport security & certificate pinning** — TLS and certificate pinning
   for the tunnel and UI channels.
-- **Credential boundary** — how the local-server auth secret is provisioned,
-  scoped, stored, and rotated (the mechanism behind the mandatory-auth
-  guarantee above).
+- **Credential boundary** — how the local-server auth secret is generated,
+  scoped, stored (at-rest format and permissions), and rotated (the fuller
+  mechanism behind the mandatory-auth guarantee above; reading a provided secret
+  from the env var or config file, and the refusal, are done — #57).
 - **Audit trail** — what control-channel activity is recorded and how it is
   retained.
 

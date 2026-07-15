@@ -2,9 +2,13 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { HostEndpoint } from "@ccctl/core";
 import {
   LOCAL_SERVER_AUTH_ENV,
+  XDG_CONFIG_HOME_ENV,
   type CcctlServer,
   type ISessionLauncher,
   type LaunchAcceptedWire,
@@ -151,19 +155,33 @@ function makeDeps(options: FakeDepsOptions = {}): {
 }
 
 const originalAuth = process.env[LOCAL_SERVER_AUTH_ENV];
+const originalXdgConfigHome = process.env[XDG_CONFIG_HOME_ENV];
 let logSpy: ReturnType<typeof vi.spyOn>;
+let xdgConfigDir: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  // Isolate the #57 config-file auth source: point $XDG_CONFIG_HOME at a fresh empty dir
+  // so `serve`'s auth guard never finds a real ~/.config/ccctl/local-server-auth. The env
+  // var stays the only auth these tests configure — a refuse-path test that deletes it must
+  // deterministically refuse, not silently start off a developer's stray on-disk secret.
+  xdgConfigDir = await mkdtemp(join(tmpdir(), "ccctl-cli-xdg-"));
+  process.env[XDG_CONFIG_HOME_ENV] = xdgConfigDir;
 });
 
-afterEach(() => {
+afterEach(async () => {
   logSpy.mockRestore();
   if (originalAuth === undefined) {
     Reflect.deleteProperty(process.env, LOCAL_SERVER_AUTH_ENV);
   } else {
     process.env[LOCAL_SERVER_AUTH_ENV] = originalAuth;
   }
+  if (originalXdgConfigHome === undefined) {
+    Reflect.deleteProperty(process.env, XDG_CONFIG_HOME_ENV);
+  } else {
+    process.env[XDG_CONFIG_HOME_ENV] = originalXdgConfigHome;
+  }
+  await rm(xdgConfigDir, { recursive: true, force: true });
 });
 
 /** All console output this run, joined — for asserting the reported address / host. */
