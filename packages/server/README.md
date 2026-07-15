@@ -88,9 +88,17 @@ push. Each wake also carries two **reliability directives**
 backgrounded client is pulled back now, not deferred) and an **opaque per-session collapse id** — a
 one-way digest of the session pointer, so repeated wakes for one blocked session coalesce into a
 single notification rather than stacking, yet the gateway that reads that collapse id (a cleartext
-Web-Push `Topic` header) still never learns which session it is. This slice fixes only the
-pointer-only SHAPE, its firewall, and those directives; the wake **dispatch** itself (and its VAPID
-key handling, [#50](https://github.com/alexey-pelykh/ccctl/issues/50)) is a later item.
+Web-Push `Topic` header) still never learns which session it is. Those layers fix only the
+pointer-only SHAPE, its firewall, and those directives; the wake **dispatch** that consumes them is a
+single seam ([#50](https://github.com/alexey-pelykh/ccctl/issues/50), `wake-dispatch.ts`).
+`dispatchWake` is the ONE function all wake dispatch goes through — it derives those directives and
+stamps them onto every send, serializes the pointer-only payload as the RFC 8291-encrypted body, and
+hands the assembled request to an injected Web-Push transmit — with NO pluggable-transport abstraction
+(a future APNs/FCM adapter replaces the whole function, not an injected port), plus fail-closed VAPID
+key handling (`validateVapidKeys` refuses a mis-typed subject or a wrong-length P-256 key at config
+load). Like the shapes it consumes, it is not yet wired into a live path — there is no subscription
+store ([#51](https://github.com/alexey-pelykh/ccctl/issues/51)) or scheduler loop yet — so it fixes
+the dispatch discipline before the first live caller exists.
 
 Because both rungs above can miss — the live SSE relay misses a disconnected client, and a push is
 at-most-once (coalesced by its `Topic`, dropped on expiry, or lost when a subscription lapses) — a
