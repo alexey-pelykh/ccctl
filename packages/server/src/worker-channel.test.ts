@@ -442,6 +442,154 @@ describe("§5 worker events + delivery — upstream POSTs", () => {
   });
 });
 
+// #39 AC2: the classification must capture "the human-ready detail (the tool/action description)
+// for the notification". The §4 `PUT …/worker` gate carries a BARE status — its body is
+// `{ worker_status, worker_epoch, external_metadata }`, with no detail field at all. The RICH
+// frame (`payload: { status, detail }`) rides the §5 upstream events leg, which until now was
+// relayed to the UI and never folded into the session model — so the server-side detail was
+// permanently `DEFAULT_REQUIRES_ACTION_DETAIL` and a notification (#43) could never name the
+// actual tool. The fold is IN ADDITION to the verbatim relay: `web-ui/src/transcript.js` still
+// decodes the frame itself for the in-place activity indicator.
+describe("§5 worker_status fold — the events leg feeds the classification (#39)", () => {
+  /** A `worker_status` control event as it rides the §5 upstream events leg. */
+  const statusEvent = (status: string, detail?: string) => ({
+    type: "control_event",
+    subtype: "worker_status",
+    payload: detail === undefined ? { status } : { status, detail },
+  });
+
+  it("folds a requires_action worker_status into the session model WITH its human-ready detail", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    const res = await postWorkerEvents(server, sessionId, epoch, [
+      statusEvent("requires_action", "Approve the edit to src/index.ts?"),
+    ]);
+    expect(res.status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve the edit to src/index.ts?",
+    });
+  });
+
+  it("folds the running and idle tri-state off the same leg", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    await postWorkerEvents(server, sessionId, epoch, [statusEvent("running")]);
+    expect(server.sessions.get(sessionId)?.activity).toEqual({ kind: "running" });
+    await postWorkerEvents(server, sessionId, epoch, [statusEvent("idle")]);
+    expect(server.sessions.get(sessionId)?.activity).toEqual({ kind: "idle" });
+  });
+
+  it("STILL relays the payload verbatim to the session's UI stream (the fold is in addition, not instead)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    const frame = statusEvent("requires_action", "Approve the edit to src/index.ts?");
+    await postWorkerEvents(server, sessionId, epoch, [frame]);
+    await waitFor(() => ui.received().length === 1);
+
+    // Byte-identical to what the worker sent: the UI decodes this frame itself (#15), so the
+    // fold must not rewrite, enrich, or swallow it.
+    expect(JSON.parse(ui.received()[0]?.data ?? "null")).toEqual(frame);
+    // …and the model was fed by the SAME payload.
+    expect(server.sessions.get(sessionId)?.activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve the edit to src/index.ts?",
+    });
+  });
+
+  it("leaves activity untouched for a non-worker_status payload (fail-soft, batch semantics intact)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    await postWorkerEvents(server, sessionId, epoch, [statusEvent("running")]);
+
+    // A transcript line, an unknown status (drift), a null payload, and a scalar: none is a
+    // well-formed worker_status, so each is relayed but none moves the classification.
+    const res = await postWorkerEvents(server, sessionId, epoch, [
+      { type: "result", subtype: "success" },
+      statusEvent("on-fire"),
+      null,
+      "just-a-string",
+    ]);
+    expect(res.status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity).toEqual({ kind: "running" });
+  });
+
+  it("folds per-session: one session's status event never moves another's (#21 isolation holds on this leg)", async () => {
+    const server = await startTestServer();
+    const s1 = await registerSession(server);
+    const s2 = await registerSession(server);
+    const e1 = await registerWorker(server, s1);
+    const e2 = await registerWorker(server, s2);
+
+    await postWorkerEvents(server, s1, e1, [statusEvent("running")]);
+    await postWorkerEvents(server, s2, e2, [statusEvent("requires_action", "Approve the shell command?")]);
+
+    expect(server.sessions.get(s1)?.activity).toEqual({ kind: "running" });
+    expect(server.sessions.get(s2)?.activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve the shell command?",
+    });
+  });
+
+  it("normalizes a worker-supplied detail before it reaches GET /api/sessions", async () => {
+    // Folding §5 into the model means `activity.detail` now carries arbitrary WORKER bytes where
+    // it could previously only ever hold the fixed default. `ccctl attach` prints one line per
+    // session, so an unflattened newline forges a session row that does not exist, and an ANSI
+    // escape repaints the operator's terminal. Core normalizes at the trust boundary; this pins
+    // that the real §5 handler is actually ON that boundary, and that the API surface inherits it.
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    const forged = "Approve?\n  99999999-9999-9999-9999-999999999999  [ready] idle";
+    await postWorkerEvents(server, sessionId, epoch, [statusEvent("requires_action", forged)]);
+
+    const listed = await fetch(`${base(server)}/api/sessions`);
+    const body = (await listed.json()) as { sessions: { id: string; activity: { detail?: string } }[] };
+    const detail = body.sessions.find((s) => s.id === sessionId)?.activity.detail ?? "";
+    expect(detail).toBe("Approve? 99999999-9999-9999-9999-999999999999 [ready] idle");
+    expect(detail).not.toContain("\n");
+  });
+
+  it("a BARE §4 PUT re-affirming requires_action RETAINS the detail the §5 leg captured", async () => {
+    // The two legs both report a status, and the §4 gate has no detail field. Without the
+    // carry-forward the bare re-affirmation would reset the captured tool description to the
+    // generic default — AC2's detail would hold only until the worker's next status report.
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    await postWorkerEvents(server, sessionId, epoch, [
+      statusEvent("requires_action", "Approve the edit to src/index.ts?"),
+    ]);
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve the edit to src/index.ts?",
+    });
+  });
+
+  it("a §4 PUT that CHANGES the status drops the captured detail (the question it named is gone)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    await postWorkerEvents(server, sessionId, epoch, [
+      statusEvent("requires_action", "Approve the edit to src/index.ts?"),
+    ]);
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity).toEqual({ kind: "idle" });
+  });
+});
+
 describe("§4 worker heartbeat — POST …/worker/heartbeat", () => {
   it("refreshes liveness (200) and fails closed on an unknown session (404)", async () => {
     const server = await startTestServer();

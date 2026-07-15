@@ -19,13 +19,17 @@
  *     it (turn injection / steer relay).
  *   - `POST …/worker/events` `{ worker_epoch, events: [{ payload }] }` → the upstream
  *     transcript leg ({@link handleWorkerEvents}); each payload is relayed to the UI
- *     SSE (#13, {@link broadcastEvent}) — this is where a turn's output returns.
+ *     SSE (#13, {@link broadcastEvent}) — this is where a turn's output returns — and a
+ *     `worker_status` payload ALSO feeds the session's `activity` ({@link foldWorkerStatus},
+ *     #39). This is the leg carrying the RICH frame (`payload: { status, detail }`), so it
+ *     is where the human-ready detail enters the model.
  *   - `PUT …/worker` `{ worker_status, worker_epoch, external_metadata }` → the status
  *     gate ({@link handleWorkerStatus}); `idle` means "ready for a turn". It MUST `200`
  *     or the worker exits. The server derives the session's `activity` from it
- *     ({@link applyWorkerStatus}). `GET …/worker` on the SAME bare path is the child's
- *     worker-state restore ({@link handleWorkerStateRestore}) — an empty `200` (issue
- *     #154); the path is method-multiplexed (GET restore / PUT status).
+ *     ({@link applyWorkerStatus}) — a BARE status, no detail field, so a `requires_action`
+ *     re-affirmation keeps the detail §5 captured. `GET …/worker` on the SAME bare path is
+ *     the child's worker-state restore ({@link handleWorkerStateRestore}) — an empty `200`
+ *     (issue #154); the path is method-multiplexed (GET restore / PUT status).
  *   - `POST …/worker/heartbeat` → liveness ({@link handleWorkerHeartbeat},
  *     {@link recordHeartbeat}); `POST …/worker/events/delivery`
  *     `{ worker_epoch, updates: [{ event_id, status }] }` → the worker's per-event
@@ -51,11 +55,13 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   applyWorkerStatus,
+  applyWorkerStatusFrame,
   BRIDGE_PROTOCOL_API_VERSION,
   isSessionStale,
   isWorkerStatus,
   markSessionReady,
   recordHeartbeat,
+  type ControlFrame,
   type ControlRequest,
   type JsonValue,
   type Session,
@@ -384,11 +390,42 @@ export function handleWorkerEventsStream(
 }
 
 /**
+ * Fold a §5 payload into the session's classification when it is a `worker_status` frame
+ * (#39). This is the leg that carries the RICH frame — `payload: { status, detail }` — so it
+ * is the ONLY place the human-ready tool description enters the session model; the §4 gate
+ * ({@link handleWorkerStatus}) reports a bare status with no detail field at all.
+ *
+ * Additive to the verbatim relay, never a substitute: the UI decodes the same frame itself to
+ * render the in-place current-turn indicator (#15), so the relay stays byte-identical.
+ *
+ * Fail-soft, matching the batch contract: {@link applyWorkerStatusFrame} returns the session
+ * unchanged for any payload that is not a well-formed `worker_status` (a transcript line, an
+ * unknown status, a scalar), so a non-status entry is simply a no-op here.
+ */
+function foldWorkerStatus(state: WorkerChannelState, sessionId: string, payload: unknown): void {
+  // A relayed payload is whatever the worker sent, so it is read back as `unknown` and narrowed
+  // to a plain object before the cast — the same stance `decodeControlFrame` takes over a
+  // decoded line. `applyWorkerStatusFrame`'s own guard does the rest of the validation.
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return;
+  }
+  const session = state.sessions.get(sessionId);
+  if (session === undefined) {
+    return;
+  }
+  const next = applyWorkerStatusFrame(session, payload as ControlFrame);
+  if (next !== session) {
+    state.sessions.set(sessionId, next);
+  }
+}
+
+/**
  * `POST …/worker/events` (§5). The upstream transcript leg: a batched
  * `{ worker_epoch, events: [{ payload }] }`. Each payload is a raw `stream-json`
  * message the server relays to the UI SSE (#13) — this is where a turn's output
- * returns. Fails closed 404 (unknown session), 409 (superseded epoch), or 400
- * (malformed body). MUST `200` on success.
+ * returns — and a `worker_status` payload ALSO feeds the session's classification
+ * ({@link foldWorkerStatus}, #39). Fails closed 404 (unknown session), 409 (superseded
+ * epoch), or 400 (malformed body). MUST `200` on success.
  */
 export function handleWorkerEvents(
   req: IncomingMessage,
@@ -408,7 +445,10 @@ export function handleWorkerEvents(
       // than tearing down the batch — fail-soft per event, fail-closed only on the batch
       // envelope above.
       if (typeof entry === "object" && entry !== null && !Array.isArray(entry) && "payload" in entry) {
-        broadcastEvent(state.eventRelays, sessionId, (entry as { payload: JsonValue }).payload);
+        const { payload } = entry as { payload: JsonValue };
+        // Entries in one batch apply in order, so a batch carrying running→idle lands on idle.
+        foldWorkerStatus(state, sessionId, payload);
+        broadcastEvent(state.eventRelays, sessionId, payload);
       }
     }
     writeJson(res, 200, {});

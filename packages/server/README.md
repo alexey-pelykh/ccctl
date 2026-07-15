@@ -26,6 +26,25 @@ downstream, `worker/events` is the batched upstream, and `PUT worker` reports a
 (running / requires_action / idle) via the `@ccctl/core` model. A turn is injected
 by pushing a `client_event` frame down the SSE.
 
+**Both worker legs feed the classification (#39).** `PUT worker` carries a BARE
+`worker_status`; the RICH `worker_status` frame — `payload: { status, detail }`, whose
+`detail` is the human-ready line naming the tool or question the worker is blocked on —
+rides the `worker/events` upstream, which relays it to the UI _and_ folds it into the
+session's `activity`. That detail is what a "needs you" notification names, so it must
+reach the session model, not just the browser's transcript. A bare `requires_action`
+re-affirmation keeps the detail already captured: supplying no detail is not a statement
+that the detail is unknown. The detail is worker-supplied, so it is normalized where it
+enters the model — flattened to one line, control characters stripped, length clamped —
+and every consumer (`ccctl attach`'s session list, `GET /api/sessions`, the persisted
+snapshot) inherits that rather than re-deriving it.
+
+Classification is **per-session**, and applications are **last-write-wins in the server's
+receipt order**. It is NOT ordered by frame age: neither status leg carries a timestamp or
+a sequence number (`worker_epoch` orders registrations, not the frames within one), so the
+server has no frame age to order by. Detecting a genuinely stale frame needs the emitter —
+the patched worker — to stamp one, which is a protocol change, tracked in
+[#201](https://github.com/alexey-pelykh/ccctl/issues/201).
+
 **Two-credential boundary (hard).** The account Bearer rides §1/§2 ONLY — received
 and treated as a strict non-persisting pass-through: required, but never stored on
 the session, never logged, never returned in a body. The §3 poll carries no
