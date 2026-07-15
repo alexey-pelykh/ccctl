@@ -30,12 +30,21 @@
  *
  * **Fail closed, and say WHY (#33).** Every branch that cannot launch answers a status AND a
  * typed {@link LaunchFailureCode} — never a silent drop, and never an opaque 502 the UI can only
- * show as prose: a wrong method (405), no launcher configured (501 `launcher-absent`), a
+ * show as prose: a wrong method (405), no launcher configured (501 `launcher-absent`), the
+ * `maxSessions` cap already full (429 `at-capacity`, #36), a
  * malformed body (400 `malformed-request`), a non-prompting permission-mode that could never
  * raise the "awaiting input" signal a remotely-driven UC2 session needs (400
  * `non-prompting-mode`, SRV-C-003 launch half), a working directory that does not exist (400
  * `invalid-cwd`), or a launcher that could bring up no surface at all (502
  * `backend-unavailable` / `worker-not-found` / `spawn-failed`, as the backend classified it).
+ *
+ * **Bounded, because a launch is remotely triggerable (#36).** Every `POST /api/sessions` spawns a
+ * REAL terminal on the operator's host, and the caller is a phone across a tunnel — so a stuck
+ * button or a replaying proxy is a loop that spawns windows until the host dies, taking the
+ * operator's own sessions with it. `maxSessions` (default {@link DEFAULT_MAX_SESSIONS}) bounds the
+ * live-session count; a launch past it is refused rather than attempted. The cap is enforced in
+ * {@link launchSession} — the shared core — so the programmatic entry point is bounded by the same
+ * number, and it counts the whole registry, so UC1 attaches occupy slots exactly as UC2 launches do.
  *
  * The cwd is validated HERE, before any backend runs, rather than inferred from a backend's
  * failure: the tmux backend can only surface a bad directory as an opaque non-zero exit plus
@@ -83,6 +92,26 @@ import { UI_SESSIONS_PATH } from "./ui-sessions.js";
 const MAX_LAUNCH_BODY_BYTES = 1024 * 1024;
 
 /**
+ * Default ceiling (8) on how many sessions may be live at once (#36) — the `maxSessions` cap a
+ * launch past which is refused `at-capacity`. Overridable per server ({@link ServerConfig.maxSessions});
+ * exported so a caller (or a test) can name the default rather than re-hardcode `8`, exactly as
+ * {@link DEFAULT_REGISTRATION_TIMEOUT_MS} is.
+ *
+ * The cap exists because a launch is REMOTELY triggerable and each one spawns a real terminal: a
+ * phone-side retry loop (a stuck "New session" button, a flaky tunnel replaying a POST) would
+ * otherwise spawn terminals until the host runs out of pty/window/RAM — and the sessions it kills
+ * on the way down are the operator's, not the loop's (`SRV-B-003`).
+ *
+ * 8 is a human number, not a resource-derived one, and choosing it that way is deliberate: the
+ * budget being protected is the OPERATOR's (nobody drives 8 concurrent Claude sessions from a
+ * phone), and it sits far below any limit the host would actually hit — so the cap bites while the
+ * machine is still healthy, which is the only time a refusal is cheap. A host-derived cap (some
+ * fraction of RAM or file descriptors) would bind orders of magnitude too late to bound the loop
+ * this defends against, and would move under the operator's feet between machines.
+ */
+export const DEFAULT_MAX_SESSIONS = 8;
+
+/**
  * The "no launcher configured" reason, shared by the HTTP 501 and the programmatic throw so the
  * two entry points describe the one condition identically (single source of truth).
  */
@@ -111,6 +140,28 @@ function invalidCwdReason(cwd: string): string {
 }
 
 /**
+ * The "at the session cap" reason (#36). Names the NUMBERS — how many are live, and what the cap is
+ * — for the same reason {@link invalidCwdReason} echoes the path: the bare fact is not actionable.
+ * "At capacity" alone leaves the operator unable to tell a cap of 2 they forgot they configured from
+ * the default 8 they never chose, and both moves it offers (end one, or raise the cap) depend on
+ * knowing which.
+ *
+ * `live` may EXCEED `cap`, so the sentence is phrased to stay true when it does. The cap governs
+ * LAUNCHING, which is the only verb this server initiates; a §2 registration is a worker announcing
+ * a session that already exists, and refusing it would not un-spawn anything — so an operator who
+ * attaches 3 sessions by hand against a cap of 2 is over the cap and nothing is wrong. Reading
+ * "3 of 2 slots in use" would say the server had lost count; "3 sessions are live and the cap is 2"
+ * is the same two numbers telling the truth.
+ */
+function atCapacityReason(live: number, cap: number): string {
+  const sessions = live === 1 ? "1 session is" : `${live} sessions are`;
+  return (
+    `ccctl: at capacity — ${sessions} live and the cap is ${cap}, so this server will not launch another. ` +
+    "End a session to free a slot, or raise the cap (`maxSessions`)."
+  );
+}
+
+/**
  * The per-server state the launch ingress reads: the injected launcher (absent → this server
  * cannot launch, a fail-closed 501), the set of launched terminal handles to track for teardown,
  * and — since a launch now places a `registering` session in the registry until its worker checks
@@ -121,6 +172,35 @@ function invalidCwdReason(cwd: string): string {
 export interface SessionLaunchState extends PendingLaunchState {
   /** The injected session launcher, or `undefined` when this server was not configured with one. */
   readonly launcher: ISessionLauncher | undefined;
+  /**
+   * The ceiling on live sessions (#36) — a launch that would exceed it is refused `at-capacity`.
+   * Defaults to {@link DEFAULT_MAX_SESSIONS}; resolved and VALIDATED once at `startServer` (a
+   * non-positive-integer cap is refused there, so this is always a usable number) so the whole
+   * server reads one number.
+   *
+   * Counted against `sessions` (inherited from {@link PendingLaunchState}) — exactly the set the AC
+   * names, "all live sessions (launched and attached)" — plus {@link SessionLaunchState.launchReservations}.
+   * See {@link liveSessionCount}.
+   */
+  readonly maxSessions: number;
+  /**
+   * Slots held by launches that are IN FLIGHT (#36) — taken before the launcher is called and released
+   * once it settles, so a launch occupies a slot for the whole window in which it has no registry row
+   * yet but is already bringing a terminal up.
+   *
+   * That window is the entire reason this exists. A launch's row is written only AFTER its surface
+   * comes up (#33's no-ghost invariant, which this must not weaken — hence a set of its own rather
+   * than a placeholder row), and bringing a surface up is slow: tmux shells out, the pty forks. Every
+   * concurrent launch in that window would otherwise read the same pre-launch `sessions.size`, pass
+   * the cap, and spawn — so the cap would bound a sequential caller and nothing else, which is the
+   * opposite of the loop it exists to bound.
+   *
+   * A `Set` of unique tokens rather than a counter, matching the shape of every other bookkeeping
+   * field on this state (`launchedSessions`, `pendingLaunches`): its `size` IS the reading, a token
+   * cannot be released twice, and there is no `-= 1` to be forgotten on a path that throws — a leaked
+   * decrement would permanently shrink the cap for the life of the process.
+   */
+  readonly launchReservations: Set<symbol>;
 }
 
 /**
@@ -174,9 +254,23 @@ export interface LaunchFailureWire {
  * parse, a mode we refuse, a directory that does not exist; a server that was never wired to
  * launch is `501` (not implemented HERE, which is exactly true); and a host that could bring no
  * surface up is `502` — the launch was well-formed and we could not honor it.
+ *
+ * `at-capacity` is `429` (#36), and the reasoning is worth pinning because the obvious alternative
+ * is `503`. It is a `4xx` by this map's own rule: the launch is REFUSED BY POLICY, not failed by the
+ * host — the same shape as `non-prompting-mode` (also a well-formed request this server declines),
+ * and the operator is the one who acts (end a session, or raise the cap). A `503` would say the
+ * service is unavailable, which is false in the way that matters: the server is healthy, the other
+ * 8 sessions are live and steerable, and only this one verb is declining. Within `4xx`, `429` is the
+ * member that means "you may not have more of this right now" — its RFC 6585 gloss says "rate
+ * limiting" ("too many requests in a given amount of time"), and this is a CONCURRENCY ceiling
+ * rather than a rate, but the reading is the established one for a resource cap and it carries the
+ * one thing a client must know: retrying the identical request later can succeed. No `Retry-After`
+ * accompanies it — a slot frees when a human ends a session, which this server cannot predict, and
+ * a guessed delay would be a fabricated promise.
  */
 const LAUNCH_FAILURE_STATUS: Record<LaunchFailureCode, number> = {
   "launcher-absent": 501,
+  "at-capacity": 429,
   "malformed-request": 400,
   "non-prompting-mode": 400,
   "invalid-cwd": 400,
@@ -251,30 +345,86 @@ export interface LaunchOutcome {
 }
 
 /**
+ * How many slots are TAKEN right now — the number the `maxSessions` cap is measured against (#36).
+ * Two disjoint halves, because a session occupies a slot from the instant its terminal starts coming
+ * up, which is strictly before it has a registry row:
+ *
+ *   - `sessions` — the registry, which IS the AC's "all live sessions (launched and attached)";
+ *   - `launchReservations` — the launches in flight, holding slots they have not yet turned into rows
+ *     (see {@link SessionLaunchState.launchReservations}; without this half the cap bounds only a
+ *     sequential caller).
+ *
+ * Disjoint by construction: a launch's reservation is released only after `trackPendingLaunch` has
+ * written its row, and with no `await` in between — so a launch is counted exactly once throughout,
+ * never twice and never zero times.
+ *
+ * That the registry half needs no bookkeeping of its own is a property worth stating, because the
+ * cheap-looking alternatives are each subtly wrong:
+ *
+ *   - `launchedSessions` counts only surfaces THIS server launched — a host filled by UC1 attaches
+ *     would still launch its 9th terminal;
+ *   - `pendingLaunches` counts only the not-yet-registered — it empties as workers check in, so a
+ *     loop would be capped only while its sessions were still booting, which is no cap at all.
+ *
+ * Every write to the registry is one of: a launch placing its `registering` row from birth
+ * (`pending-launch.ts`), a §2 registration minting a UC1 attach (`environments-bridge.ts`), a
+ * rehydrated survivor of the across-restart reaper (`session-reconcile.ts`), or an in-place status
+ * advance (`worker-channel.ts`) that changes no count. Every removal is an END: the ghost-reaper
+ * evicting an unregistered launch, or a worker channel driving to `closed`. So the size rises with
+ * every session that begins and falls with every session that ends, from either use case — which is
+ * exactly the cap's contract, and is why a slot frees with no new plumbing (AC3).
+ *
+ * Counting `registering` rows is load-bearing, not incidental. They are the whole hazard: a retry
+ * loop's terminals are all still `registering` (nothing has had time to check in), so a cap that
+ * waited for registration would let the loop spawn every window it wanted before the first one
+ * counted. A session's terminal is real from launch, so it occupies a slot from launch.
+ */
+function liveSessionCount(state: SessionLaunchState): number {
+  return state.sessions.size + state.launchReservations.size;
+}
+
+/**
  * Launch a session, TRACK its terminal, and place it in the registry as `registering` — the shared
  * core behind both the HTTP ingress and the programmatic {@link CcctlServer.launchSession}, so
  * NEITHER entry point can create a session that nothing will ever reap (a programmatic launch that
  * skipped the pending-launch bookkeeping would leave exactly the ghost #33 exists to prevent).
  *
  * Every refusal is a typed {@link SessionLaunchError}: no launcher configured (`launcher-absent`),
- * a non-prompting permission-mode (`non-prompting-mode` — `acceptEdits` / `bypassPermissions`, a
+ * every slot under the `maxSessions` cap already held by a live session (`at-capacity`, #36), a
+ * non-prompting permission-mode (`non-prompting-mode` — `acceptEdits` / `bypassPermissions`, a
  * session that could never raise the "awaiting input" signal a remotely-driven UC2 session needs;
  * the sibling attach half, #26, can only MARK such a session degraded, but the launch half CONTROLS
  * the mode, so it enforces prompting), or a working directory that does not exist (`invalid-cwd`).
  * A launcher reject propagates with the code the BACKEND classified it as. The HTTP handler maps
  * each code to its status; a programmatic caller reads `error.code` directly.
  *
- * The guards run BEFORE the launcher, in cheapest-first order, so a refused launch spawns nothing
- * at all and touches no state. On success — and only then — the handle is recorded (so
- * {@link releaseLaunchedSessions} tears the terminal down on shutdown) and the `registering` session
- * + its eviction timer are armed ({@link trackPendingLaunch}). Mirrors the {@link injectUserTurn}
- * shared-core seam (one behavior, two entry points).
+ * The cap lives HERE, in the shared core, rather than at the HTTP ingress — and that placement is the
+ * guarantee, not a tidiness preference. #36 exists to bound a LOOP, and a cap a caller can walk around
+ * by picking the other entry point bounds nothing; this is the one seam every launch passes through.
+ *
+ * The guards run BEFORE the launcher, so a refused launch spawns nothing at all and touches no state.
+ * Their ORDER follows the existing `launcher-absent`-first shape: first what makes this server unable
+ * to launch ANYTHING right now (no launcher; no free slot) — neither of which the request can fix —
+ * then what makes THIS launch illegal (its mode, its cwd). Within that, still cheapest-first: the cap
+ * is two in-memory `.size` reads, ahead of the two `realpath`/`stat` syscalls the cwd pre-flight
+ * costs. So a loop hammering a full server is refused without touching the filesystem at all.
+ *
+ * On success — and only then — the handle is recorded (so {@link releaseLaunchedSessions} tears the
+ * terminal down on shutdown) and the `registering` session + its eviction timer are armed
+ * ({@link trackPendingLaunch}). Mirrors the {@link injectUserTurn} shared-core seam (one behavior,
+ * two entry points).
  *
  * The backend is handed the RESOLVED cwd, never the operator's raw string — see below.
  */
 export async function launchSession(state: SessionLaunchState, options: SessionLaunchOptions): Promise<LaunchOutcome> {
   if (state.launcher === undefined) {
     throw new SessionLaunchError("launcher-absent", NO_LAUNCHER_CONFIGURED);
+  }
+  // The cap (#36). `>=` because this launch would be the (live + 1)-th: at the cap there is no slot
+  // left to take, so the cap-th session is the last one allowed rather than the first one refused.
+  const live = liveSessionCount(state);
+  if (live >= state.maxSessions) {
+    throw new SessionLaunchError("at-capacity", atCapacityReason(live, state.maxSessions));
   }
   if (isNonPromptingPermissionMode(options.permissionMode)) {
     throw new SessionLaunchError("non-prompting-mode", NON_PROMPTING_MODE_REFUSED);
@@ -293,12 +443,40 @@ export async function launchSession(state: SessionLaunchState, options: SessionL
   // a string this server never stored, the claim misses, and the eviction timer this launch just
   // armed reaps a session that is very much alive (#33; `pending-launch.ts` § Correlation).
   const resolved: SessionLaunchOptions = { ...options, cwd };
-  const launched = await state.launcher.launch(resolved);
-  // The surface is up. From here the session EXISTS — visible as `registering` until its worker
-  // registers (claim) or the timeout reaps it (evict). Both halves live in `pending-launch.ts`.
-  const sessionId = randomUUID();
-  trackPendingLaunch(state, sessionId, resolved, launched);
-  return { sessionId, launched };
+  // TAKE the slot before yielding to the launcher (#36). Everything from the count above to this line
+  // is synchronous — no `await` — so on JS's single thread the check and the take are ATOMIC: no
+  // second launch can observe the count between them. That is the whole concurrency argument, and it
+  // is why this needs no lock; it is also why the reservation must be taken HERE rather than after the
+  // launch, and why the cwd pre-flight being synchronous is load-bearing rather than incidental — it
+  // sits inside this window, so `resolveLaunchCwd` states the dependency at its own definition too,
+  // which is where someone would break it.
+  //
+  // Without it, `launch()` is a check-then-act race, and the cap is decorative exactly when it matters
+  // most: a burst all reads the same pre-launch count, all passes the guard, and all spawns. Not a
+  // theoretical interleaving — the spawn is SLOW (tmux shells out; the pty forks), so the window is
+  // milliseconds wide, and the caller is a phone across a tunnel whose retry loop is concurrent by
+  // nature. Measured on this code before the reservation existed: 40 concurrent POSTs against the
+  // default cap of 8 spawned 40 terminals. The tests cover it (a delayed launcher + a `Promise.all`
+  // burst) because a zero-delay fake resolves in a microtask and hides the race completely.
+  const reservation = Symbol("ccctl.launch-reservation");
+  state.launchReservations.add(reservation);
+  try {
+    const launched = await state.launcher.launch(resolved);
+    // The surface is up. From here the session EXISTS — visible as `registering` until its worker
+    // registers (claim) or the timeout reaps it (evict). Both halves live in `pending-launch.ts`.
+    const sessionId = randomUUID();
+    trackPendingLaunch(state, sessionId, resolved, launched);
+    return { sessionId, launched };
+  } finally {
+    // Release in a `finally`, so the slot is handed over on success and given back on failure. The
+    // handover is seamless: `trackPendingLaunch` has already written the `registering` row by the time
+    // this runs, and no `await` separates the two, so the slot never blinks out of the count — a gap
+    // there would let a concurrent launch slip through on a stale reading. On a REJECTED launch it
+    // gives the slot back and writes nothing, so a failed launch still touches no session state
+    // whatsoever (#33's "no half-registered ghost" invariant, which the reservation must not weaken:
+    // it is deliberately NOT the registry, precisely so a failure leaves no row behind).
+    state.launchReservations.delete(reservation);
+  }
 }
 
 /**

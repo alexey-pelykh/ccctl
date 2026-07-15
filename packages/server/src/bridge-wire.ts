@@ -172,8 +172,21 @@ export function toWorkItemWire(item: WorkItem): WorkItemWire {
 
 // --- shared guards ---
 
-/** A positive integer (a valid concurrent-session cap) — anything else fails closed. */
-function isPositiveInteger(value: unknown): value is number {
+/**
+ * A positive integer (a valid concurrent-session cap) — anything else fails closed.
+ *
+ * Exported because two different caps need the same SHAPE check, and one rule is better than two that
+ * can drift. Their REASONS differ, though, and only one of them is a safety property:
+ *
+ *   - the §1 environment's DECLARED `max_sessions` off the wire (here) is refused when malformed for
+ *     the ordinary ingress reason — this seam fails closed on protocol drift. The server RECORDS that
+ *     cap on the environment ({@link EnvironmentRecord}); it does not enforce it;
+ *   - this server's own ENFORCED `maxSessions` launch cap off its config (#36, validated at
+ *     `startServer`) is refused because a cap that is not a counting number cannot bound anything —
+ *     `NaN` above all, which makes every `live >= cap` comparison false and so silently DISABLES the
+ *     guard rather than failing it.
+ */
+export function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 

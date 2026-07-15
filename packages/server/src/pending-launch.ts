@@ -208,9 +208,15 @@ export function canonicalCwd(cwd: string): string {
  * while the correlation silently misses — and a missed correlation is not a benign no-op here, it
  * leaves an armed timer on a session that DID register.
  *
- * Synchronous by design: it runs once per launch, on a path the operator just typed, and an async
- * stat would buy nothing but a re-entrancy hazard on the ingress. Any error at all (`ENOENT`,
- * `ENOTDIR`, `EACCES`) reads as "not a usable directory" — fail closed.
+ * Synchronous by design — and since #36 that is a CONTRACT, not a preference. It runs once per launch
+ * on a path the operator just typed, so an async stat would buy nothing; what it would cost is the
+ * session cap's atomicity. This call sits between the cap's count and the reservation that takes a
+ * slot (`ui-session-launch.ts` § `launchSession`), and check-and-take is safe for one reason only:
+ * nothing between them awaits. An `await` in here re-opens the check-then-act window a concurrent
+ * burst drives straight through — every launch reading the same pre-launch count, passing the cap, and
+ * spawning — which is the cap silently becoming decorative rather than failing.
+ *
+ * Any error at all (`ENOENT`, `ENOTDIR`, `EACCES`) reads as "not a usable directory" — fail closed.
  *
  * And deliberately NOT behind an injected port, unlike this codebase's other impure edges
  * (`PtySpawner`, `TmuxRunner`, `RandomBytesSource`). Those are injected because they are
