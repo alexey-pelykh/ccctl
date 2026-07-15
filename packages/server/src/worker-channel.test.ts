@@ -15,7 +15,12 @@ import {
   workerRegisterPath,
 } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
-import { DEFAULT_SESSION_EVICTION_GRACE_MS, DEFAULT_WORKER_LIVENESS_INTERVAL_MS } from "./worker-channel.js";
+import {
+  DEFAULT_SESSION_EVICTION_GRACE_MS,
+  DEFAULT_SESSION_IDLE_THRESHOLD_MS,
+  DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
+  SESSION_IDLE_EVENT_TYPE,
+} from "./worker-channel.js";
 
 const ACCOUNT_BEARER = "oauth-account-secret-worker-abc123";
 
@@ -1046,5 +1051,179 @@ describe("§ UI event relay eviction — a terminally-gone session's relay is re
     expect(server.sessions.has(sessionId)).toBe(true);
     expect(server.hasSessionRelay(sessionId)).toBe(true);
     expect(ui.closed()).toBe(false);
+  });
+});
+
+// --- #41: per-session idle timer — raise an "idle > X" informational event ---
+
+/**
+ * Start a server whose #41 idle threshold is SHORT, so the idle timer fires within a test window. The
+ * eviction grace stays at its (long) default unless overridden — a short one would make the
+ * heartbeat-staleness fire-time guard race the idle threshold; the staleness test overrides it on purpose.
+ */
+async function startIdleServer(
+  sessionIdleThresholdMs: number,
+  overrides: { sessionEvictionGraceMs?: number } = {},
+): Promise<CcctlServer> {
+  const server = await startServer({ port: 0, host: DEFAULT_HOST, sessionIdleThresholdMs, ...overrides });
+  started.push(server);
+  return server;
+}
+
+/**
+ * The parsed "idle > X" informational payloads a UI subscriber received (#41): each event's `data` JSON
+ * is parsed and the set filtered to the {@link SESSION_IDLE_EVENT_TYPE} frames the server raises — so a
+ * verbatim worker payload relayed onto the same stream (e.g. the §5 worker_status frame) is excluded.
+ */
+function idleEvents(ui: {
+  received(): UiSseEvent[];
+}): { type: string; session_id: string; idle_threshold_ms: number }[] {
+  return ui
+    .received()
+    .map((event) => JSON.parse(event.data) as { type: string; session_id: string; idle_threshold_ms: number })
+    .filter((payload) => payload.type === SESSION_IDLE_EVENT_TYPE);
+}
+
+describe("§4/§5 per-session idle timer — raises an 'idle > X' informational event, resets on activity (#41)", () => {
+  const IDLE_MS = 40;
+
+  it("raises an 'idle > X' event NAMING the session once it stays idle past the threshold (AC1/AC2)", async () => {
+    const server = await startIdleServer(IDLE_MS);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // Observe idle — arms the per-session idle timer from the session's OWN observed idle state.
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+
+    await waitFor(() => idleEvents(ui).length >= 1);
+    const events = idleEvents(ui);
+    expect(events).toHaveLength(1);
+    // The event NAMES the session (AC2) and carries the threshold it crossed.
+    expect(events[0].session_id).toBe(sessionId);
+    expect(events[0].idle_threshold_ms).toBe(IDLE_MS);
+  });
+
+  it("resets the timer on a status change off idle — no event is raised (AC3)", async () => {
+    const server = await startIdleServer(IDLE_MS);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+    // Activity before the threshold elapses: the worker starts running. The idle timer must reset.
+    expect((await putStatus(server, sessionId, epoch, "running")).status).toBe(200);
+
+    // Well past the threshold — no idle event, because the running status reset the timer.
+    await new Promise((resolve) => setTimeout(resolve, IDLE_MS * 5));
+    expect(idleEvents(ui)).toEqual([]);
+  });
+
+  it("resets the timer when a new turn is injected — no event is raised (AC3)", async () => {
+    const server = await startIdleServer(IDLE_MS);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId); // a live downstream — injectTurn's precondition.
+    const ui = await openUiEventStream(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+    // A turn injected at the operator's hand is activity — it resets the idle clock.
+    server.injectTurn(sessionId, "run the migration");
+
+    await new Promise((resolve) => setTimeout(resolve, IDLE_MS * 5));
+    expect(idleEvents(ui)).toEqual([]);
+  });
+
+  it("times each session INDEPENDENTLY — two idle sessions each raise their OWN event, never cross-wired (AC1)", async () => {
+    const server = await startIdleServer(IDLE_MS);
+    const a = await registerSession(server);
+    const b = await registerSession(server);
+    const epochA = await registerWorker(server, a);
+    const epochB = await registerWorker(server, b);
+    const uiA = await openUiEventStream(server, a);
+    const uiB = await openUiEventStream(server, b);
+
+    expect((await putStatus(server, a, epochA, "idle")).status).toBe(200);
+    expect((await putStatus(server, b, epochB, "idle")).status).toBe(200);
+
+    await waitFor(() => idleEvents(uiA).length >= 1 && idleEvents(uiB).length >= 1);
+    // Each session's event names ITSELF on ITS OWN stream — independent per-session timers, and the
+    // event never reaches the other session's subscribers (#20).
+    expect(idleEvents(uiA).map((event) => event.session_id)).toEqual([a]);
+    expect(idleEvents(uiB).map((event) => event.session_id)).toEqual([b]);
+  });
+
+  it("does NOT raise the event for a session gone stale — 'idle > X' means idle AND alive (AC1 '+ heartbeat')", async () => {
+    // Idle threshold longer than the (short) staleness window, and no heartbeat ever sent: by the time
+    // the idle timer fires the session is heartbeat-stale, so the nudge is suppressed (eviction's job).
+    const server = await startIdleServer(60, { sessionEvictionGraceMs: 30 });
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 60 * 5));
+    expect(idleEvents(ui)).toEqual([]);
+  });
+
+  it("arms AT MOST ONE timer across a redundant idle re-affirmation — the event fires exactly once (AC2)", async () => {
+    const server = await startIdleServer(IDLE_MS);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // Two back-to-back idle observations before the threshold could elapse: the second must NOT arm a
+    // second concurrent timer (one continuous idle stretch is one event), so exactly one event fires.
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+
+    await waitFor(() => idleEvents(ui).length >= 1);
+    await new Promise((resolve) => setTimeout(resolve, IDLE_MS * 3)); // give any second timer time to (wrongly) fire.
+    expect(idleEvents(ui)).toHaveLength(1);
+  });
+
+  it("also arms off the §5 events leg's worker_status frame, not only the §4 status gate (AC1)", async () => {
+    const server = await startIdleServer(IDLE_MS);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // Drive idle via the §5 upstream worker/events leg (the rich-frame path) rather than the §4 PUT gate.
+    const res = await postWorkerEvents(server, sessionId, epoch, [
+      { type: "control_event", subtype: "worker_status", payload: { status: "idle" } },
+    ]);
+    expect(res.status).toBe(200);
+
+    await waitFor(() => idleEvents(ui).length >= 1);
+    expect(idleEvents(ui)[0].session_id).toBe(sessionId);
+  });
+
+  it("resets the timer on a §5 events-leg status change off idle — the reset holds on BOTH legs (AC3)", async () => {
+    const server = await startIdleServer(IDLE_MS);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // Arm via the §5 leg, then move off idle via the SAME leg: the §5 path must reset too, not only §4.
+    const armed = await postWorkerEvents(server, sessionId, epoch, [
+      { type: "control_event", subtype: "worker_status", payload: { status: "idle" } },
+    ]);
+    expect(armed.status).toBe(200);
+    const moved = await postWorkerEvents(server, sessionId, epoch, [
+      { type: "control_event", subtype: "worker_status", payload: { status: "running" } },
+    ]);
+    expect(moved.status).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, IDLE_MS * 5));
+    expect(idleEvents(ui)).toEqual([]);
+  });
+
+  it("defaults the idle threshold well above the liveness/eviction windows (a lull, not a per-turn nudge)", () => {
+    // The nudge is for a session an operator has LEFT idle — deliberately far above the 20s/30s
+    // liveness/eviction windows (which bound a worker presumed GONE), so it never fires right after a
+    // turn settles to idle.
+    expect(DEFAULT_SESSION_IDLE_THRESHOLD_MS).toBe(300_000);
+    expect(DEFAULT_SESSION_IDLE_THRESHOLD_MS).toBeGreaterThan(DEFAULT_SESSION_EVICTION_GRACE_MS);
   });
 });
