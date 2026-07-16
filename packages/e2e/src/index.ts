@@ -60,7 +60,28 @@
  *     it — which is the hole this closes. Fenced on CCCTL_E2E + CCCTL_E2E_TAILSCALE;
  *     skips-never-fakes (see `full-flow-gate.e2e.test.ts`), with its JUDGMENT proven
  *     credential-free in `full-flow-gate.test.ts` and its COMPOSITION hermetically in
- *     `full-flow-inference.test.ts`.
+ *     `full-flow-inference.test.ts`; and
+ *
+ *   - the LONG-RUN DAEMON SOAK (#69) — {@link driveDaemonSoak} + {@link classifyDaemonSoak}, the
+ *     one question a single pass structurally cannot ask. Every oracle above judges ONE pass, and a
+ *     leak of one handle per session lifecycle passes all of them: one pass leaks one handle,
+ *     nothing notices, every assertion is green. It is visible only as an ACCUMULATION. So this
+ *     keeps ONE daemon UP, runs repeated session lifecycles against it through its own ingress
+ *     (launch → §2 claim → worker downstream → stop), and reads #63's OWN FD/handle diagnostics
+ *     ({@link captureHandleReport}) between cycles: the count must return to baseline, and must not
+ *     climb. Two detectors, both AC2's words — accumulation (per TOTAL and per TYPE, because a
+ *     leaked resource while a pooled socket closes nets to zero and reads clean) and no monotonic
+ *     growth (the SLOW leak: a series that never comes back down, the only detector with no
+ *     tolerance). What it can see is bounded by what that endpoint answers — ref'd libuv resources
+ *     (in practice the sockets and pipes), NOT bare file descriptors (#68's `fstat` probe's
+ *     question) and NOT the daemon's per-session timers, which are all `.unref()`'d and therefore
+ *     invisible to it; `daemon-soak.ts`'s module doc states that boundary and who owns what.
+ *     AC1's "multiple days" is the
+ *     OPERATOR's lever ({@link SoakPlan}) and the verdict never lies about it
+ *     ({@link SoakReport.spannedMultiDay}). Fenced on CCCTL_E2E + CCCTL_E2E_SOAK — but the arm buys
+ *     only the SPAN: the compressed soak against a REAL daemon, its negative control, the
+ *     classifier AND the drive's own mechanics are all credential-free
+ *     (`daemon-soak-lifecycle.test.ts` + `daemon-soak.test.ts`), so they gate every run.
  *
  * The live-worker oracle drives the full happy path with a REAL patched worker and a
  * real egress to api.anthropic.com — fenced to the credentialed wave; the hermetic
@@ -104,3 +125,4 @@ export * from "./bearer-canary.js";
 export * from "./live-worker-oracle.js";
 export * from "./worker-idle-hold.js";
 export * from "./pty-handle-residual.js";
+export * from "./daemon-soak.js";
