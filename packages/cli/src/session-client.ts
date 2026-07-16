@@ -185,15 +185,24 @@ interface StopFailure {
  * not — that this is a `ccctl` command, run from a shell, with flags — earn a hint; for the rest the
  * daemon's own sentence is what the operator needs, and adding to it would be noise.
  *
- * `taken-over` is the hint that matters, and it is a TRANSLATION rather than an addition: the
- * daemon's sentence names its remedy in WIRE words — "re-send this stop with `{ force: true }`" —
- * which is exactly right for the browser and curl, and not something anyone can type at a shell.
- * `--force` is that same remedy spelled for this surface. Without it the daemon's advice is a dead
- * end for the operator who is holding the one thing that can act on it.
+ * The two forceable refusals are the hints that matter, and each is a TRANSLATION rather than an
+ * addition: the daemon's sentence names its remedy in WIRE words — "re-send this stop with
+ * `{ force: true }`" — which is exactly right for the browser and curl, and not something anyone can
+ * type at a shell. `--force` is that same remedy spelled for this surface. Without it the daemon's
+ * advice is a dead end for the operator who is holding the one thing that can act on it.
+ *
+ * `liveness-indeterminate` (#197) earns the same hint for the same reason and NOT by resemblance to its
+ * sibling: the daemon reached the session's host and the host would not say what the surface is, so it
+ * refuses for want of the operator's say-so — which `--force` is. Its sibling `liveness-unknown` reads
+ * almost identically and gets NO hint, deliberately: there the host could not be reached at all, force
+ * does not override it, and a `--force` suggestion would send the operator to spend a destructive flag
+ * on a refusal it cannot move. A hint that names a remedy which does not work is worse than the silence
+ * this table keeps for every other code.
  */
 const STOP_FAILURE_HINTS: Partial<Record<StopFailureCode, string>> = {
   "unknown-session": "Run `ccctl attach` to see the running sessions",
   "taken-over": "Re-run with `--force` if you are sure",
+  "liveness-indeterminate": "Re-run with `--force` if you are sure",
 };
 
 /** Read a failed stop's `{ error, code }` body, or `null` when it is not one (an older daemon, a proxy). */
@@ -221,9 +230,11 @@ async function readStopFailure(res: Response): Promise<StopFailure | null> {
 /**
  * Turn a failed `POST /api/sessions/{id}/stop` into a clear, actionable CLI error, branching on the
  * TYPED {@link StopFailureCode} rather than the HTTP status — the exact shape of
- * {@link launchError}, and for a sharper reason: four distinct refusals share `409`, so the status
- * alone cannot tell "someone is driving it" from "the backend could not be read", and those are
+ * {@link launchError}, and for a sharper reason: five distinct refusals share `409`, so the status
+ * alone cannot tell "someone is driving it" from "the backend could not be reached", and those are
  * fixed by completely different actions (one by `--force`, the other by nothing this shell can do).
+ * Two of those five are even spelled alike — `liveness-unknown` and `liveness-indeterminate` (#197) —
+ * and take opposite hints, which is precisely why this branches on the code and not on prose.
  *
  * The daemon's own `error` sentence is already actionable, so it is carried through verbatim as the
  * message; the code selects the ADDED hint. A body with no recognizable code — an older daemon, a

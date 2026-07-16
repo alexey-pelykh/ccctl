@@ -446,7 +446,7 @@ describe("createTmuxSessionLauncher (#29 tmux backend)", () => {
       await expect(session.liveness()).resolves.toBe("alive-server-owned");
     });
 
-    it("answers `unknown` when tmux cannot be asked at all — never `alive-server-owned` (AC5)", async () => {
+    it("answers `host-unreachable` when tmux cannot be asked at all — never `alive-server-owned` (AC5)", async () => {
       // No tmux server is running (a real `list-windows` exits 1 there), the binary is gone, the socket
       // is unreachable. We do not know what became of this window — and a probe that cannot see must
       // never be optimized into permission to kill.
@@ -456,9 +456,12 @@ describe("createTmuxSessionLauncher (#29 tmux backend)", () => {
       const launcher = createTmuxSessionLauncher({ runner, workerCommand, workerBinaryProbe: workerBinaryFound });
       const session = await launcher.launch({ cwd: "/repo", permissionMode: "default" });
 
-      // It RESOLVES `unknown` rather than rejecting: the reading is the backend's honest answer, not an
-      // error for the release rule to interpret.
-      await expect(session.liveness()).resolves.toBe("unknown");
+      // It RESOLVES `host-unreachable` rather than rejecting: the reading is the backend's honest
+      // answer, not an error for the release rule to interpret. And it is that reading rather than
+      // `surface-indeterminate` (#197) because what failed here is the CHANNEL — tmux could not be
+      // ASKED. Reporting the sibling would assert this runner works, which is what force spends a kill
+      // on and what a post-close re-read would then believe.
+      await expect(session.liveness()).resolves.toBe("host-unreachable");
     });
 
     it("re-probes on every call — a reading is never cached from launch", async () => {

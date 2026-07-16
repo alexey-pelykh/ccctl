@@ -80,8 +80,8 @@ export interface TerminalAttachment {
 
 /**
  * What one READING of a launched surface says about it (#35) — the answer the safe-teardown rule
- * (`session-release.ts`) decides by before it may close anything. Four values, because teardown has
- * three distinct dispositions and one of them must be reachable without certainty:
+ * (`session-release.ts`) decides by before it may close anything. Five values: three that SAW the
+ * surface, and two that did not — because a probe that cannot see must be able to say WHY it cannot.
  *
  *   - `alive-server-owned` — the surface is up and STILL THIS SERVER'S: nobody took it over, so
  *     tearing it down destroys nothing but what we ourselves brought up.
@@ -90,38 +90,75 @@ export interface TerminalAttachment {
  *     must never do (`SRV-B-003`).
  *   - `exited` — the surface is already gone (the worker exited, the operator closed the window).
  *     Teardown is a no-op: there is nothing left to close and nothing to be sorry about.
- *   - `unknown` — the backend could not tell. A FIRST-CLASS answer, not a failure to paper over:
- *     a probe that cannot see the surface must be able to SAY so, because the alternative is
- *     guessing, and one of the two guesses kills live work.
+ *   - `host-unreachable` — the backend could not reach the HOST that would know: the tmux CLI would
+ *     not run, a socket was refused, a probe threw. Nothing was learned about the surface itself.
+ *   - `surface-indeterminate` — the backend REACHED the host and the host would not say: a read that
+ *     timed out against a live daemon, a probe that raced a reconnect, a backend whose answer was
+ *     genuinely inconclusive. The surface may be anything; the channel to it works.
+ *
+ * Both non-answers are FIRST-CLASS, not failures to paper over: a probe that cannot see the surface
+ * must be able to SAY so, because the alternative is guessing, and one of the two guesses kills live
+ * work.
+ *
+ * **Why the non-answer is TWO readings and not one — the distinction is the whole of #197.** Until
+ * that issue these were a single `unknown`, and both rules that consume it had to make a
+ * defensible-but-lossy call, because the word could not tell them the one thing they each needed:
+ * IS THE CHANNEL TO THE SURFACE WORKING? That is not a detail about the reading, it is a fact about
+ * what `close()` will do next, and the two rules need opposite halves of it:
+ *
+ *   - **force** ({@link FORCED_STOP_BY_LIVENESS}) may kill on a reading it cannot resolve ONLY if a
+ *     kill would actually travel. Through an unreachable host it would not — it would report
+ *     "stopped" having done nothing, which is the one answer an emergency-stop must never give. Down
+ *     a working channel it would, so the operator's explicit "kill it" can be honored.
+ *   - **the post-close re-read** ({@link stopLaunchedSession}) verifies a `close()` that CLAIMED to
+ *     work. A reading taken through an unreachable host is no evidence at all — least of all for a
+ *     backend like tmux whose `close()` swallows its own errors — so it must not be read as success.
+ *     One taken through a working channel is a backend declining to answer, which genuinely cannot
+ *     contradict the close.
+ *
+ * So the two readings differ in what they license, and a single word licensed the intersection: the
+ * cautious answer for both, which was wrong for one of them each time. Splitting them is not a
+ * finer taxonomy for its own sake — each half is a premise a rule was already reasoning about and
+ * could not observe.
  *
  * **Why this is not the boolean {@link ProcessLivenessProbe} the orphan-reaper (#34) uses.** That
  * probe decides whether to retain or evict a RECORD, and a record has no stake: get it wrong and a
  * row is wrong. This reading decides whether to KILL, so "alive" is not one state but two — alive
  * and ours, alive and theirs — and the difference between them is the entire safety property. A
- * boolean cannot carry it, and `unknown` has nowhere to live in one at all.
+ * boolean cannot carry it, and neither non-answer has anywhere to live in one at all.
  *
  * **`taken-over` is about SERVER OWNERSHIP, not tmux's attach state.** The word the AC uses for it
  * is "detached", meaning detached from THIS SERVER's ownership — the operator has taken the surface
  * over. It is the opposite of tmux's own "detached session" (which has no client and, for the tmux
  * backend, is precisely the still-ours case). The vocabulary here is ccctl's, deliberately, so the
  * rule reads as what it decides rather than as one backend's jargon.
+ *
+ * **Which non-answer a backend owes, stated plainly, because getting it backwards inverts a rule.**
+ * Report `host-unreachable` when the failure is the CHANNEL — you could not ask. Report
+ * `surface-indeterminate` only when you ASKED and got no usable answer back. When in doubt, report
+ * `host-unreachable`: it is the conservative half (force will not flip it, and a close verified
+ * through it is not believed), so a backend that guesses wrong in that direction costs a refusal the
+ * operator can see and retry, while the other direction spends a kill on a channel that may be dead.
  */
-export type SurfaceLiveness = "alive-server-owned" | "taken-over" | "exited" | "unknown";
+export type SurfaceLiveness =
+  "alive-server-owned" | "taken-over" | "exited" | "host-unreachable" | "surface-indeterminate";
 
 /** The pinned {@link SurfaceLiveness} set, in one place, for the release rule's decision map and the tests. */
 export const SURFACE_LIVENESS_READINGS: readonly SurfaceLiveness[] = [
   "alive-server-owned",
   "taken-over",
   "exited",
-  "unknown",
+  "host-unreachable",
+  "surface-indeterminate",
 ];
 
 /**
  * Runtime guard for {@link SurfaceLiveness} — fails closed on anything outside the pinned set, exactly
  * as {@link isLaunchFailureCode} does for the other closed set that crosses this port. Structural
  * rather than by identity, so a reading that crossed a module boundary is still recognized; but a word
- * this server does not know is NOT one it will act on — the release rule reads it as `unknown`
- * ({@link releaseLaunchedSession}), which is the do-not-kill side.
+ * this server does not know is NOT one it will act on — the release rule reads it as `host-unreachable`
+ * ({@link readLiveness}), the most conservative of the five: do-not-kill even under force, and no
+ * evidence that a close worked.
  */
 export function isSurfaceLiveness(value: unknown): value is SurfaceLiveness {
   return typeof value === "string" && (SURFACE_LIVENESS_READINGS as readonly string[]).includes(value);
@@ -152,12 +189,14 @@ export interface LaunchedSession {
    *
    * **REQUIRED, not optional, and that is a safety choice.** An optional probe has no safe default:
    * absent-reads-as-alive silently kills the operator's session (the bug this exists to fix), and
-   * absent-reads-as-unknown silently leaks every surface on every shutdown. So every backend must
+   * absent-reads-as-a-non-answer silently leaks every surface on every shutdown. So every backend must
    * answer, and `tsc` — not a doc comment — is what holds a backend to it.
    *
-   * MAY reject: a probe that throws is read as `unknown` by {@link releaseLaunchedSession}, which is
-   * the safe direction, so a backend never has to invent an answer to avoid throwing. Returning
-   * `unknown` explicitly is preferred where the backend knows it cannot see.
+   * MAY reject: a probe that throws is read as `host-unreachable` by {@link readLiveness} — the most
+   * conservative reading — so a backend never has to invent an answer to avoid throwing. Answering
+   * explicitly is preferred where the backend knows it cannot see, and a backend that knows WHICH way
+   * it could not see owes the matching reading: `host-unreachable` when it could not ask at all,
+   * `surface-indeterminate` when it asked and got nothing usable back ({@link SurfaceLiveness}).
    */
   liveness(): Promise<SurfaceLiveness>;
   /**

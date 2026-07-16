@@ -326,10 +326,13 @@ describe("createPtySessionLauncher (#30 owned-pty backend)", () => {
   });
 });
 
-// The owned pty's liveness reading (#35). Only TWO of the four readings are reachable here, and that
+// The owned pty's liveness reading (#35). Only TWO of the five readings are reachable here, and that
 // is a property of this backend rather than a gap: `taken-over` needs a surface an operator can reach,
-// and this one is explicitly not attachable; `unknown` needs a host to interrogate, and this backend
-// owns its child and watches it exit directly.
+// and this one is explicitly not attachable; `host-unreachable` needs a host to interrogate, and this
+// backend owns its child and watches it exit directly; `surface-indeterminate` needs a host that was
+// ASKED and would not answer, and this backend asks nobody — it watches. That totality is load-bearing
+// for shutdown (`session-launcher-pty.ts` § liveness): every reading it CAN make is one the release
+// rule tears down or treats as gone, so an owned pty is always reaped and never leaks its child.
 describe("createPtySessionLauncher liveness (#35)", () => {
   it("reads a running pty as `alive-server-owned` — the server owns this child", async () => {
     const { pty } = makeFakePty();

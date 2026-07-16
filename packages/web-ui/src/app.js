@@ -589,7 +589,7 @@ async function loadSessions() {
     activityEl.hidden = true;
     // Nothing selected: there is nothing to stop.
     renderStopControl();
-    // Drop a REFUSAL — its subject is gone, so it is stale news, and (for `taken-over`) it carries a
+    // Drop a REFUSAL — its subject is gone, so it is stale news, and (for a forceable one) it carries a
     // live "Stop anyway" button that would otherwise outlive the session it points at. A SUCCESS
     // line stays: this is the branch a successful stop itself arrives on, so clearing it would wipe
     // the "stopped … — closed" answer the operator is reading.
@@ -799,8 +799,8 @@ async function submitLaunch(request) {
  * The region is `aria-live`, so each outcome is announced once.
  *
  * `onForce`, when given, appends the escalation button. It is passed ONLY for a refusal `stop.js`
- * marked forceable (`taken-over`), so force is never a standing control — it exists for one refusal,
- * for as long as that refusal is on screen, and the next outcome replaces it. That makes the
+ * marked forceable (`taken-over`, `liveness-indeterminate`), so force is never a standing control — it
+ * exists for as long as such a refusal is on screen, and the next outcome replaces it. That makes the
  * two-step (stop → refused → stop anyway) a confirm by construction rather than a dialog bolted on.
  */
 function renderStopStatus(state, text, code, onForce) {
@@ -842,11 +842,13 @@ function renderStopStatus(state, text, code, onForce) {
  * `loadSessions` disconnects its stream and drops the current-turn indicator, which is a live claim
  * about a session that no longer exists. The TRANSCRIPT deliberately stays (see the `clear` branch).
  *
- * A refusal surfaces the server's TYPED code plus its actionable sentence — and, for the ONE refusal
- * force overrides (`taken-over`: someone is driving it at a terminal), an escalation that re-sends
- * the same stop with the operator's explicit consent. That consent is the whole of what force means:
- * the server refuses because it cannot know whether a human is at that terminal, and the operator
- * pressing this IS that human, saying they want it stopped.
+ * A refusal surfaces the server's TYPED code plus its actionable sentence — and, for the refusals force
+ * overrides (`taken-over`: someone is driving it at a terminal; `liveness-indeterminate`: the backend
+ * reached its host and the host would not describe the surface), an escalation that re-sends the same
+ * stop with the operator's explicit consent. Which refusals those are is `stop.js`'s call, read off
+ * `failure.forceable` rather than re-decided here. That consent is the whole of what force means: the
+ * server refuses for want of a fact only the operator has — that they want it stopped — and the
+ * operator pressing this is the one supplying it.
  *
  * Resolves TRUE when the server confirmed the session is over, and FALSE when it refused — which is
  * what {@link stop} re-enables the control from. The distinction is exactly the one that makes a
@@ -1551,9 +1553,10 @@ approveButtonEl.addEventListener("click", () => {
 });
 
 // stop: kill the SELECTED session's terminal outright (#77). Never forced from here — the plain stop
-// is the non-destructive-by-default one, and the server's `taken-over` refusal is what offers the
-// escalation. The button is disabled with no selection, so the guard below is the defensive second
-// half of that pair (for a click that raced a selection being cleared).
+// is the non-destructive-by-default one, and a forceable refusal from the server is what offers the
+// escalation (`stop.js` § isForceable owns which those are). The button is disabled with no selection,
+// so the guard below is the defensive second half of that pair (for a click that raced a selection
+// being cleared).
 stopButtonEl.addEventListener("click", () => {
   if (currentSessionId === null) {
     return;

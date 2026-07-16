@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { describe, expect, it } from "vitest";
+import { isSurfaceLiveness, SURFACE_LIVENESS_READINGS } from "./session-launcher.js";
 import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions, SurfaceLiveness } from "./session-launcher.js";
 
 // #28 ships the launcher PORT only — no backend (tmux #29 / owned-pty #30 follow). These
@@ -39,6 +40,44 @@ class FakePtyLauncher implements ISessionLauncher {
     });
   }
 }
+
+describe("SurfaceLiveness (the pinned set)", () => {
+  it("holds exactly the five readings — the ONE thing `tsc` does not check about this set", () => {
+    // `SURFACE_LIVENESS_READINGS` is typed `readonly SurfaceLiveness[]`, which accepts a SUBSET: a
+    // member can be dropped from the array while staying in the union, and the compiler is happy. Every
+    // exhaustive `Record<SurfaceLiveness, …>` in this package is checked against the UNION, so none of
+    // them notices either — and the rule tests that count "of the five readings" derive their five from
+    // this very array, so they would quietly under-test rather than fail.
+    //
+    // `host-unreachable` is the member that makes this worth a test rather than a nicety (#197): it is
+    // the fail-closed target of `readLiveness`, so guard-ACCEPTS and guard-REJECTS are observationally
+    // identical through the only boundary that narrows a backend's answer — drop it and the whole suite
+    // stays green while `isSurfaceLiveness` (public API, `index.ts`) silently rejects a reading a
+    // third-party backend is entitled to report. This literal is the gate.
+    expect(SURFACE_LIVENESS_READINGS).toEqual([
+      "alive-server-owned",
+      "taken-over",
+      "exited",
+      "host-unreachable",
+      "surface-indeterminate",
+    ]);
+  });
+
+  it("accepts every pinned reading and fails closed on anything else", () => {
+    for (const reading of SURFACE_LIVENESS_READINGS) {
+      expect(isSurfaceLiveness(reading)).toBe(true);
+    }
+    // Named literally, not derived: the loop above would pass a set that had lost one.
+    expect(isSurfaceLiveness("host-unreachable")).toBe(true);
+    expect(isSurfaceLiveness("surface-indeterminate")).toBe(true);
+    // The word #197 REPLACED. A backend still shipping it is a drifted build, and it must not be read
+    // as a reading this server knows — `readLiveness` files it as `host-unreachable`, the safe side.
+    expect(isSurfaceLiveness("unknown")).toBe(false);
+    for (const value of ["", "probably-fine", null, undefined, 7, {}]) {
+      expect(isSurfaceLiveness(value)).toBe(false);
+    }
+  });
+});
 
 describe("ISessionLauncher (contract)", () => {
   it("resolves with a handle carrying the surface's attachment", async () => {

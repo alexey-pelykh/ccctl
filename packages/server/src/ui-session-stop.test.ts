@@ -349,24 +349,75 @@ describe("POST /api/sessions/{id}/stop (emergency-stop)", () => {
   it("refuses a session whose liveness could not be READ — even forced, and says so precisely", async () => {
     // Distinct from `taken-over` on purpose. Both refuse, but they are different news and only one of
     // them is the operator's doing — telling them "you have this open at your desk" when the truth is
-    // "tmux did not answer" fabricates a claim they would act on. And force deliberately does not reach
-    // here: on the pty this reading is unreachable, and on tmux it means the CLI could not be reached
-    // at all — so `close()` would travel the same failed runner, swallow its error, and report a kill
-    // that never happened. See `session-release.ts` § FORCED_STOP_BY_LIVENESS.
+    // "tmux could not be reached" fabricates a claim they would act on. And force deliberately does not
+    // reach here: on the pty this reading is unreachable, and on tmux it means the CLI could not be
+    // reached at all — so `close()` would travel the same failed runner, swallow its error, and report a
+    // kill that never happened. See `session-release.ts` § FORCED_STOP_BY_LIVENESS.
     const { launcher, closeCount, setLiveness } = fakeLauncher();
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
     const sessionId = await launch(server);
-    setLiveness("unknown");
+    setLiveness("host-unreachable");
 
     const res = await postStop(server, sessionId, { force: true });
 
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string; code: string };
     expect(body.code).toBe("liveness-unknown");
-    expect(body.error).not.toContain("force"); // no force to offer: it would not work here.
+    // No force to OFFER: it would not work here. The sentence may explain that forcing is futile, but it
+    // must never read as an invitation — `\`{ force: true }\`` is the invitation this ingress writes for
+    // the refusals force resolves, and it must not appear on the one it does not.
+    expect(body.error).not.toContain("{ force: true }");
     expect(closeCount()).toBe(0);
     // Untouched — the session stays exactly as it was.
     expect(server.sessions.has(sessionId)).toBe(true);
+  });
+
+  // Rule: An indeterminate surface refuses UNFORCED and names the move that resolves it (#197).
+  //
+  //   Scenario: The operator stops a session whose reachable backend will not describe its surface
+  //     Given a launched session whose backend reached its host and got no usable answer back
+  //     When a stop is requested WITHOUT force
+  //     Then the stop is refused with its own typed code
+  //     And the refusal offers force, because force is what resolves it
+  it("refuses an indeterminate surface unforced, with its OWN code, and offers force (#197)", async () => {
+    // The wire half of #197. This reading and `host-unreachable` are one refusal to anything reading the
+    // status (both 409) and opposites to the operator: this one they can end from here. Sharing
+    // `liveness-unknown` would put a forceable refusal in the not-forceable bucket, and every client
+    // switching on the code — #77's stop button via `isForceable`, `ccctl stop`'s `--force` hint —
+    // would faithfully hide the one move that works.
+    const { launcher, closeCount, setLiveness } = fakeLauncher();
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
+    const sessionId = await launch(server);
+    setLiveness("surface-indeterminate");
+
+    const res = await postStop(server, sessionId, {});
+
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string; code: string };
+    expect(body.code).toBe("liveness-indeterminate");
+    // The remedy, named in the wire words this ingress's own clients translate.
+    expect(body.error).toContain("{ force: true }");
+    expect(closeCount()).toBe(0);
+    expect(server.sessions.has(sessionId)).toBe(true);
+  });
+
+  // Rule: An explicit force kills a surface whose reachable backend would not report on it (#197).
+  it("KILLS an indeterminate surface when forced, and ends the session (#197)", async () => {
+    // The end-to-end of the flipped cell, through the real ingress: the host is reachable, so the kill
+    // really travels — and everything the session owned is retired, exactly as on any other stop that
+    // leaves the surface gone.
+    const { launcher, closeCount, setLiveness } = fakeLauncher();
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
+    const sessionId = await launch(server);
+    setLiveness("surface-indeterminate");
+
+    const res = await postStop(server, sessionId, { force: true });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { sessionId: string; outcome: string; status: string };
+    expect(body).toMatchObject({ sessionId, outcome: "stopped" });
+    expect(closeCount()).toBe(1);
+    expect(server.sessions.has(sessionId)).toBe(false);
   });
 
   //   Scenario: The session already exited on its own
@@ -684,7 +735,7 @@ describe("CcctlServer.stopSession (programmatic)", () => {
     });
   });
 
-  it("forces when asked — the same one flipped cell, through the programmatic door", async () => {
+  it("forces when asked — the same `taken-over` flipped cell, through the programmatic door", async () => {
     const { launcher, closeCount, setLiveness } = fakeLauncher();
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
     const sessionId = await launch(server);

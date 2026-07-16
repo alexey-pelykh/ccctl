@@ -36,10 +36,18 @@ import { connectUiClient, waitFor } from "./one-session-harness.js";
 // so it must stay dependency-free), and a mirror is only as good as what pins it.
 //
 // What nothing here pins is the `StopFailureCode` SET's membership, deliberately, for the reason
-// `stop.js` gives: the reader passes an unrecognized code through verbatim, so an eighth code needs
-// no UI change. The CLI is the side that DOES gate membership — it narrows with the server's OWN
-// `isStopFailureCode` guard rather than a copy — so a drift there is a typecheck failure, not
+// `stop.js` gives: the reader passes an unrecognized code through verbatim, so a new code needs no UI
+// change to be DISPLAYED. The CLI is the side that DOES gate membership — it narrows with the server's
+// OWN `isStopFailureCode` guard rather than a copy — so a drift there is a typecheck failure, not
 // something this spec must catch.
+//
+// That reasoning is about DISPLAY, and #197 showed where it stops: `liveness-indeterminate` was the
+// eighth code, and it DID need a UI change — not to be shown, but because `isForceable` had to learn
+// that force resolves it. So the rule is narrower than "a new code needs no UI change": a new code
+// needs no UI change unless the UI must ACT on it, and then this spec is the only place that pins the
+// acting against a real ingress. Every code the UI treats specially is driven here for exactly that
+// reason (`taken-over`, and both `liveness-` codes — which are one word apart and opposite in what
+// they permit, the drift a shared-prefix shortcut would silently introduce).
 //
 // `ambiguous-surface` is the one refusal not driven here: #33's `mayHoldLiveWorker` is set only when
 // a REAL worker registers over §2 from one of two launches sharing a (cwd, mode), which a fake
@@ -331,13 +339,81 @@ describe("both paths drive the SAME server-side emergency-stop (#77 AC3)", () =>
 
     expect(browserRes.status).toBe(409);
     expect(browserFailure.code).toBe("taken-over");
-    // The web-ui offers its force escalation off exactly this code (and only this one).
+    // The web-ui offers its force escalation off this code (one of the two it offers it for — see the
+    // `liveness-indeterminate` spec below for the other).
     expect(isForceable(browserFailure.code)).toBe(true);
 
     // The CLI meets the SAME rule at the same reading — not a stricter or looser one of its own.
     await expect(runStop(server, viaCli)).rejects.toThrow(/taken over/);
 
     // Neither refusal touched its session: both are still exactly as they were, still stoppable.
+    expect((await listSessions(server)).map((row) => row.status)).toEqual(["registering", "registering"]);
+  });
+
+  it("agree that `liveness-indeterminate` is forceable — the OTHER refusal force resolves (#197)", async () => {
+    // #197 split the old `unknown` into an unreachable-host reading and an indeterminate-surface one,
+    // and gave the second its own wire code precisely because force RESOLVES it while its near-namesake
+    // `liveness-unknown` is beyond force. That distinction lives in the server; both readers must meet
+    // it, and neither may re-derive it. This is the spec that pins it against the REAL ingress — which
+    // matters more than usual here, because `stop.test.js`'s hand-copied `SERVER_FAILURE_CODES` fixture
+    // explicitly defers to THIS file for the codes' real behavior (`stop.js` itself mirrors no copy of
+    // the set at all), and because the two `liveness-` codes are one word apart and opposite in what
+    // they permit.
+    const { launcher } = fakeLauncher({ liveness: "surface-indeterminate" });
+    const server = await serve({ port: 0, launcher });
+    const viaBrowser = await launchOne(server);
+    const viaCli = await launchOne(server);
+
+    const browserRes = await postStop(server, viaBrowser, stopRequest());
+    const browserFailure = stopFailure(browserRes.status, await browserRes.json());
+
+    expect(browserRes.status).toBe(409);
+    expect(browserFailure.code).toBe("liveness-indeterminate");
+    // The whole point of the new code: the UI offers the escalation. Under the old shared
+    // `liveness-unknown` this would be `false` and the operator would have no way through.
+    expect(isForceable(browserFailure.code)).toBe(true);
+
+    // The CLI meets the same rule and translates the same remedy for ITS surface (`--force`, not
+    // `{ force: true }`).
+    await expect(runStop(server, viaCli)).rejects.toThrow(/--force/);
+
+    // And the escalation the UI just offered actually works — a forceable refusal that force cannot
+    // resolve would be the button-that-cannot-work this UI refuses to render.
+    const forced = await postStop(server, viaBrowser, stopRequest({ force: true }));
+    expect(await forced.json()).toEqual({ sessionId: viaBrowser, outcome: "stopped", status: "closed" });
+  });
+
+  it("keeps `liveness-unknown` NOT forceable — the sibling one word away, and beyond force (#197)", async () => {
+    // The other half of the split, and the one a `startsWith("liveness-")` shortcut would break: here
+    // the backend could not REACH its host, so a kill would travel the same dead channel and be
+    // confirmed by nobody. Both readers must decline to offer the escalation, and the server must
+    // refuse it even if one did.
+    const { launcher } = fakeLauncher({ liveness: "host-unreachable" });
+    const server = await serve({ port: 0, launcher });
+    const viaBrowser = await launchOne(server);
+    const viaCli = await launchOne(server);
+
+    const browserRes = await postStop(server, viaBrowser, stopRequest({ force: true }));
+    const browserFailure = stopFailure(browserRes.status, await browserRes.json());
+
+    expect(browserRes.status).toBe(409);
+    expect(browserFailure.code).toBe("liveness-unknown");
+    expect(isForceable(browserFailure.code)).toBe(false);
+
+    // The CLI is told the same thing, and — the property that matters — is NOT handed a `--force` hint
+    // it could not act on (`session-client.ts` § STOP_FAILURE_HINTS: "a hint that names a remedy which
+    // does not work is worse than the silence").
+    //
+    // Asserted on `--force`'s ABSENCE, and anchored on a clause only THIS refusal has. Both liveness
+    // sentences open `…'s terminal could not be read — `, and `stopError` APPENDS its hint to the
+    // daemon's sentence — so a `/could not be read/` match would pass whether or not the forbidden hint
+    // were there, and would pass against the sibling refusal too. It would gate nothing.
+    const unforceable = await runStop(server, viaCli, "--force").catch((error: unknown) => error as Error);
+    expect(unforceable.message).toMatch(/could not reach the host/);
+    expect(unforceable.message).not.toMatch(/--force/);
+
+    // Refused even WITH force, and untouched — a refusal changes nothing, which is what makes it safe
+    // to retry.
     expect((await listSessions(server)).map((row) => row.status)).toEqual(["registering", "registering"]);
   });
 

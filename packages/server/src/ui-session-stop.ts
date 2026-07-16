@@ -69,11 +69,14 @@ const MAX_STOP_BODY_BYTES = 4 * 1024;
  *   - this server HOLDS NO HANDLE to the session's terminal — `no-surface`. It did not launch it, so
  *     it cannot kill it. Permanent, and the operator acts at the terminal itself;
  *   - this server WILL NOT kill it, and the operator can change that — `taken-over` (they are driving
- *     it at their desk; `force` overrides, which is precisely what AC3 scopes force to);
+ *     it at their desk; `force` overrides, which is precisely what AC3 scopes force to) and
+ *     `liveness-indeterminate` (#197: the backend reached its host and the host would not say, so this
+ *     server does not know what the surface is — but the channel to it works, which means a forced kill
+ *     would really travel and would really be verified. Force overrides);
  *   - this server WILL NOT kill it, and NOTHING changes that — `ambiguous-surface` (the terminal may
- *     be running a DIFFERENT session's live worker) and `liveness-unknown` (the backend could not read
- *     it). Force does not reach either; see {@link stopSession} and `session-release.ts` for why each
- *     is a refusal force must not overrule rather than a strictness worth relaxing;
+ *     be running a DIFFERENT session's live worker) and `liveness-unknown` (the backend could not reach
+ *     its host at all). Force does not reach either; see {@link stopSession} and `session-release.ts`
+ *     for why each is a refusal force must not overrule rather than a strictness worth relaxing;
  *   - the operator's request is malformed — `malformed-request`;
  *   - anything else — `stop-failed`, the honest catch-all for a teardown that could not be completed
  *     for a reason this server cannot classify. The exact sibling of `spawn-failed` at the other end
@@ -86,6 +89,7 @@ export type StopFailureCode =
   | "ambiguous-surface"
   | "taken-over"
   | "liveness-unknown"
+  | "liveness-indeterminate"
   | "malformed-request"
   | "stop-failed";
 
@@ -96,6 +100,7 @@ export const STOP_FAILURE_CODES: readonly StopFailureCode[] = [
   "ambiguous-surface",
   "taken-over",
   "liveness-unknown",
+  "liveness-indeterminate",
   "malformed-request",
   "stop-failed",
 ];
@@ -154,6 +159,7 @@ const STOP_FAILURE_STATUS: Record<StopFailureCode, number> = {
   "ambiguous-surface": 409,
   "taken-over": 409,
   "liveness-unknown": 409,
+  "liveness-indeterminate": 409,
   "malformed-request": 400,
   "stop-failed": 502,
 };
@@ -191,16 +197,36 @@ function takenOverReason(sessionId: string, hint: string): string {
 }
 
 /**
- * The "the backend could not read this surface" refusal. Distinct from {@link takenOverReason} because
- * they are DIFFERENT NEWS and only one of them is the operator's doing — and force is deliberately not
- * offered here, since forcing on a reading nobody could take is how a stop reports a kill that did not
- * happen (`session-release.ts` § `FORCED_STOP_BY_LIVENESS`).
+ * The "the backend could not REACH the host that would know" refusal. Distinct from
+ * {@link takenOverReason} because they are DIFFERENT NEWS and only one of them is the operator's doing
+ * — and force is deliberately not offered here, since forcing on a surface whose host is unreachable is
+ * how a stop reports a kill that did not happen: the kill would travel the very channel that just
+ * failed (`session-release.ts` § `FORCED_STOP_BY_LIVENESS`).
  */
 function livenessUnknownReason(sessionId: string): string {
   return (
-    `ccctl: session ${sessionId}'s terminal could not be read — its backend did not answer, so this server ` +
-    "cannot tell whether the surface is still there or who has it, and will not kill what it cannot see. " +
+    `ccctl: session ${sessionId}'s terminal could not be read — its backend could not reach the host that ` +
+    "would know, so this server cannot tell whether the surface is still there or who has it, and will not " +
+    "kill what it cannot see. Forcing would not help: the kill would travel the same unreachable path. " +
     "If the backend itself is gone, the terminal went with it."
+  );
+}
+
+/**
+ * The "the backend reached its host and the host would not say" refusal (#197). The sibling of
+ * {@link livenessUnknownReason}, and split from it for exactly one reason: this is the non-answer force
+ * CAN act on, so the refusal that reports it must SAY so. The channel to the surface works, which is
+ * the premise a forced kill needs — it will really travel, and the post-close re-read will really
+ * verify it (`session-release.ts` § `FORCED_STOP_BY_LIVENESS`). Telling this operator "the backend did
+ * not answer" and stopping there would hand them the one refusal they could resolve while withholding
+ * the move that resolves it — the dead-end this ingress refuses to write anywhere else.
+ */
+function livenessIndeterminateReason(sessionId: string): string {
+  return (
+    `ccctl: session ${sessionId}'s terminal could not be read — its backend reached the host but got no ` +
+    "usable answer back, so this server cannot tell whether the surface is still there or who has it, and " +
+    "will not kill what it cannot see without being asked to. The host itself is reachable, so a forced " +
+    "stop would really reach the terminal: re-send this stop with `{ force: true }` if you are sure."
   );
 }
 
@@ -349,22 +375,57 @@ export interface SessionStopState extends SessionCloseState, WorkerChannelReapSt
 }
 
 /**
- * The ONE mapping from the reading a refused stop was decided from to the code that reports it. Kept
- * as an exhaustive `Record<SurfaceLiveness, StopFailureCode>` for the same reason the rule it mirrors
- * is one: a new reading cannot be added without `tsc` demanding the code a refusal on it would answer.
+ * The reason a reading that should never refuse would answer with. Deliberately says nothing about the
+ * surface: a refusal this server cannot explain must not borrow the words of one it can.
+ */
+function unexplainedRefusalReason(sessionId: string): string {
+  return `ccctl: session ${sessionId} could not be stopped`;
+}
+
+/**
+ * The ONE mapping from the reading a refused stop was decided from to the refusal that reports it —
+ * both halves of it, the machine-readable {@link StopFailureCode} and the sentence the operator reads.
+ * Kept as an exhaustive `Record<SurfaceLiveness, …>` for the same reason the rule it mirrors is one: a
+ * new reading cannot be added without `tsc` demanding the refusal it would answer.
  *
- * Only the two readings that CAN refuse have a truthful entry. `alive-server-owned` and `exited` never
+ * **The reason lives in the table rather than in a branch on the code, and that is the lesson of #197.**
+ * A `Record<SurfaceLiveness, StopFailureCode>` paired with an `if (code === …)` ladder picking the
+ * sentence is exhaustive in the half `tsc` checks and unguarded in the half it does not: the code is
+ * demanded, the sentence falls through to {@link unexplainedRefusalReason}. So a future reading with a
+ * code of its own — exactly what `surface-indeterminate` was — compiles green while answering a refusal
+ * this server CAN name with the sentence reserved for one it cannot (see the next paragraph), which is
+ * the "something unexplainable happened" report given for a case that is fully explained. Pairing them
+ * here makes the two halves impossible to add one at a time. The same instinct as `session-release.ts`
+ * keeping its forced table whole rather than spreading the unforced one over it: a cell you inherit is
+ * a cell nobody decided.
+ *
+ * Only the three readings that CAN refuse have a truthful entry. `alive-server-owned` and `exited` never
  * reach this map — every table in `session-release.ts`, forced or not, dispositions them to
  * `tear-down` / `no-op` — so their entries exist to satisfy exhaustiveness and are filed as
  * `stop-failed`: if one ever DID arrive here, the honest report is that something the server cannot
- * explain happened, not a refusal it can name. That is the same instinct as the `unknown` cell in the
+ * explain happened, not a refusal it can name. That is the same instinct as the non-answer cells in the
  * release rule — a value this server does not expect must not be dressed up as one it does.
+ *
+ * **The two non-answers get two codes (#197), and that is the wire earning its keep.** They are one
+ * refusal to a reader who only sees `409`, and two completely different situations to the operator:
+ * `liveness-unknown` cannot be resolved by anything they can do from here, while `liveness-indeterminate`
+ * is resolved by `force`. That is the SAME distinction this set's own partition already draws for
+ * `taken-over` — "it will not kill it and the operator CAN change that" — so collapsing the two would
+ * put a forceable refusal in the not-forceable bucket, and every client switching on the code (#77's
+ * stop button via `isForceable`, `ccctl stop`'s `--force` hint) would faithfully hide the one move that
+ * works. A distinction the rule makes and the wire does not is a distinction the operator does not have.
  */
-const REFUSAL_BY_LIVENESS: Record<SurfaceLiveness, StopFailureCode> = {
-  "alive-server-owned": "stop-failed",
-  "taken-over": "taken-over",
-  exited: "stop-failed",
-  unknown: "liveness-unknown",
+const REFUSAL_BY_LIVENESS: Record<
+  SurfaceLiveness,
+  { readonly code: StopFailureCode; readonly reason: (sessionId: string, hint: string) => string }
+> = {
+  "alive-server-owned": { code: "stop-failed", reason: unexplainedRefusalReason },
+  "taken-over": { code: "taken-over", reason: takenOverReason },
+  exited: { code: "stop-failed", reason: unexplainedRefusalReason },
+  "host-unreachable": { code: "liveness-unknown", reason: livenessUnknownReason },
+  // Reachable ONLY unforced: forced, `FORCED_STOP_BY_LIVENESS` tears this reading down rather than
+  // refusing it — so this cell is, by construction, always a refusal that force resolves.
+  "surface-indeterminate": { code: "liveness-indeterminate", reason: livenessIndeterminateReason },
 };
 
 /**
@@ -372,16 +433,15 @@ const REFUSAL_BY_LIVENESS: Record<SurfaceLiveness, StopFailureCode> = {
  * is the one the DECISION was made on ({@link StopOutcome}), never a fresh probe — re-reading to
  * build the message would report a second observation the decision was not made on, which is how an
  * answer and its reason come apart.
+ *
+ * A total lookup and nothing else: which refusal a reading earns is {@link REFUSAL_BY_LIVENESS}'s to
+ * say, so there is no branch here to forget to extend. Only `taken-over` reads `hint` — the others take
+ * the narrower signature the table widens for them, so a reason cannot quietly start depending on a
+ * fact its refusal does not carry.
  */
 function refusal(sessionId: string, liveness: SurfaceLiveness, hint: string): SessionStopError {
-  const code = REFUSAL_BY_LIVENESS[liveness];
-  if (code === "taken-over") {
-    return new SessionStopError(code, takenOverReason(sessionId, hint));
-  }
-  if (code === "liveness-unknown") {
-    return new SessionStopError(code, livenessUnknownReason(sessionId));
-  }
-  return new SessionStopError(code, `ccctl: session ${sessionId} could not be stopped`);
+  const { code, reason } = REFUSAL_BY_LIVENESS[liveness];
+  return new SessionStopError(code, reason(sessionId, hint));
 }
 
 /**

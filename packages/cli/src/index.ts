@@ -523,7 +523,7 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
     .argument("<session-id>", "the session to stop (from `ccctl attach`)")
     .option("-p, --port <port>", "loopback port the daemon is on", "4321")
     .option("--host <host>", "loopback host the daemon is on", DEFAULT_HOST)
-    .option("--force", "stop it even if it has been taken over at a terminal")
+    .option("--force", "stop it even if it has been taken over at a terminal, or its backend would not report on it")
     .action(async (sessionId: string, options: { port: string; host: string; force?: boolean }) => {
       const target: HostEndpoint = { host: resolveBindHost(options.host), port: parsePort(options.port) };
       // `--force` is a boolean flag, so commander gives `true` when present and `undefined` when not;
