@@ -517,7 +517,18 @@ export function handleSessionStop(
     } catch (error) {
       // Typed by the guard that refused it or the rule that could not complete it; anything
       // unclassifiable becomes an honest `stop-failed` rather than a success nobody can trust.
-      writeStopFailure(res, toStopFailure(error));
+      const failure = toStopFailure(error);
+      // Error trail (#61): an emergency-stop was refused or could not complete — a session the operator
+      // asked to kill may still be live. The typed code IS the diagnosis (unknown-session / taken-over /
+      // ambiguous-surface / stop-failed / …), named to the session it concerns.
+      state.logger.log({
+        category: "error",
+        level: "warn",
+        event: "stop-failed",
+        sessionId,
+        detail: `${failure.code}: ${failure.message}`,
+      });
+      writeStopFailure(res, failure);
     }
   });
 }

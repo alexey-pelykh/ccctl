@@ -51,7 +51,7 @@
  * TTL nobody has a number for, and none of that is what "reflected to clients" asks for.
  */
 
-import { markSessionClosed, type Session } from "@ccctl/core";
+import { markSessionClosed, type Logger, type Session } from "@ccctl/core";
 import { closeSessionRelay, type SessionEventRelays } from "./event-stream.js";
 
 /**
@@ -80,6 +80,8 @@ export interface SessionCloseState {
   readonly sessions: Map<string, Session>;
   /** The per-session UI event relays — the ending session's is reaped (#176), ending its subscribers. */
   readonly eventRelays: SessionEventRelays;
+  /** The structured-log sink (#61) — every session death is emitted here, so a created-but-never-closed leak is diagnosable. */
+  readonly logger: Logger;
 }
 
 /**
@@ -106,5 +108,17 @@ export function closeSession(state: SessionCloseState, sessionId: string): Sessi
   const closed = markSessionClosed(session);
   state.sessions.delete(sessionId);
   closeSessionRelay(state.eventRelays, sessionId);
+  // The one terminal-transition log (#61): every session death — a #173 eviction or a #76 stop —
+  // funnels through here, so a `created` with no matching `closed` is a leaked slot the trail exposes.
+  // `markSessionClosed` preserves an `errored` status, so the terminal `status` here is the diagnosis
+  // (why it ended), not just "closed".
+  state.logger.log({
+    category: "session",
+    level: "info",
+    event: "closed",
+    sessionId,
+    status: closed.status,
+    detail: `session ended (${closed.status})`,
+  });
   return closed;
 }

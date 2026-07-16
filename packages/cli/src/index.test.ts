@@ -271,7 +271,7 @@ describe("ccctl serve — starts the daemon (AC2)", () => {
   it("starts the daemon on the default loopback host + port and reports the bound address", async () => {
     const { deps, startServer, establish, launcher } = makeDeps();
     await buildProgram(deps).parseAsync(["serve"], { from: "user" });
-    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321, launcher });
+    expect(startServer).toHaveBeenCalledWith(expect.objectContaining({ host: "127.0.0.1", port: 4321, launcher }));
     expect(establish).not.toHaveBeenCalled();
     expect(loggedText()).toContain("http://127.0.0.1:4321");
   });
@@ -279,14 +279,14 @@ describe("ccctl serve — starts the daemon (AC2)", () => {
   it("passes an explicit loopback --host and --port through to the daemon", async () => {
     const { deps, startServer, launcher } = makeDeps();
     await buildProgram(deps).parseAsync(["serve", "--host", "127.0.0.1", "--port", "8080"], { from: "user" });
-    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 8080, launcher });
+    expect(startServer).toHaveBeenCalledWith(expect.objectContaining({ host: "127.0.0.1", port: 8080, launcher }));
     expect(loggedText()).toContain("http://127.0.0.1:8080");
   });
 
   it("reports the RESOLVED ephemeral port (from server.address), not the requested --port 0", async () => {
     const { deps, startServer, launcher } = makeDeps();
     await buildProgram(deps).parseAsync(["serve", "--port", "0"], { from: "user" });
-    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 0, launcher });
+    expect(startServer).toHaveBeenCalledWith(expect.objectContaining({ host: "127.0.0.1", port: 0, launcher }));
     expect(loggedText()).toContain("http://127.0.0.1:55555");
   });
 
@@ -308,7 +308,7 @@ describe("ccctl serve --tunnel — composes daemon + tunnel (AC4)", () => {
   it("starts the daemon THEN establishes the tunnel against the bound address, reporting the public host", async () => {
     const { deps, startServer, establish, launcher } = makeDeps();
     await buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
-    expect(startServer).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321, launcher });
+    expect(startServer).toHaveBeenCalledWith(expect.objectContaining({ host: "127.0.0.1", port: 4321, launcher }));
     expect(establish).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 });
     expect(loggedText()).toContain("oracle-node.tailnet.ts.net");
   });

@@ -46,7 +46,14 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { ENVIRONMENTS_BRIDGE_PATH, SESSIONS_PATH, type HostEndpoint, type Session } from "@ccctl/core";
+import {
+  ENVIRONMENTS_BRIDGE_PATH,
+  NO_OP_LOGGER,
+  SESSIONS_PATH,
+  type HostEndpoint,
+  type Logger,
+  type Session,
+} from "@ccctl/core";
 import {
   closeWorkerChannels,
   DEFAULT_SESSION_EVICTION_GRACE_MS,
@@ -123,6 +130,11 @@ import {
 // its shape. The mapper and its exact serialized bytes are golden-tested in
 // session-create-wire.test.ts.
 export { toSessionCreateResponseWire, type SessionCreateResponseWire } from "./session-create-wire.js";
+
+// The concrete structured-log sink (#61): the Node-adjacent writer half of the `@ccctl/core`
+// {@link Logger} contract. The daemon injects `createJsonLineLogger()` via {@link ServerConfig.logger}
+// to turn on the diagnostic trail; the `Logger` / `LogEvent` / `NO_OP_LOGGER` types live in `@ccctl/core`.
+export { createJsonLineLogger, type LogLineWriter } from "./logger.js";
 
 // Re-export the browser-facing session-namespace wire types (#20 list, #31 launch) on the
 // public surface, for the SAME contract-consumer reason as the §2 session-create wire above:
@@ -457,6 +469,19 @@ export interface ServerConfig {
    * live process (AC4). Absent (the default): the reaper does not run, and no recorded handle is rehydrated.
    */
   livenessProbe?: ProcessLivenessProbe;
+  /**
+   * The structured-log sink (#61) the daemon injects to turn on the diagnostic trail — session
+   * lifecycle, bridge registration, worker-status detection, notification dispatch, and refusals,
+   * enough to diagnose a stalled or leaked long-lived daemon. An injected {@link Logger} port, like
+   * {@link ServerConfig.launcher} and {@link ServerConfig.livenessProbe}. Absent (the default): the
+   * server falls back to {@link NO_OP_LOGGER} and emits nothing, so an embedder or a test that wants a
+   * quiet server gets one. `@ccctl/server` ships {@link createJsonLineLogger} as the concrete writer.
+   *
+   * Redaction is a property of the {@link LogEvent} SHAPE, not of this sink: a {@link LogEvent} is
+   * JSON-safe by construction and carries no field for the account Bearer or the session-ingress
+   * token, so whatever writer is injected here cannot be handed a credential to leak.
+   */
+  logger?: Logger;
 }
 
 /** A running ccctl server: the relay between the environments-bridge worker and the UI. */
@@ -587,6 +612,8 @@ interface ServerState {
   readonly sessionEvictionGraceMs: number;
   /** Threshold (ms) a session may stay continuously idle before the "idle > X" event is raised (#41). */
   readonly sessionIdleThresholdMs: number;
+  /** The structured-log sink (#61) — {@link ServerConfig.logger}, or {@link NO_OP_LOGGER} when absent. Threaded to every handler slice that emits a diagnostic event. */
+  readonly logger: Logger;
   /** Provisional at construction; finalized with the resolved port once bound. */
   address: HostEndpoint;
 }
@@ -749,6 +776,10 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
  * (possibly ephemeral) port. Rejects if the socket fails to bind.
  */
 export function startServer(config: ServerConfig): Promise<CcctlServer> {
+  // The structured-log sink (#61), resolved once at the top so the BOOT refusals below — which reject
+  // before any `state` exists — share the same trail as every later runtime event. Absent → the no-op
+  // sink, so an unconfigured server stays silent.
+  const logger = config.logger ?? NO_OP_LOGGER;
   // Localhost-bind guarantee (#58), enforced on the ACTUAL bind path so it is not silently
   // overridable: an embedder passing a non-loopback `config.host` (`0.0.0.0`, `::`, a LAN or public
   // IP) is refused HERE, exactly as `ccctl serve` refuses one at the CLI edge — the guarantee holds
@@ -764,7 +795,9 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
   } catch (error) {
     // resolveBindHost throws an Error; re-narrow the `unknown` catch binding to one so the
     // rejection reason is statically an Error (and stays robust if that ever changes).
-    return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    const reason = error instanceof Error ? error : new Error(String(error));
+    logger.log({ category: "error", level: "error", event: "bind-refused", sessionId: null, detail: reason.message });
+    return Promise.reject(reason);
   }
   // Refuse a nonsense session cap AT BOOT, before anything binds (#36). `??` only defends against an
   // absent value, and the values it lets through are not all harmless: `NaN` — trivially produced by
@@ -780,24 +813,24 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
   // promise-returning function is the classic mixed-contract footgun — `startServer(cfg).catch(…)`
   // would not catch it — so the one entry point answers its caller one way, always.
   if (config.maxSessions !== undefined && !isPositiveInteger(config.maxSessions)) {
-    return Promise.reject(
-      new Error(
-        `ccctl: maxSessions must be a positive integer (got \`${String(config.maxSessions)}\`) — ` +
-          "it is the ceiling on live sessions, and a cap that is not a counting number cannot bound anything",
-      ),
+    const reason = new Error(
+      `ccctl: maxSessions must be a positive integer (got \`${String(config.maxSessions)}\`) — ` +
+        "it is the ceiling on live sessions, and a cap that is not a counting number cannot bound anything",
     );
+    logger.log({ category: "error", level: "error", event: "boot-rejected", sessionId: null, detail: reason.message });
+    return Promise.reject(reason);
   }
   // The idle-threshold config-time override (#42) fails closed the same way maxSessions does: a `NaN`
   // (what `Number(…)` of an unset/mistyped env var yields) or a non-positive value handed to `setTimeout`
   // would fire the "idle > X" nudge immediately and repeatedly rather than after the lull, so a mistyped
   // override is refused at the door instead of silently defeating the timer.
   if (config.sessionIdleThresholdMs !== undefined && !isPositiveInteger(config.sessionIdleThresholdMs)) {
-    return Promise.reject(
-      new Error(
-        `ccctl: sessionIdleThresholdMs must be a positive integer (got \`${String(config.sessionIdleThresholdMs)}\`) — ` +
-          "it is the ms a session may sit idle before the nudge, and a non-positive/NaN value would fire it immediately, not after the lull",
-      ),
+    const reason = new Error(
+      `ccctl: sessionIdleThresholdMs must be a positive integer (got \`${String(config.sessionIdleThresholdMs)}\`) — ` +
+        "it is the ms a session may sit idle before the nudge, and a non-positive/NaN value would fire it immediately, not after the lull",
     );
+    logger.log({ category: "error", level: "error", event: "boot-rejected", sessionId: null, detail: reason.message });
+    return Promise.reject(reason);
   }
   const state: ServerState = {
     sessions: new Map<string, Session>(),
@@ -814,6 +847,7 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     workerLivenessIntervalMs: config.workerLivenessIntervalMs ?? DEFAULT_WORKER_LIVENESS_INTERVAL_MS,
     sessionEvictionGraceMs: config.sessionEvictionGraceMs ?? DEFAULT_SESSION_EVICTION_GRACE_MS,
     sessionIdleThresholdMs: config.sessionIdleThresholdMs ?? DEFAULT_SESSION_IDLE_THRESHOLD_MS,
+    logger,
     address: { host, port: config.port },
   };
 
@@ -846,7 +880,15 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
       // message (#156); any other listen error passes through unchanged. The CLI
       // prints error.message (never the stack) and exits non-zero, so branding here
       // is the whole user-visible fix.
-      reject(brandListenError(error, config.port));
+      const reason = brandListenError(error, config.port);
+      logger.log({
+        category: "error",
+        level: "error",
+        event: "listen-failed",
+        sessionId: null,
+        detail: reason.message,
+      });
+      reject(reason);
     };
     httpServer.once("error", onListenError);
     httpServer.listen(config.port, host, () => {

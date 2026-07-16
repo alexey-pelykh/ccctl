@@ -59,6 +59,7 @@ import {
   type SessionActivity,
 } from "@ccctl/core";
 import {
+  createJsonLineLogger,
   DEFAULT_HOST,
   mintDeviceToken,
   requireLocalServerAuth,
@@ -308,7 +309,18 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       // Inject the session launcher so a `POST /api/sessions` "New session" (UC2) actually spawns
       // the PATCHED `claude` worker (#157) — without it the daemon tracks sessions but fails a launch
       // closed with a 501. The launcher is a seam so a test drives `serve` without a real tmux/worker.
-      const server = await deps.startServer({ host, port, launcher: deps.launcher });
+      //
+      // Inject the structured-log sink (#61) so the daemon actually EMITS its diagnostic trail — one
+      // JSON line per session-lifecycle / registration / detection / notification / error event, enough
+      // to diagnose a stalled or leaked long-running daemon. Absent this the server falls back to the
+      // no-op sink; the daemon is the composition root that turns the trail on. The `LogEvent` shape is
+      // JSON-safe by construction, so no credential (account Bearer, session-ingress token) can ride it.
+      const server = await deps.startServer({
+        host,
+        port,
+        launcher: deps.launcher,
+        logger: createJsonLineLogger(),
+      });
       // Report the address actually bound (`server.address` carries the resolved port,
       // which matters when `--port 0` selects an ephemeral one).
       console.log(`ccctl: serving on ${serverUrl(server.address.host, server.address.port)}`);

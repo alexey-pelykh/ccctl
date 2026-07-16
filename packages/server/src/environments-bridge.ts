@@ -163,6 +163,16 @@ export function handleEnvironmentRegister(req: IncomingMessage, res: ServerRespo
       queue: [],
       waiters: new Set<PollWaiter>(),
     });
+    // Registration §1 (#61): a worker's environment is now on the bridge. The account Bearer that
+    // authorized this leg is NEVER a field here — the loggable shape omits it by construction.
+    state.logger.log({
+      category: "registration",
+      level: "info",
+      event: "environment-registered",
+      environmentId: id,
+      sessionId: null,
+      detail: `max_sessions=${String(body.maxSessions)}`,
+    });
     // 200, not 201: the observed worker rejects a non-200 register response (#154).
     writeJson(res, 200, toEnvironmentRegisterResponseWire(id));
   });
@@ -223,6 +233,16 @@ export function handleSessionCreate(req: IncomingMessage, res: ServerResponse, s
     // permission mode (a non-prompting mode never emits `requires_action`); the
     // marker is life-long since a running session's mode cannot change.
     state.sessions.set(sessionId, createSession(sessionId, body.permissionMode));
+    // Registration §2 (#61): a `connecting` session is born on the bridge. The account Bearer that
+    // authorized this leg is never a field here (loggable shape omits it by construction).
+    state.logger.log({
+      category: "registration",
+      level: "info",
+      event: "session-created",
+      environmentId: latestEnvironment(state)?.id ?? "unregistered",
+      sessionId,
+      detail: `permission_mode=${body.permissionMode}`,
+    });
     // §2→§3 wiring: enqueue the session-dispatch work item (with its minted work-secret)
     // so the worker's next poll delivers it. The account Bearer is NOT carried here — the
     // work-secret's session_ingress_token is the per-session credential, minted locally.
@@ -258,8 +278,22 @@ export function handleWorkPoll(
     writeError(res, 404, `ccctl: no environment ${environmentId}`);
     return;
   }
+  // §3 delivery trail (#61): the work item's id + type + session id ONLY — NEVER `item.secret`, which
+  // base64url-encodes the WorkSecret (and its session_ingress_token). The loggable shape has no field
+  // for the secret, so redaction here is by construction, not by remembering to omit it.
+  const logDelivered = (item: WorkItem): void => {
+    state.logger.log({
+      category: "registration",
+      level: "info",
+      event: "work-delivered",
+      environmentId,
+      sessionId: item.data.id ?? null,
+      detail: `work ${item.id} (${item.data.type})`,
+    });
+  };
   const queued = env.queue.shift();
   if (queued !== undefined) {
+    logDelivered(queued);
     writeJson(res, 200, toWorkItemWire(queued));
     return;
   }
@@ -275,6 +309,7 @@ export function handleWorkPoll(
     env.waiters.delete(waiter);
     clearTimeout(waiter.timer);
     if (item !== null) {
+      logDelivered(item);
       writeJson(res, 200, toWorkItemWire(item));
     } else {
       // 200 + empty body = "no work" (the wire has no envelope to represent empty).
