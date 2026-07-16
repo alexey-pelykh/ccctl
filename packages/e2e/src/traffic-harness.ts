@@ -45,6 +45,16 @@ const LOOPBACK_HOST = "127.0.0.1";
 /** How long a harness HTTP request waits before it is treated as hung. */
 const REQUEST_TIMEOUT_MS = 10_000;
 
+/**
+ * The header an inference leg carries its session marker in, so the RECEIVER can attribute
+ * it. A harness affordance, and deliberately so: a real inference request carries no such
+ * header — in the credentialed wave, per-session attribution comes from the patched worker's
+ * own egress instead. What the header buys is that the attribution stays RECEIVER-grounded
+ * even here — the session on an {@link ObservedConnection} is read back out of the stand-in's
+ * own log, never taken from the caller's variable (see {@link observeInferenceLeg}).
+ */
+export const SESSION_MARKER_HEADER = "x-ccctl-e2e-session";
+
 /** One request the {@link InferenceStandIn} received, as it saw it. */
 export interface RecordedRequest {
   /** The `Host` the request carried (hostname only; any port stripped). */
@@ -53,6 +63,13 @@ export interface RecordedRequest {
   readonly method: string;
   /** The request path. */
   readonly path: string;
+  /**
+   * The session marker the request carried ({@link SESSION_MARKER_HEADER}), as the stand-in
+   * saw it — `undefined` when the request carried none. This is the receiver's OWN attribution
+   * record: the full-flow gate (#67) reads a session's inference proof from here, so "session X
+   * reached api.anthropic.com" is something the receiver says, not something the sender claims.
+   */
+  readonly sessionMarker?: string | undefined;
 }
 
 /** A loopback stand-in for `api.anthropic.com` that records what reaches it. */
@@ -73,7 +90,12 @@ export interface InferenceStandIn {
 export function startInferenceStandIn(host: string = LOOPBACK_HOST): Promise<InferenceStandIn> {
   const received: RecordedRequest[] = [];
   const server = createServer((req, res) => {
-    received.push({ host: hostnameOf(req.headers.host), method: req.method ?? "", path: req.url ?? "" });
+    received.push({
+      host: hostnameOf(req.headers.host),
+      method: req.method ?? "",
+      path: req.url ?? "",
+      sessionMarker: headerValue(req.headers[SESSION_MARKER_HEADER]),
+    });
     req.resume(); // drain the (ignored) request body so the socket does not stall
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ standIn: "api.anthropic.com" }));
@@ -211,6 +233,13 @@ export interface InferenceLegOptions {
   readonly inferenceHost: string;
   /** The Anthropic stand-in, whose log grounds "reached api.anthropic.com". */
   readonly standIn: InferenceStandIn;
+  /**
+   * The session this model turn belongs to. When set, the leg carries it as a
+   * {@link SESSION_MARKER_HEADER} marker so the RECEIVER can attribute the turn — which is
+   * what lets the full-flow gate (#67) prove the guarantee per session rather than only in
+   * aggregate. Omit for an unattributed (aggregate-only) leg, as the one-session skeleton does.
+   */
+  readonly sessionId?: string | undefined;
 }
 
 /**
@@ -220,9 +249,17 @@ export interface InferenceLegOptions {
  * api.anthropic.com is decided by whether the stand-in logged it, so pointing
  * `target` at the local server (the regression) yields `receivedBy:
  * "local-server"` and trips {@link assertInferenceUntouched}.
+ *
+ * When `sessionId` is given, the returned observation's own
+ * {@link ObservedConnection.sessionId} is read back out of the STAND-IN'S log — the marker it
+ * actually saw — never echoed from the argument. That asymmetry is deliberate and is the
+ * whole receiver-of-record discipline in miniature: a leg that never arrived has no record to
+ * read, so it yields NO session attribution and can never count as that session's proof
+ * (`docs/security-posture.md` § Oracle-independence). Attribution therefore fails closed
+ * exactly where the guarantee is breached.
  */
 export async function observeInferenceLeg(options: InferenceLegOptions): Promise<ObservedConnection> {
-  const { target, inferenceHost, standIn } = options;
+  const { target, inferenceHost, standIn, sessionId } = options;
   const anthropicBefore = standIn.received.length;
 
   // A real outbound connection carrying Host: inferenceHost. Awaiting the full
@@ -230,7 +267,7 @@ export async function observeInferenceLeg(options: InferenceLegOptions): Promise
   await httpPostJson(
     target,
     "/v1/messages",
-    { host: inferenceHost },
+    { host: inferenceHost, ...(sessionId !== undefined ? { [SESSION_MARKER_HEADER]: sessionId } : {}) },
     {
       model: "claude-opus-4-8",
       messages: [{ role: "user", content: "e2e inference probe" }],
@@ -241,7 +278,15 @@ export async function observeInferenceLeg(options: InferenceLegOptions): Promise
   const receivedBy: TrafficReceiver = reachedAnthropic ? "anthropic" : "local-server";
   const lastRecord = standIn.received.at(-1);
   const intendedHost = reachedAnthropic && lastRecord ? lastRecord.host : inferenceHost;
-  return { leg: "inference", receivedBy, intendedHost };
+  // Receiver-grounded attribution: the session comes from the marker the STAND-IN recorded,
+  // so a leg it never took carries none.
+  const observedSession = reachedAnthropic ? lastRecord?.sessionMarker : undefined;
+  return {
+    leg: "inference",
+    receivedBy,
+    intendedHost,
+    ...(observedSession !== undefined ? { sessionId: observedSession } : {}),
+  };
 }
 
 /** The status + body of a harness HTTP round-trip. */
@@ -289,6 +334,21 @@ function httpPostJson(
     });
     req.end(payload);
   });
+}
+
+/**
+ * Read a single header value as the stand-in saw it.
+ *
+ * `node:http` types every header as `string | string[] | undefined`, so both branches must be
+ * handled, but the array one is unreachable HERE: node only yields `string[]` for `set-cookie` —
+ * any other repeated header is JOINED into one comma-separated string (verified against node, not
+ * assumed). A repeated marker would therefore arrive as `"a, b"` and be returned verbatim; that
+ * still fails closed downstream (it matches no carried session id, so coverage reports the session
+ * as unproven), and `observeInferenceLeg` builds the header from a single-key object literal, so it
+ * cannot arise from this harness at all. The array branch is kept only because the type demands it.
+ */
+function headerValue(raw: string | string[] | undefined): string | undefined {
+  return typeof raw === "string" && raw !== "" ? raw : undefined;
 }
 
 /** Read the hostname out of a `Host` header, stripping any port or brackets. */
