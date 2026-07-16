@@ -307,8 +307,9 @@ describe("classifyPtyHandleResidual (#68) — the self-guard: the positive can n
 
 describe("classifyPtyHandleResidual (#68) — inconclusive: skips, never fakes", () => {
   it("is INCONCLUSIVE when the real backend never brought a pty up, and names the daemon's own reason", () => {
-    // The default-checkout outcome: node-pty cannot load (no Linux prebuild) or cannot spawn (the
-    // shipped spawn-helper is left non-executable by `allowBuilds: node-pty: false`).
+    // The default-checkout outcome: node-pty cannot load, or loads but cannot spawn — for the two
+    // different per-platform reasons `pty-handle-residual.ts`'s header documents (the canonical
+    // account; not restated here).
     const report = classifyPtyHandleResidual({
       spawned: undefined,
       launchStatus: 502,

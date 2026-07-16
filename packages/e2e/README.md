@@ -364,10 +364,13 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
 
     # linux: flip `allowBuilds.node-pty` to true in pnpm-workspace.yaml, then reinstall — with no
     # prebuild to find, prebuild.js exits 1, `|| node-gyp rebuild` runs, and build/Release/pty.node
-    # is what loadNativeModule then prefers. spawn-helper is NOT part of the Linux story at all:
-    # binding.gyp gates that target on OS=="mac", and pty.cc reads helper_path only under
-    # `#if defined(__APPLE__)` — the Linux path calls forkpty(3). So darwin's mode-644 trap has no
-    # Linux counterpart. UNVERIFIED: read off binding.gyp + pty.cc, not run (no Linux box).
+    # is what loadNativeModule then prefers. No spawn-helper is BUILT or EXEC'd on Linux: binding.gyp
+    # gates that target on OS=="mac", and while pty.cc reads helper_path unconditionally (:352) —
+    # unixTerminal.js passes it on every unix — it is USED only under `#if defined(__APPLE__)` (:356),
+    # so on Linux the string is simply discarded and forkpty(3) (:399) runs instead. Darwin's mode-644
+    # trap therefore has no Linux counterpart. UNVERIFIED end-to-end: no Linux box was available, so
+    # the chain is read off binding.gyp, pty.cc, scripts/prebuild.js, package.json and lib/utils.js
+    # rather than run. (binding.gyp also links -lutil, which can bite on musl/Alpine.)
     pnpm install
 
     CCCTL_E2E=1 CCCTL_E2E_PTY=1 pnpm --filter @ccctl/e2e test:e2e

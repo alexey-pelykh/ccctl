@@ -687,10 +687,12 @@ export async function drivePtyHandleResidual(config: PtyResidualDriveConfig): Pr
     const body = (await res.json()) as { sessionId?: string; code?: string; error?: string };
     sessionId = body.sessionId;
     if (res.status !== 201) {
-      // The daemon's OWN typed reason (#33) — e.g. `backend-unavailable` when node-pty could not load,
-      // `spawn-failed` when it loaded but could not spawn (this repo's default install: the shipped
-      // `spawn-helper` is left non-executable by `allowBuilds: node-pty: false`). Carried into the
-      // verdict so an `inconclusive` says WHY rather than merely that it could not run.
+      // The daemon's OWN typed reason (#33) — e.g. `backend-unavailable` when node-pty could not
+      // load, `spawn-failed` when it loaded but could not spawn. Both are the default-checkout
+      // outcome, for the two different per-platform reasons this module's header documents — that
+      // header is the ONE canonical account; deliberately not restated here, because a restated copy
+      // is what drifts. Carried into the verdict so an `inconclusive` says WHY rather than merely
+      // that it could not run.
       launchFailure = body.code ?? body.error;
     }
   } catch (error) {
