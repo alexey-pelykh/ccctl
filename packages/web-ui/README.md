@@ -17,6 +17,19 @@ needs-you-queue reconcile / ack logic). For PWA install it also ships a
 There is nothing to compile; `build` just copies the static assets into `dist/`,
 and the modules can be served as-is by the daemon (or locally, e.g. `npx serve .`).
 
+The layout is **mobile-first and responsive (#83)**: the phone is the primary
+surface and stays a single column, and from a tablet width up (`min-width: 48rem`)
+the UI uses the extra real estate rather than only stretching that column — the
+session picker sits **beside** the selected session's transcript + steer controls,
+width-capped and centred so line lengths stay readable on a laptop, with device
+management full-width below. A **desktop-class tablet** (touch **and**
+keyboard/mouse, landscape) renders exactly this two-pane layout; the steer controls
+run on `click` + form `submit`, so touch, pointer and keyboard all drive them. There
+is **no device sniffing** — a single `width=device-width` viewport plus CSS
+breakpoints do the whole job, so the "above the picker" / "below the steer controls"
+positions described below are the single-column reading that the wide layout only
+rearranges sideways.
+
 It talks to [`@ccctl/server`](../server) over a **per-session** namespace (#20), so
 more than one session can be carried at once. `GET /api/sessions` lists the carried
 sessions and the UI picks one to view + steer; the selected session drives the

@@ -19,10 +19,20 @@
     <title>ccctl</title>
     <style>
       /* Minimal legibility only — zero-build, no framework and no bundler. */
+      *,
+      *::before,
+      *::after {
+        /* Padding + borders count INSIDE a declared width, so a full-width control
+           (e.g. #session-list button { width: 100% }) can't overflow its row (#83, AC3). */
+        box-sizing: border-box;
+      }
       body {
         font-family: system-ui, sans-serif;
         margin: 1rem;
         line-height: 1.4;
+        /* Long unbreakable tokens (session UUIDs, cwd paths) wrap instead of forcing a
+           horizontal scroll at any width (#83, AC3). */
+        overflow-wrap: break-word;
       }
       #status {
         color: #666;
@@ -292,6 +302,48 @@
       #push-status[data-push="failed"] {
         color: #b91c1c;
       }
+      /* Comfortable touch targets on the phone — the primary surface (#83, AC2). 44px
+         (2.75rem) is the long-standing minimum tap size; applied to the primary controls. The
+         compact inline secondary actions below keep a smaller-but-still-tappable minimum. */
+      #session-list button,
+      #refresh-sessions,
+      #refresh-devices,
+      .launch-form input,
+      #launch-button,
+      .steer-form input,
+      .steer-form button,
+      #approve-button,
+      #stop-button,
+      #enable-push {
+        min-height: 2.75rem;
+      }
+      #stop-force-button,
+      #device-list li button[data-revoke="true"],
+      #steer-queue [data-queue-cancel],
+      #steer-queue [data-queue-send] {
+        min-height: 2rem;
+      }
+      /* Wide viewports — tablet and up (#83, AC1/AC4). The phone (base styles above) is the
+         primary surface and stays a single column; from 48rem the UI uses the extra width
+         rather than only stretching that column: the session picker (`.pane-nav`) sits BESIDE
+         the selected session's transcript + steer controls (`.pane-detail`), and the page is
+         width-capped + centred so line lengths stay readable on a laptop. Device management
+         (`.pane-manage`) spans full width below. A desktop-class tablet (touch + keyboard/mouse,
+         landscape) is exactly this two-pane layout; the steer controls run on click + form
+         submit, which fire from touch, pointer and keyboard alike (unchanged). `minmax(0, 1fr)`
+         lets the transcript column shrink so long content wraps rather than overflowing. */
+      @media (min-width: 48rem) {
+        main {
+          max-width: 75rem;
+          margin-inline: auto;
+        }
+        .workspace {
+          display: grid;
+          grid-template-columns: minmax(15rem, 20rem) minmax(0, 1fr);
+          gap: 1.5rem;
+          align-items: start;
+        }
+      }
     </style>
   </head>
   <body>
@@ -305,68 +357,85 @@
       <p id="connection-line" aria-live="polite" aria-atomic="true">
         Connection: <span id="connection" data-connection="reconnecting">reconnecting</span>
       </p>
-      <!-- The sessions the daemon is carrying (#20). Pick one to view + steer it; each is
-           independent — the transcript, activity, and steer below apply to the SELECTED session. -->
-      <section id="sessions">
-        <h2>Sessions <button id="refresh-sessions" type="button">Refresh</button></h2>
-        <ul id="session-list" aria-live="polite"></ul>
-      </section>
-      <!-- The "New session" control (#37, UC2): launch a fresh session on the operator's host via
+      <!-- RESPONSIVE WORKSPACE (#83): a single column on the phone (the primary surface), and from
+           48rem a two-pane grid — the session picker (`.pane-nav`) BESIDE the selected session's
+           transcript + steer controls (`.pane-detail`). The DOM order is phone-first, so the
+           single-column stack reads sessions → new session → the selected session's detail exactly
+           as before; the grid only rearranges it sideways at width. Device management
+           (`.pane-manage`) sits full-width below. All layout is CSS — `app.js` binds by id, so the
+           wrappers change nothing it reads. -->
+      <div class="workspace">
+        <div class="pane-nav">
+          <!-- The sessions the daemon is carrying (#20). Pick one to view + steer it; each is
+               independent — the transcript, activity, and steer below apply to the SELECTED session. -->
+          <section id="sessions">
+            <h2>Sessions <button id="refresh-sessions" type="button">Refresh</button></h2>
+            <ul id="session-list" aria-live="polite"></ul>
+          </section>
+          <!-- The "New session" control (#37, UC2): launch a fresh session on the operator's host via
            `POST /api/sessions` (#31). The working directory is the one REQUIRED field — `required`
            lets the browser block a blank submit natively, and `launch.js` refuses one anyway; the
            project and initial prompt are optional. The launched session is `registering` from birth
            (#33), so it lands in the picker above on the refresh an accepted launch triggers. The
            outcome — the minted id + attach hint, or a TYPED failure code + the server's actionable
            sentence — lands in the `aria-live` status line below the form. -->
-      <section id="new-session">
-        <h2>New session</h2>
-        <form id="launch-form" class="launch-form">
-          <input
-            id="launch-cwd"
-            name="cwd"
-            type="text"
-            autocomplete="off"
-            required
-            placeholder="Working directory (required, e.g. /home/alex/code/app)"
-          />
-          <input id="launch-project" name="project" type="text" autocomplete="off" placeholder="Project (optional)" />
-          <input
-            id="launch-prompt"
-            name="initialPrompt"
-            type="text"
-            autocomplete="off"
-            placeholder="Initial prompt (optional)"
-          />
-          <button id="launch-button" type="submit">New session</button>
-        </form>
-        <p id="launch-status" aria-live="polite" hidden></p>
-      </section>
-      <!-- Transport lifecycle of the SSE connection to the selected session. -->
-      <section id="status" aria-live="polite">no session selected</section>
-      <!-- The session's current turn (worker_status); revealed on the first frame. -->
-      <section id="activity" aria-live="polite" hidden></section>
-      <h2>Transcript</h2>
-      <ul id="events" aria-live="polite"></ul>
-      <!-- Upstream steer controls (#16): input / redirect / approve. Each POSTs a
+          <section id="new-session">
+            <h2>New session</h2>
+            <form id="launch-form" class="launch-form">
+              <input
+                id="launch-cwd"
+                name="cwd"
+                type="text"
+                autocomplete="off"
+                required
+                placeholder="Working directory (required, e.g. /home/alex/code/app)"
+              />
+              <input
+                id="launch-project"
+                name="project"
+                type="text"
+                autocomplete="off"
+                placeholder="Project (optional)"
+              />
+              <input
+                id="launch-prompt"
+                name="initialPrompt"
+                type="text"
+                autocomplete="off"
+                placeholder="Initial prompt (optional)"
+              />
+              <button id="launch-button" type="submit">New session</button>
+            </form>
+            <p id="launch-status" aria-live="polite" hidden></p>
+          </section>
+        </div>
+        <div class="pane-detail">
+          <!-- Transport lifecycle of the SSE connection to the selected session. -->
+          <section id="status" aria-live="polite">no session selected</section>
+          <!-- The session's current turn (worker_status); revealed on the first frame. -->
+          <section id="activity" aria-live="polite" hidden></section>
+          <h2>Transcript</h2>
+          <ul id="events" aria-live="polite"></ul>
+          <!-- Upstream steer controls (#16): input / redirect / approve. Each POSTs a
            control_request to the server, which relays it to the worker channel. -->
-      <form id="prompt-form" class="steer-form">
-        <input id="prompt-input" name="prompt" type="text" autocomplete="off" placeholder="Send to session…" />
-        <button type="submit">Send</button>
-      </form>
-      <form id="redirect-form" class="steer-form">
-        <input
-          id="redirect-input"
-          name="redirect"
-          type="text"
-          autocomplete="off"
-          placeholder="Redirect the current turn…"
-        />
-        <button type="submit">Redirect</button>
-      </form>
-      <div class="steer-actions">
-        <button id="approve-button" type="button">Approve</button>
-      </div>
-      <!-- OPTIMISTIC OFFLINE-STEER QUEUE (#79, UI-B-011) + STALE-GUARD (#80, W5-21 / SRV-B-015+UI-B-011):
+          <form id="prompt-form" class="steer-form">
+            <input id="prompt-input" name="prompt" type="text" autocomplete="off" placeholder="Send to session…" />
+            <button type="submit">Send</button>
+          </form>
+          <form id="redirect-form" class="steer-form">
+            <input
+              id="redirect-input"
+              name="redirect"
+              type="text"
+              autocomplete="off"
+              placeholder="Redirect the current turn…"
+            />
+            <button type="submit">Redirect</button>
+          </form>
+          <div class="steer-actions">
+            <button id="approve-button" type="button">Approve</button>
+          </div>
+          <!-- OPTIMISTIC OFFLINE-STEER QUEUE (#79, UI-B-011) + STALE-GUARD (#80, W5-21 / SRV-B-015+UI-B-011):
            a steer the operator submits while the connection is offline (the #75 indicator above reads
            "offline") is held here — visibly pending — and fired in order on the next reconnect, so a
            brief tunnel drop does not lose a decision. At fire time each item is routed through the
@@ -375,11 +444,11 @@
            blind (#80). An ONLINE steer against a moved-on session lands here the same way. The section
            stays hidden until something is queued. `src/steer-queue.js` owns the pure queue + guard
            decisions, `app.js` is the thin shell around them. -->
-      <section id="steer-queue-section" hidden>
-        <h2>Queued steering</h2>
-        <ul id="steer-queue" aria-live="polite"></ul>
-      </section>
-      <!-- EMERGENCY STOP (#77, UI-B-012): kill the SELECTED session's terminal outright via
+          <section id="steer-queue-section" hidden>
+            <h2>Queued steering</h2>
+            <ul id="steer-queue" aria-live="polite"></ul>
+          </section>
+          <!-- EMERGENCY STOP (#77, UI-B-012): kill the SELECTED session's terminal outright via
            `POST /api/sessions/{id}/stop` (#76). Deliberately its own section rather than a fourth
            `.steer-actions` button: a stop is not a steer — the three above ASK the worker to do
            something and need it listening, this kills the surface the worker RUNS ON — and it is the
@@ -393,12 +462,15 @@
            The outcome — how it ended plus the terminal state it reached, or a TYPED refusal code and
            the server's actionable sentence — lands in the `aria-live` status line. On a `taken-over`
            refusal ONLY, an escalation appears there: force is never a standing control. -->
-      <section id="stop-session">
-        <h2>Stop session</h2>
-        <button id="stop-button" type="button" disabled>Stop session</button>
-        <p id="stop-status" aria-live="polite" hidden></p>
-      </section>
-      <!-- ENABLE NOTIFICATIONS (#51, UI-C-002): subscribe THIS device to Web-Push (VAPID) so the
+          <section id="stop-session">
+            <h2>Stop session</h2>
+            <button id="stop-button" type="button" disabled>Stop session</button>
+            <p id="stop-status" aria-live="polite" hidden></p>
+          </section>
+        </div>
+      </div>
+      <div class="pane-manage">
+        <!-- ENABLE NOTIFICATIONS (#51, UI-C-002): subscribe THIS device to Web-Push (VAPID) so the
            operator is woken by a visible notification when a session blocks on them while the app is
            backgrounded / closed. The button requests notification permission, fetches the server's
            VAPID public key, subscribes via the PushManager, and uploads the subscription — the exact
@@ -408,12 +480,12 @@
            or unavailable until the server wires the push routes (this surface runs ahead of that, as
            the QR-pair token #74 and device list #85 do) — lands in the `aria-live` status line.
            `src/push.js` owns the pure decisions; this is the control they hang off. -->
-      <section id="notifications">
-        <h2>Notifications</h2>
-        <button id="enable-push" type="button">Enable notifications</button>
-        <p id="push-status" aria-live="polite" hidden></p>
-      </section>
-      <!-- The operator's PAIRED DEVICES (#85): a management surface listing each paired device
+        <section id="notifications">
+          <h2>Notifications</h2>
+          <button id="enable-push" type="button">Enable notifications</button>
+          <p id="push-status" aria-live="polite" hidden></p>
+        </section>
+        <!-- The operator's PAIRED DEVICES (#85): a management surface listing each paired device
            (phone / tablet / laptop) by name + last-seen (AC1), with the current device clearly
            marked (AC2). Each row is keyed by device id — the entry point a per-device revoke
            (W6-19, AC3) will hang off. Fetched from `GET /api/devices` on load + manual Refresh;
@@ -421,10 +493,11 @@
            the device store; the server-side token verification that computes `current` is deferred).
            Not `aria-live`: it refreshes only on explicit user action, so — unlike the auto-polled
            session list — it needn't re-announce the whole list each time. -->
-      <section id="devices">
-        <h2>Devices <button id="refresh-devices" type="button">Refresh</button></h2>
-        <ul id="device-list"></ul>
-      </section>
+        <section id="devices">
+          <h2>Devices <button id="refresh-devices" type="button">Refresh</button></h2>
+          <ul id="device-list"></ul>
+        </section>
+      </div>
     </main>
     <!-- Zero-build: plain ES modules, no framework and no bundler. -->
     <script type="module" src="./src/app.js"></script>
