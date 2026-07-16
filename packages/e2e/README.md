@@ -283,6 +283,64 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   `pty-handle-residual.test.ts` — a live pid, a reaped pid, an open fd, a closed fd and a character
   device are all obtainable without a pty, so what is fenced is the **binding**, not the **judgment**.
 
+- **The long-run daemon soak (#69, traces E2E-B-003)** — `daemon-soak.ts` is the self-classifying
+  oracle for the one question every other oracle here structurally **cannot** ask. Each of them judges
+  **one pass** — does the flow work (#20/#65/#66), is the split honest (#67/#18), does the launched pty
+  leave a residual (#68) — and a leak of **one handle per session lifecycle passes all of them**: one
+  pass leaks one handle, nothing notices, every assertion is green. It is visible only as an
+  **accumulation**, and only something that runs the lifecycle many times over can see it. So this keeps
+  **one daemon UP** for the whole run (`close()` is never called on it — that is #68's whole-daemon
+  teardown, a different claim), drives repeated session lifecycles against it through its own ingress —
+  launch (`POST /api/sessions`, the phone's own `launchRequest` body) → **§2 claim** → the worker holds
+  its **§4/§5 downstream** open → stop (`POST …/stop`, the phone's own `stopRequest`) — and reads
+  **#63's own FD/handle diagnostics** (`captureHandleReport`) between cycles. Driving the downstream is
+  not optional depth but the cycle's only **ref'd-resource leg** — the one resource whose release this
+  oracle can measure at all (`daemon-soak.ts`'s module doc carries the why).
+  **What it can see is exactly what #63's endpoint answers, and no more** — `process.getActiveResourcesInfo()`
+  reports the libuv resources **keeping the event loop alive**. Probed rather than assumed (and pinned as
+  tests, so the boundary cannot silently drift): a ref'd `setInterval` **is** counted and a leaked socket
+  **is** counted, but an **unref'd handle is not**, and **a bare file descriptor is not** — 64 of them
+  move the tally not at all.
+  **The consequence is a scope boundary worth reading before trusting this oracle**: every one of the
+  daemon's per-session timers — pending-launch eviction (#33), worker liveness (#166), session eviction
+  (#173), idle (#41), close-timeout — calls `.unref()` on the line after it is armed, so **a leaked one
+  is invisible here**. Measured, not reasoned: 22 full lifecycles driven to downstream-open depth put no
+  `Timeout` in the tally at all; a real run's settled reading is
+  `{ PipeWrap: 4, TCPServerWrap: 1, TCPSocketWrap: 3 }`. So what this soak watches is the **ref'd
+  remainder — the sockets and pipes** (a
+  stranded downstream or event-relay socket climbs here), plus, via the `maxSessions: 1` skeleton, the
+  registry row itself. Stated plainly: **#68 owns the per-fd question** (`fstat`, per-fd), **this owns
+  the ref'd-libuv tally**, and **nothing yet owns the daemon's unref'd timers** (tracked as **#238**) —
+  closing that needs #63's sampler to widen, not this spec to route around it.
+  **Two detectors, both AC2's own words.** _The count returns to baseline_ — checked on the **total**
+  and **per type**, because a total alone is **maskable** (a leaked resource while a pooled socket
+  happens to close nets to zero and reads clean); per-type is #63's own stated design intent. And _no
+  monotonic growth_ — the **slow-leak** detector: the series never comes back **down** and ends higher
+  than it started. It earns its place as the only detector with **no tolerance**, so it catches a leak
+  of one handle every five lifecycles (`8,8,8,8,9,9,9,9` — never more than +1 over baseline, so the
+  first detector is silent). That it does not flake is **measured**: 20 consecutive settled cycles
+  against a real daemon read `8` every time, `byType` identical — zero jitter, so any climb that never
+  reverses is signal. (Why the predicate is non-decreasing-and-net-up rather than strictly increasing,
+  and the false-positive class that buys, is `isMonotonicGrowth`'s own doc.)
+  **AC1's "multiple days" is the operator's lever, and the verdict never lies about it**: the `SoakPlan`
+  carries both axes AC1 names (`cycles` and `durationMs`), the drive **paces** its cycles across the
+  declared span, `classifyDaemonSoak` **refuses to verify a soak that fell short of the plan it was
+  handed**, and every report states the span it **actually** achieved plus an explicit `spannedMultiDay`
+  — so a compressed run can never be read as a multi-day claim it did not buy.
+  **Fenced / opt-in** on its own arm — `CCCTL_E2E` + `CCCTL_E2E_SOAK` (`resolveSoakE2EEnv`) — but the
+  fence sits somewhere different from every sibling's, because the prerequisite is **time, not
+  infrastructure**. What the arm buys is the **span alone**: the compressed soak against a **real**
+  daemon, its **negative control**, the classifier **and even the drive's own mechanics** (warmup /
+  pacing / settling, over an injected clock and sampler) are all credential-free and gate **every** `test`
+  run — `daemon-soak-lifecycle.test.ts` + `daemon-soak.test.ts`. It is **self-guarded** in the
+  `probeStandInLiveness` (#134) posture, and here the guard is **empirical**: a negative control wires
+  the same real daemon to a launcher that strands **one ref'd handle per session** and asserts the same
+  probe, on the same box, **does** report `drift` — naming both detectors and the type that climbed.
+  Only the **handle** is wrong: unlike #68's control, this one's surface still tears down **correctly**
+  (disabling `close()` here would yield `inconclusive` on a broken stop rather than `drift` on a leak —
+  a different finding wearing the same red; `createLeakingSoakLauncher`'s doc carries the why), which is
+  also the truer model of a slow leak — everything visible works, and the count climbs anyway.
+
 ## What is fenced to the credentialed wave
 
 - The **live-worker oracle** above is wired but **fenced** — it runs only when
@@ -399,8 +457,25 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
 The fenced oracles each gate on their own arm and **skip** when it is absent, so the commands above
 stay green on a bare checkout. To arm one, set its vars (turbo passes them through to `test:e2e`):
 
-| Oracle                                   | Arm                                                 | Infra prerequisite                                                       |
-| ---------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------ |
-| Live-worker (#133)                       | `CCCTL_E2E` + `CCCTL_SDK_URL` + `ANTHROPIC_API_KEY` | a patched worker + API credentials                                       |
-| UC1 / UC2 / full-flow gate (#65/#66/#67) | `CCCTL_E2E` + `CCCTL_E2E_TAILSCALE`                 | one real, authenticated tailnet                                          |
-| Real-pty handle residual (#68)           | `CCCTL_E2E` + `CCCTL_E2E_PTY`                       | a **spawn-capable** `node-pty` (see above — a default checkout has none) |
+| Oracle                                   | Arm                                                 | Infra prerequisite                                                        |
+| ---------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------- |
+| Live-worker (#133)                       | `CCCTL_E2E` + `CCCTL_SDK_URL` + `ANTHROPIC_API_KEY` | a patched worker + API credentials                                        |
+| UC1 / UC2 / full-flow gate (#65/#66/#67) | `CCCTL_E2E` + `CCCTL_E2E_TAILSCALE`                 | one real, authenticated tailnet                                           |
+| Real-pty handle residual (#68)           | `CCCTL_E2E` + `CCCTL_E2E_PTY`                       | a **spawn-capable** `node-pty` (see above — a default checkout has none)  |
+| Long-run daemon soak (#69)               | `CCCTL_E2E` + `CCCTL_E2E_SOAK`                      | **none — only time** (see below: the arm buys the span, not the judgment) |
+
+The soak (#69) is the one row whose prerequisite is not infrastructure. Armed with no plan it runs a
+real but **compressed** soak in seconds, and the verdict says so rather than implying otherwise. To soak
+for the **multiple days** its AC1 names, buy the span:
+
+```sh
+# A real multi-day soak: 2000 session lifecycles paced across 48h against one long-running daemon.
+CCCTL_E2E=1 CCCTL_E2E_SOAK=1 \
+CCCTL_E2E_SOAK_CYCLES=2000 CCCTL_E2E_SOAK_DURATION_MS=172800000 \
+pnpm --filter @ccctl/e2e test:e2e
+```
+
+The spec's own timeout is **computed from the plan** rather than fixed, so a multi-day arming is not
+killed by the e2e lane's 120s default before it can answer. A soak that is cut short of the plan it was
+handed self-classifies `inconclusive` — it cannot report "no leak over a long run" when it did not have
+one.
