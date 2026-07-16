@@ -1,4 +1,4 @@
-# ccctl — ClaudeCodeControl
+# ccctl
 
 A self-hosted control plane for [Claude Code](https://www.anthropic.com/claude-code).
 
@@ -64,6 +64,35 @@ workspace.
 - Node.js **≥ 22**
 - [pnpm](https://pnpm.io/) (repo pins `pnpm@11.2.2` via `packageManager`)
 
+## Maintenance contract
+
+`ccctl` currently tracks **Claude Code 2.1.207** — the version its patch
+derivation was developed and verified against. That verification is a
+maintainer-local bring-up, **not** the public release gate: the control/inference
+split above is still only hermetically verified here, and
+[#67](https://github.com/alexey-pelykh/ccctl/issues/67) remains the hard gate
+before any real-worker rollout.
+
+Support is **best-effort**. `ccctl-patch` anchors on Claude Code internals, and
+Claude Code ships often: every release tracked so far has moved them, and needed
+the patch re-derived and re-verified before it worked. Expect no same-day support
+for a new release, and no guarantee that any given version can be supported at
+all. A version that has not been re-verified is untested, not known-broken.
+
+Two properties bound what best-effort can cost you:
+
+- **Fail-closed, never silently mis-patched.** `ccctl-patch` refuses to touch a
+  Claude Code binary it does not recognize, rather than applying a patch derived
+  for a different build.
+- **No version data is bundled.** The patcher's built-in manifest is an inert
+  placeholder — the per-version anchors are derived out-of-band by the maintainer
+  and are not committed. Patching any real version means supplying a populated
+  manifest yourself (`--manifest <path>`).
+
+This contract covers version tracking only. What `ccctl` does and does not do to
+your credentials and your model traffic is a separate, stricter commitment — see
+[Security posture](docs/security-posture.md).
+
 ## Configuration
 
 The server reads its runtime configuration from the environment — set these
@@ -93,6 +122,17 @@ The packages are implemented and covered by unit and end-to-end tests. One
 guarantee is still open: the control/inference split is verified today only by a
 hermetic skeleton, so `ccctl` is not yet cleared to run against a live worker or
 real credentials — see [Security posture](docs/security-posture.md).
+
+## Naming and trademarks
+
+`ccctl` is an **unofficial** project: an independent control plane **for** Claude
+Code, built around an independent patch (`ccctl-patch`) **for** Claude Code. It is
+**not affiliated with, endorsed by, sponsored by, or supported by Anthropic PBC**.
+
+"Claude" and "Claude Code" are trademarks of Anthropic PBC, used here
+**nominatively only** — to identify the software `ccctl` interoperates with, never
+as a name for `ccctl` itself. `ccctl` is this project's only name. No Anthropic
+logo, brand font, or trade dress is used.
 
 ## License
 
