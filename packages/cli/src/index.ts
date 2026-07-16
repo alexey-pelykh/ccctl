@@ -67,6 +67,7 @@ import {
   requireLocalServerAuth,
   resolveBindHost,
   resolveHeapSnapshotDir,
+  revokeAllPairedDevices,
   type SessionLaunchOptions,
   type SessionStopOptions,
   type StopAcceptedWire,
@@ -519,6 +520,27 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
 
       const stopped = await deps.sessionClient.stop(target, sessionId, stopOptions);
       console.log(`ccctl: ${describeStopAccepted(stopped, serverUrl(target.host, target.port))}`);
+    });
+
+  // --- revoke-all: the panic kill — revoke every paired device at once -------------------
+  program
+    .command("revoke-all")
+    .description("Revoke every paired device at once (panic kill) — invalidate all device tokens and force re-pairing")
+    .action(async () => {
+      // Adapter-agnostic AND daemon-independent by design: operate directly on the server-side
+      // device store (no tunnel adapter, no running daemon or network round-trip), which is exactly
+      // what makes this a robust panic control — it works even when the daemon or its tunnel is down.
+      // Emptying the registry drops every device's at-rest token hash, so every existing token is
+      // refused on next use and every device must re-pair. Unlike `ccctl stop <id>` (one session) or
+      // per-device revoke, this wipes ALL paired devices in one action.
+      const revoked = await revokeAllPairedDevices(deps.deviceStore);
+      if (revoked === 0) {
+        console.log("ccctl: no devices are paired — nothing to revoke.");
+        return;
+      }
+      console.log(
+        `ccctl: revoked ${revoked} device${revoked === 1 ? "" : "s"} — every device must re-pair (scan a fresh QR from \`ccctl serve --tunnel\` / \`ccctl tunnel\`).`,
+      );
     });
 
   return program;

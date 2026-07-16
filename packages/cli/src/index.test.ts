@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { HostEndpoint, Logger } from "@ccctl/core";
+import { DEVICE_STORE_SNAPSHOT_VERSION, deviceTokenHash, pairedDevice } from "@ccctl/core";
+import type { DeviceStoreSnapshot, HostEndpoint, IDeviceStore, Logger } from "@ccctl/core";
 import {
   LOCAL_SERVER_AUTH_ENV,
   XDG_CONFIG_HOME_ENV,
@@ -56,6 +57,8 @@ interface FakeDepsOptions {
   readonly steer?: (target: HostEndpoint, sessionId: string, command: SteerCommand) => Promise<string>;
   /** Override the session-client `stop` (e.g. to reject with a typed refusal); defaults to a successful kill. */
   readonly stop?: (target: HostEndpoint, sessionId: string, options: SessionStopOptions) => Promise<StopAcceptedWire>;
+  /** Seed the `revoke-all` device store (#88); defaults to `null` — a never-paired store. */
+  readonly deviceSnapshot?: DeviceStoreSnapshot | null;
 }
 
 /** Build fake {@link CliDependencies} plus handles to the spies the assertions read. */
@@ -75,6 +78,8 @@ function makeDeps(options: FakeDepsOptions = {}): {
   disposeHeapSnapshotHandler: ReturnType<typeof vi.fn>;
   installInspectorDiagnosticsHandler: ReturnType<typeof vi.fn>;
   disposeInspectorDiagnosticsHandler: ReturnType<typeof vi.fn>;
+  deviceStore: IDeviceStore;
+  deviceSaves: DeviceStoreSnapshot[];
 } {
   // A fake bind: echo the requested host, and resolve `--port 0` to a concrete ephemeral
   // port so a test can prove `server.address` (not the requested port) is what's reported.
@@ -156,12 +161,27 @@ function makeDeps(options: FakeDepsOptions = {}): {
   const installInspectorDiagnosticsHandler = vi.fn(
     (_options: { readonly logger: Logger }) => disposeInspectorDiagnosticsHandler,
   );
+  // The device store the `revoke-all` verb drives (#88). A minimal in-memory IDeviceStore seeded
+  // from `deviceSnapshot` (default `null` — nothing paired) that records every `save`, so a test
+  // asserts both the reported count AND whether a save happened (the nothing-to-revoke path must
+  // touch no disk) — without a real state file.
+  const deviceSaves: DeviceStoreSnapshot[] = [];
+  let deviceSnapshot: DeviceStoreSnapshot | null = options.deviceSnapshot ?? null;
+  const deviceStore: IDeviceStore = {
+    load: () => Promise.resolve(deviceSnapshot),
+    save: (snapshot: DeviceStoreSnapshot) => {
+      deviceSaves.push(snapshot);
+      deviceSnapshot = snapshot;
+      return Promise.resolve();
+    },
+  };
   return {
     deps: {
       startServer,
       adapters,
       runPatcher,
       sessionClient,
+      deviceStore,
       launcher,
       installHeapSnapshotHandler,
       installInspectorDiagnosticsHandler,
@@ -181,6 +201,8 @@ function makeDeps(options: FakeDepsOptions = {}): {
     disposeHeapSnapshotHandler,
     installInspectorDiagnosticsHandler,
     disposeInspectorDiagnosticsHandler,
+    deviceStore,
+    deviceSaves,
   };
 }
 
@@ -922,5 +944,60 @@ describe("ccctl stop — the emergency stop (#77 AC2)", () => {
       /invalid port/,
     );
     expect(stop).not.toHaveBeenCalled();
+  });
+});
+
+describe("ccctl revoke-all — the panic kill (#88 / W6-20)", () => {
+  /** A registry of `count` paired devices, for seeding the fake device store. */
+  function seededRegistry(count: number): DeviceStoreSnapshot {
+    return {
+      version: DEVICE_STORE_SNAPSHOT_VERSION,
+      devices: Array.from({ length: count }, (_, index) =>
+        pairedDevice({ id: `dev-${index + 1}`, name: `device ${index + 1}`, tokenHash: deviceTokenHash(`h${index}`) }),
+      ),
+    };
+  }
+
+  it("revokes every paired device in one action and reports the count + re-pair instruction (AC1)", async () => {
+    const { deps, deviceSaves } = makeDeps({ deviceSnapshot: seededRegistry(3) });
+
+    await buildProgram(deps).parseAsync(["revoke-all"], { from: "user" });
+
+    expect(loggedText()).toContain("revoked 3 devices");
+    expect(loggedText()).toContain("must re-pair");
+    // The registry the store now holds is empty — every device's token hash is gone.
+    expect(deviceSaves).toHaveLength(1);
+    expect(deviceSaves[0]?.devices).toEqual([]);
+  });
+
+  it("says one device singularly — a panic kill of a single paired device", async () => {
+    const { deps } = makeDeps({ deviceSnapshot: seededRegistry(1) });
+
+    await buildProgram(deps).parseAsync(["revoke-all"], { from: "user" });
+
+    expect(loggedText()).toContain("revoked 1 device —");
+    expect(loggedText()).not.toContain("1 devices");
+  });
+
+  it("reports nothing to revoke — and writes nothing — when no device is paired (never-saved store)", async () => {
+    const { deps, deviceSaves } = makeDeps({ deviceSnapshot: null });
+
+    await buildProgram(deps).parseAsync(["revoke-all"], { from: "user" });
+
+    expect(loggedText()).toContain("no devices are paired");
+    // The nothing-to-revoke path must touch no disk — no fabricated empty registry saved.
+    expect(deviceSaves).toHaveLength(0);
+  });
+
+  it("is adapter-agnostic — no tunnel is touched and no daemon is contacted (a local store op)", async () => {
+    const { deps, establish, startServer, list } = makeDeps({ deviceSnapshot: seededRegistry(2) });
+
+    await buildProgram(deps).parseAsync(["revoke-all"], { from: "user" });
+
+    // A panic kill reaches neither a tunnel adapter nor the daemon's /api/sessions — it is a
+    // direct device-store operation, which is what makes it work even when those are down.
+    expect(establish).not.toHaveBeenCalled();
+    expect(startServer).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
   });
 });
