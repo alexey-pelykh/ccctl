@@ -4,8 +4,11 @@
 import { describe, it, expect } from "vitest";
 import {
   DEFAULT_REQUIRES_ACTION_DETAIL,
+  SESSION_CLOSED_EVENT_TYPE,
   WORKER_STATUS_SUBTYPE,
   decodeControlEvent,
+  decodeSessionClosed,
+  closedText,
   isWorkerStatusEvent,
   activityText,
   activityFromEvent,
@@ -155,5 +158,87 @@ describe("processEventData", () => {
 
   it("routes an undecodable line to an unparsed instruction, verbatim", () => {
     expect(processEventData("{broken")).toEqual({ kind: "unparsed", raw: "{broken" });
+  });
+
+  it("routes the server's terminal frame to a closed instruction, carrying its human line (#196)", () => {
+    expect(processEventData(line({ type: SESSION_CLOSED_EVENT_TYPE, session_id: "sess-1", status: "closed" }))).toEqual(
+      { kind: "closed", status: "closed", text: "Session ended." },
+    );
+  });
+
+  it("carries an `errored` terminal status through to its own line (#196)", () => {
+    expect(
+      processEventData(line({ type: SESSION_CLOSED_EVENT_TYPE, session_id: "sess-1", status: "errored" })),
+    ).toEqual({ kind: "closed", status: "errored", text: "Session ended — errored." });
+  });
+});
+
+describe("decodeSessionClosed — the server's terminal frame (#196)", () => {
+  // Rule: the page acts on this frame by closing its own stream and telling the operator the session is
+  // over. Both are irreversible-looking to a watching human, so the frame must be exactly right or not
+  // this frame at all: an `unparsed` blob is a line they can read, while a loose decode announces a live
+  // session dead.
+
+  it("decodes a well-formed terminal frame", () => {
+    expect(
+      decodeSessionClosed(line({ type: SESSION_CLOSED_EVENT_TYPE, session_id: "sess-1", status: "closed" })),
+    ).toEqual({ status: "closed" });
+  });
+
+  it("decodes an `errored` terminal frame — the diagnosis the server preserved reaches the watcher", () => {
+    expect(
+      decodeSessionClosed(line({ type: SESSION_CLOSED_EVENT_TYPE, session_id: "sess-1", status: "errored" })),
+    ).toEqual({ status: "errored" });
+  });
+
+  it("fails closed on invalid JSON", () => {
+    expect(decodeSessionClosed("{not json")).toBeNull();
+  });
+
+  it("fails closed on non-object JSON (array, number, null, string)", () => {
+    expect(decodeSessionClosed(line([1, 2, 3]))).toBeNull();
+    expect(decodeSessionClosed(line(42))).toBeNull();
+    expect(decodeSessionClosed(line(null))).toBeNull();
+    expect(decodeSessionClosed(line("closed"))).toBeNull();
+  });
+
+  it("fails closed on another frame's type — a worker's control event is never a terminal frame", () => {
+    expect(decodeSessionClosed(line({ type: "control_event", subtype: "message" }))).toBeNull();
+    // Its own `ccctl_` siblings are not it either: the namespace is shared, the `type` is the discriminant.
+    expect(decodeSessionClosed(line({ type: "ccctl_session_idle", session_id: "sess-1" }))).toBeNull();
+  });
+
+  it("fails closed on a NON-terminal status — a session cannot end as `ready`", () => {
+    // The frame's whole claim is that the session is OVER. A status outside the terminal set means the
+    // sender and this reader disagree about what the frame means, and the safe reading of a disagreement
+    // is not "it ended anyway".
+    expect(decodeSessionClosed(line({ type: SESSION_CLOSED_EVENT_TYPE, session_id: "s", status: "ready" }))).toBeNull();
+    expect(
+      decodeSessionClosed(line({ type: SESSION_CLOSED_EVENT_TYPE, session_id: "s", status: "registering" })),
+    ).toBeNull();
+  });
+
+  it("fails closed on a missing / blank / non-string status", () => {
+    expect(decodeSessionClosed(line({ type: SESSION_CLOSED_EVENT_TYPE, session_id: "s" }))).toBeNull();
+    expect(decodeSessionClosed(line({ type: SESSION_CLOSED_EVENT_TYPE, session_id: "s", status: "" }))).toBeNull();
+    expect(decodeSessionClosed(line({ type: SESSION_CLOSED_EVENT_TYPE, session_id: "s", status: 1 }))).toBeNull();
+  });
+
+  it("does not require a `session_id` — the per-session stream already named it (#20)", () => {
+    // Deliberate: the frame arrived on the only stream it could have. Requiring the id would invite
+    // trusting a self-reported one over the channel it came in on.
+    expect(decodeSessionClosed(line({ type: SESSION_CLOSED_EVENT_TYPE, status: "closed" }))).toEqual({
+      status: "closed",
+    });
+  });
+});
+
+describe("closedText", () => {
+  it("says the session ended", () => {
+    expect(closedText("closed")).toBe("Session ended.");
+  });
+
+  it("says HOW it ended when it errored — a failure and a stop are different news", () => {
+    expect(closedText("errored")).toBe("Session ended — errored.");
   });
 });

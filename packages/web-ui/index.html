@@ -188,6 +188,14 @@
       #events li[data-outbound] {
         color: #1d4ed8;
       }
+      /* The session's terminal frame (#196) — ccctl's own word that it is over, not a line of the
+         transcript. Red (the page's "this is bad news" hue, as an offline connection or the stop
+         button) and bold: it is the last entry the stream will ever carry, and the operator scanning
+         a dead session's transcript needs to find it without reading to the end. */
+      #events li[data-closed] {
+        color: #b91c1c;
+        font-weight: 600;
+      }
       /* The emergency stop (#77). Red — the page's existing "this is bad news" hue (an offline
          connection, a failed launch) — and, unlike every other control here, OUTLINED rather than
          plain: it is the one button that destroys what it touches, so it must not read as another

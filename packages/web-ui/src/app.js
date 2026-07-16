@@ -278,6 +278,42 @@ function appendUnparsed(raw) {
   eventsEl.appendChild(li);
 }
 
+/** Append the session's terminal line, marked so it reads as ccctl's word, not the worker's. */
+function appendClosed(text) {
+  const li = document.createElement("li");
+  li.dataset.closed = "true";
+  li.textContent = text;
+  eventsEl.appendChild(li);
+}
+
+/**
+ * The session reached its terminal state and the server said so on its stream (#196) — the last frame
+ * before it reaps the relay.
+ *
+ * `disconnect()` FIRST, and it is the half that fixes the actual complaint. The server's `res.end()` is
+ * already on its way; an EventSource still open when it lands reads it as a fault — fires `error`, paints
+ * "disconnected — reconnecting…", drives the health indicator to `reconnecting` over a link that is
+ * perfectly fine, and retries into a 404 for a session that no longer exists. The frame's entire purpose
+ * is that this end was EXPECTED, so the page must stop expecting more of it rather than mourn a
+ * connection that never broke.
+ *
+ * The line goes in the TRANSCRIPT, not only on the status line, for the reason the poll's vanished-session
+ * branch already spells out: `statusEl` is transport state and is overwritten with "no session selected"
+ * within a poll, while `eventsEl` is the historical record and survives. "Session ended." is the last true
+ * thing about the runaway the operator just killed, so it belongs at the foot of the evidence of what it
+ * did — not in the one place that is about to be reused. The status line is set too, for the seconds
+ * before the poll catches up: it is the honest answer to "why did the stream stop".
+ *
+ * `activityEl` goes for the reason it goes there too: it is a LIVE claim about a session that has ended,
+ * and leaving it is how an operator reads "Running…" over the session they just stopped.
+ */
+function renderSessionClosed(text) {
+  disconnect();
+  appendClosed(text);
+  statusEl.textContent = text;
+  activityEl.hidden = true;
+}
+
 /** Update the current-turn indicator in place (latest worker_status wins). */
 function renderActivity(status, text) {
   activityEl.hidden = false;
@@ -311,6 +347,9 @@ function handleEvent(data) {
       break;
     case "transcript":
       appendTranscript(instruction.subtype, instruction.summary);
+      break;
+    case "closed":
+      renderSessionClosed(instruction.text);
       break;
     case "unparsed":
       appendUnparsed(instruction.raw);
