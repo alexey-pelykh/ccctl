@@ -14,7 +14,8 @@ allowBuilds:
   # Loading is NOT spawning, and darwin does NOT work out of the box: the shipped
   # prebuilds/darwin-*/spawn-helper is mode 644 and no node-pty script chmods it, so every spawn
   # fails with `posix_spawnp failed` until someone runs `chmod +x` on it. Flipping this flag does
-  # NOT fix that — see packages/e2e/README.md § "What is fenced" (#68) for the per-platform levers.
+  # NOT fix that — see packages/e2e/README.md § "What is fenced to the credentialed wave" (#68) for
+  # the per-platform levers.
   # It ships NO Linux prebuild, so a Linux operator who actually needs the pty fallback must
   # flip this to `true` (compiling node-pty from source) — the daemon-wiring item that deploys
   # the launcher owns that call, and owns the darwin chmod too. The backend itself is functional

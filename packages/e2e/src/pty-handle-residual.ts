@@ -72,7 +72,8 @@
  * spawn a pty on EITHER platform, for two DIFFERENT reasons. node-pty resolves its binding
  * `build/Release` → `build/Debug` → `prebuilds/<platform>-<arch>` (`lib/utils.js` §
  * `loadNativeModule`), and its `install` is `node scripts/prebuild.js || node-gyp rebuild`, where
- * `prebuild.js` ONLY probes for the prebuild directory (present → `exit 0`, absent → `exit 1`):
+ * `prebuild.js` PROBES for the prebuild directory (present → `exit 0`, absent → `exit 1`; only under
+ * `npm_config_build_from_source=true` does it also DELETE `prebuilds/` and exit 1). It never chmods:
  *
  *   1. **Linux** — node-pty ships NO Linux prebuild, so `prebuild.js` exits 1 and `node-gyp rebuild`
  *      is what would produce `build/Release`. `pnpm-workspace.yaml`'s `allowBuilds: node-pty: false`
@@ -81,9 +82,11 @@
  *   2. **darwin** — a prebuild IS shipped, so `prebuild.js` exits 0, `node-gyp` NEVER runs (the `||`
  *      short-circuits), and the binding loads fine. But the shipped
  *      `prebuilds/darwin-<arch>/spawn-helper`
- *      is mode `644` — NOT executable — and NO node-pty script ever chmods it (`prebuild.js` only
- *      probes; `post-install.js` touches `build/Release` + win32's `conpty.dll` only; the package
- *      contains no `chmod` at all). So every spawn fails with `posix_spawnp failed`. Flipping
+ *      is mode `644` — NOT executable — and NO node-pty script ever chmods it (`prebuild.js` probes
+ *      and, under `npm_config_build_from_source`, deletes; `post-install.js` touches `build/Release`
+ *      + win32's `conpty.dll` only; the package contains no `chmod` at all, which is verifiable
+ *      against the pristine tarball rather than a working tree someone may already have armed). So
+ *      every spawn fails with `posix_spawnp failed`. Flipping
  *      `allowBuilds` does NOT fix this — it is neither necessary nor sufficient here, since the script
  *      it unblocks exits before `node-gyp` and would not have chmodded anything anyway. The actual
  *      lever is `chmod +x` on that prebuilt helper (the package README carries the runbook).

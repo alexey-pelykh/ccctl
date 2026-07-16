@@ -339,8 +339,9 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
     which is what makes the arming step non-obvious enough to be worth spelling out. node-pty resolves
     its binding in the order `build/Release` → `build/Debug` → `prebuilds/<platform>-<arch>`
     (`lib/utils.js` § `loadNativeModule`), and its `install` script is
-    `node scripts/prebuild.js || node-gyp rebuild`, where `prebuild.js` **only probes** for the
-    prebuild directory: present → `exit 0`, absent → `exit 1`. So:
+    `node scripts/prebuild.js || node-gyp rebuild`, where `prebuild.js` **probes** for the prebuild
+    directory: present → `exit 0`, absent → `exit 1` (and, only under
+    `npm_config_build_from_source=true`, deletes `prebuilds/` and exits 1). It never chmods. So:
 
     - **Linux** — node-pty ships **no Linux prebuild**, so `prebuild.js` exits 1 and `node-gyp rebuild`
       is what would produce `build/Release`. `pnpm-workspace.yaml` sets `allowBuilds: node-pty: false`,
@@ -383,8 +384,10 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
     naming the typed failure the daemon itself reported (`backend-unavailable` / `spawn-failed`) — and
     the spec `ctx.skip`s with that reason rather than faking a green. **That is the safe behavior, but
     it does mean a mis-armed run reports green-with-a-skip**: if you armed the oracle deliberately, read
-    the skip reason — an `inconclusive` naming `spawn-failed` means the chmod above is what is missing,
-    not that the daemon is fine.
+    the skip reason. An `inconclusive` naming `spawn-failed` is **usually** the missing `chmod` — but
+    `spawn-failed` is the daemon's honest catch-all for a spawn throw it cannot classify structurally
+    (`session-launcher.ts`), so it names the symptom and not the cause; check the mode bit rather than
+    assume. What it never means is that the daemon is fine.
 
 ## Running
 
