@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { describe, expect, it } from "vitest";
-import { createSession, markSessionReady, type Session } from "@ccctl/core";
+import { createSession, markSessionReady, NO_OP_LOGGER, type LogEvent, type Logger, type Session } from "@ccctl/core";
 import { createSessionEventRelays, relayFor } from "./event-stream.js";
 import { closeSession, type SessionCloseState } from "./session-close.js";
 
@@ -11,8 +11,14 @@ import { closeSession, type SessionCloseState } from "./session-close.js";
 // HTTP, no surfaces. The wired-through behavior is covered by `ui-session-stop.test.ts` (the stop path)
 // and `worker-channel.test.ts` (the #173 eviction path).
 
-function makeState(): SessionCloseState {
-  return { sessions: new Map<string, Session>(), eventRelays: createSessionEventRelays() };
+function makeState(logger: Logger = NO_OP_LOGGER): SessionCloseState {
+  return { sessions: new Map<string, Session>(), eventRelays: createSessionEventRelays(), logger };
+}
+
+/** A capturing sink so a test can assert the structured trail (#61) the transition emitted. */
+function captureLogger(): { logger: Logger; events: LogEvent[] } {
+  const events: LogEvent[] = [];
+  return { logger: { log: (event) => events.push(event) }, events };
 }
 
 describe("closeSession", () => {
@@ -77,5 +83,48 @@ describe("closeSession", () => {
 
     expect(state.sessions.has("sess-2")).toBe(true);
     expect(state.eventRelays.has("sess-2")).toBe(true);
+  });
+});
+
+describe("closeSession structured logging (#61)", () => {
+  // Rule: every session death funnels through this one seam, so a `created` with no matching `closed`
+  // is a leaked slot the trail exposes.
+  it("emits a `session`/`closed` event naming the session and its terminal status", () => {
+    const { logger, events } = captureLogger();
+    const state = makeState(logger);
+    state.sessions.set("sess-1", markSessionReady(createSession("sess-1", "default")));
+
+    closeSession(state, "sess-1");
+
+    expect(events).toEqual([
+      {
+        category: "session",
+        level: "info",
+        event: "closed",
+        sessionId: "sess-1",
+        status: "closed",
+        detail: "session ended (closed)",
+      },
+    ]);
+  });
+
+  it("carries the terminal status through — an errored session is logged `errored`, not overwritten", () => {
+    const { logger, events } = captureLogger();
+    const state = makeState(logger);
+    state.sessions.set("sess-1", { ...createSession("sess-1", "default"), status: "errored" });
+
+    closeSession(state, "sess-1");
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ category: "session", event: "closed", status: "errored" });
+  });
+
+  it("emits NOTHING for a session that was already gone — an idempotent no-op does not fabricate a death", () => {
+    const { logger, events } = captureLogger();
+    const state = makeState(logger);
+
+    closeSession(state, "never-existed");
+
+    expect(events).toEqual([]);
   });
 });

@@ -13,6 +13,7 @@ import {
   workerEventsStreamPath,
   workerHeartbeatPath,
   workerRegisterPath,
+  type LogEvent,
 } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
 import {
@@ -1511,5 +1512,108 @@ describe("§4/§5 notification classes — blocking and informational are firewa
 
     expect(idleEvents(ui).every((event) => event.notification_class === NOTIFICATION_CLASS_INFORMATIONAL)).toBe(true);
     expect(needsInputEvents(ui).every((event) => event.notification_class === NOTIFICATION_CLASS_BLOCKING)).toBe(true);
+  });
+});
+
+// --- #61: structured logging — detection (worker_status transitions, staleness) + notification dispatch ---
+
+/** Start a server whose events are captured by an injected sink, so the #61 trail can be asserted. */
+async function startLoggingServer(
+  events: LogEvent[],
+  overrides: { sessionIdleThresholdMs?: number } = {},
+): Promise<CcctlServer> {
+  const server = await startServer({
+    port: 0,
+    host: DEFAULT_HOST,
+    logger: { log: (event) => events.push(event) },
+    ...overrides,
+  });
+  started.push(server);
+  return server;
+}
+
+describe("§4/§5 structured logging — detection + notification (#61)", () => {
+  it("emits a detection `activity` event and an `awaiting-input` notification on a requires_action transition", async () => {
+    const events: LogEvent[] = [];
+    const server = await startLoggingServer(events);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // A fresh session starts idle, so `requires_action` is a real transition.
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+
+    // Detection: the activity KIND moved to requires_action.
+    expect(
+      events.some(
+        (event) => event.category === "detection" && event.event === "activity" && event.activity === "requires_action",
+      ),
+    ).toBe(true);
+    // Notification: the blocking needs-you was dispatched, NAMING the session (AC: not a generic nudge).
+    expect(
+      events.some(
+        (event) =>
+          event.category === "notification" && event.event === "awaiting-input" && event.sessionId === sessionId,
+      ),
+    ).toBe(true);
+  });
+
+  it("emits detection `activity` events for each transition and, past the threshold, an `idle` notification", async () => {
+    const events: LogEvent[] = [];
+    const server = await startLoggingServer(events, { sessionIdleThresholdMs: 40 });
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // idle → running → idle: two real activity-kind transitions, and the final idle arms the nudge timer.
+    expect((await putStatus(server, sessionId, epoch, "running")).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+
+    const activityKinds = events
+      .filter((event) => event.category === "detection" && event.event === "activity")
+      .map((event) => (event.category === "detection" ? event.activity : ""));
+    expect(activityKinds).toContain("running");
+    expect(activityKinds).toContain("idle");
+
+    // The idle nudge fires after the threshold, naming the session.
+    await waitFor(() => events.some((event) => event.category === "notification" && event.event === "idle"));
+    expect(
+      events.some(
+        (event) => event.category === "notification" && event.event === "idle" && event.sessionId === sessionId,
+      ),
+    ).toBe(true);
+  });
+
+  it("never emits a detection `activity` event on a same-kind frame — only real transitions are logged", async () => {
+    const events: LogEvent[] = [];
+    const server = await startLoggingServer(events);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // Fresh session is already idle; a redundant idle frame bumps lastActivityAt but is not a transition.
+    expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
+
+    expect(events.filter((event) => event.category === "detection" && event.event === "activity")).toEqual([]);
+  });
+
+  it("emits a detection `worker-registered` event on EACH worker (re-)register — a flapping worker leaves a repeating trail", async () => {
+    const events: LogEvent[] = [];
+    const server = await startLoggingServer(events);
+    const sessionId = await registerSession(server);
+
+    await registerWorker(server, sessionId); // first check-in
+    await registerWorker(server, sessionId); // re-register SUPERSEDES the prior epoch — the flap signal
+
+    const registered = events.filter(
+      (event) => event.category === "detection" && event.event === "worker-registered" && event.sessionId === sessionId,
+    );
+    // Both the first check-in and the supersede leave a line, so a churning (repeatedly re-registering)
+    // worker is VISIBLE as a repeating trail — the "is this session leaking/flapping?" AC — rather than
+    // a single silent attach. The detail carries only the monotonic epoch, no worker-presented secret.
+    expect(registered).toHaveLength(2);
+    expect(registered[0]).toMatchObject({
+      category: "detection",
+      event: "worker-registered",
+      detail: "registered (epoch 1)",
+    });
+    expect(registered[1]).toMatchObject({ event: "worker-registered", detail: "re-registered (epoch 1→2)" });
   });
 });

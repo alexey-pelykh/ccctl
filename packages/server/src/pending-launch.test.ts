@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, wr
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import type { Session } from "@ccctl/core";
+import { NO_OP_LOGGER, type LogEvent, type Logger, type Session } from "@ccctl/core";
 import { createSessionEventRelays, relayFor } from "./event-stream.js";
 import {
   canonicalCwd,
@@ -46,14 +46,21 @@ function fakeLaunched(liveness: SurfaceLiveness = "alive-server-owned") {
   return { launched, closeCount: (): number => closes };
 }
 
-function makeState(registrationTimeoutMs = 60_000): PendingLaunchState {
+function makeState(registrationTimeoutMs = 60_000, logger: Logger = NO_OP_LOGGER): PendingLaunchState {
   return {
     sessions: new Map<string, Session>(),
     launchedSurfaces: new Map<string, LaunchedSession>(),
     pendingLaunches: new Map<string, PendingLaunch>(),
     eventRelays: createSessionEventRelays(),
     registrationTimeoutMs,
+    logger,
   };
+}
+
+/** A capturing sink so a test can assert the lifecycle trail (#61) a launch birth / ghost eviction emitted. */
+function captureLogger(): { logger: Logger; events: LogEvent[] } {
+  const events: LogEvent[] = [];
+  return { logger: { log: (event) => events.push(event) }, events };
 }
 
 const OPTIONS: SessionLaunchOptions = { cwd: "/work/atlas", permissionMode: "default" };
@@ -535,5 +542,48 @@ describe("clearPendingLaunches", () => {
     await sleep(120);
     expect(closeCount()).toBe(0);
     expect(state.sessions.has("sess-1")).toBe(true);
+  });
+});
+
+describe("pending-launch structured logging (#61)", () => {
+  // Rule: a launch's `registering` birth and its ghost eviction both emit, so a launcher stuck at
+  // `registering` — a leak-prone state — is diagnosable by a `created` with no matching `closed`.
+  it("emits a `session`/`created` event, marked `registering`, when a launch is tracked", () => {
+    const { logger, events } = captureLogger();
+    const state = makeState(60_000, logger);
+
+    trackPendingLaunch(state, "sess-1", OPTIONS, fakeLaunched().launched);
+
+    expect(events).toEqual([
+      {
+        category: "session",
+        level: "info",
+        event: "created",
+        sessionId: "sess-1",
+        status: "registering",
+        detail: "launched, awaiting §2 registration",
+      },
+    ]);
+  });
+
+  it("emits an `evicted` event when a launch never registers within the window (#33)", async () => {
+    const { logger, events } = captureLogger();
+    const state = makeState(60_000, logger);
+    trackPendingLaunch(state, "sess-1", OPTIONS, fakeLaunched().launched);
+
+    await evictPendingLaunch(state, "sess-1");
+
+    // Birth then ghost death, paired by session id — exactly the pair a leak hunt correlates.
+    expect(events.map((event) => event.event)).toEqual(["created", "evicted"]);
+    expect(events[1]).toMatchObject({ category: "session", event: "evicted", sessionId: "sess-1", status: "closed" });
+  });
+
+  it("emits NOTHING when evicting a launch that was already claimed or gone (idempotent)", async () => {
+    const { logger, events } = captureLogger();
+    const state = makeState(60_000, logger);
+
+    await evictPendingLaunch(state, "never-tracked");
+
+    expect(events).toEqual([]);
   });
 });

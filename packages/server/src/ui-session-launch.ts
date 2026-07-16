@@ -521,7 +521,17 @@ export function handleSessionLaunch(req: IncomingMessage, res: ServerResponse, s
     } catch (error) {
       // Typed by the guard that refused it or the backend that failed; anything unclassifiable
       // becomes an honest `spawn-failed` rather than a guessed code.
-      writeLaunchFailure(res, toLaunchFailure(error));
+      const failure = toLaunchFailure(error);
+      // Error trail (#61): a "New session" launch was refused or failed — the operator could not start
+      // a session. The typed code IS the diagnosis (launcher-absent / at-capacity / spawn-failed / …).
+      state.logger.log({
+        category: "error",
+        level: "warn",
+        event: "launch-failed",
+        sessionId: null,
+        detail: `${failure.code}: ${failure.message}`,
+      });
+      writeLaunchFailure(res, failure);
     }
   });
 }

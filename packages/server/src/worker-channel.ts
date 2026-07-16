@@ -91,6 +91,7 @@ import {
   type ControlFrame,
   type ControlRequest,
   type JsonValue,
+  type Logger,
   type Session,
 } from "@ccctl/core";
 import { broadcastEvent, type SessionEventRelays } from "./event-stream.js";
@@ -328,6 +329,13 @@ export interface WorkerChannelState extends WorkerChannelReapState {
    * same per-session stream ({@link fireIdleEvent}).
    */
   readonly eventRelays: SessionEventRelays;
+  /**
+   * The structured-log sink (#61) — the worker channel is where the daemon's stall signals live:
+   * `ready` transitions, `worker_status` activity changes, staleness, and the needs-you / idle
+   * notifications. Also satisfies {@link SessionCloseState.logger} for the {@link considerEviction}
+   * → {@link closeSession} terminal path.
+   */
+  readonly logger: Logger;
 }
 
 /** A matched §4/§5 worker-channel leg plus the session it addresses. */
@@ -458,6 +466,19 @@ export function handleWorkerRegister(
     evictionTimer: null,
     idleTimer: null,
   });
+  // Detection trail (#61): a worker generation attached. The first register is the worker checking
+  // in; a re-register SUPERSEDES the prior epoch (`prev` present), so a REPEATING one is a flapping
+  // worker — exactly the churn signal the stall/leak trail exists to surface (a silent re-attach
+  // would hide it). `detail` carries only the epoch (a monotonic integer), never anything the worker
+  // presented, so no session-ingress token can ride this line.
+  state.logger.log({
+    category: "detection",
+    level: "info",
+    event: "worker-registered",
+    sessionId,
+    activity: session.activity.kind,
+    detail: prev === undefined ? `registered (epoch ${epoch})` : `re-registered (epoch ${prev.epoch}→${epoch})`,
+  });
   writeJson(res, 200, { worker_epoch: epoch });
 }
 
@@ -509,7 +530,20 @@ export function handleWorkerEventsStream(
   // session, and the reverse leg (`→closed`/`errored` on teardown) is a separate transition.
   const session = state.sessions.get(sessionId);
   if (session !== undefined) {
-    state.sessions.set(sessionId, markSessionReady(session));
+    const ready = markSessionReady(session);
+    state.sessions.set(sessionId, ready);
+    // Lifecycle transition (#61): log only a REAL advance (`markSessionReady` is a no-op on an
+    // already-ready session), so a re-opened downstream does not spam a `ready` that did not move.
+    if (ready.status !== session.status) {
+      state.logger.log({
+        category: "session",
+        level: "info",
+        event: "status",
+        sessionId,
+        status: ready.status,
+        detail: `${session.status}→${ready.status}`,
+      });
+    }
   }
   // Arm the per-session liveness interval (#166): a no-op `client_event` every
   // `workerLivenessIntervalMs` keeps THIS held-open downstream past the worker's ~45s
@@ -543,6 +577,28 @@ export function handleWorkerEventsStream(
 }
 
 /**
+ * Emit a DETECTION log event (#61) for a worker_status transition — but only when the activity KIND
+ * actually MOVED (running / requires_action / idle), not on every well-formed frame. A frame that only
+ * bumps `lastActivityAt` (running→running) advances the session (so the caller's `next !== session`
+ * holds) yet is not a state change worth a line; logging every one would drown the running→idle and
+ * idle→requires_action transitions that ARE the stall signal. Shared by the §4 gate and the §5 leg so
+ * one rule governs both — the same "one derivation, both legs" discipline the reconciles follow.
+ */
+function logActivityTransition(state: WorkerChannelState, sessionId: string, prev: Session, next: Session): void {
+  if (prev.activity.kind === next.activity.kind) {
+    return;
+  }
+  state.logger.log({
+    category: "detection",
+    level: "info",
+    event: "activity",
+    sessionId,
+    activity: next.activity.kind,
+    detail: `${prev.activity.kind}→${next.activity.kind}`,
+  });
+}
+
+/**
  * Fold a §5 payload into the session's classification when it is a `worker_status` frame
  * (#39). This is the leg that carries the RICH frame — `payload: { status, detail }` — so it
  * is the ONLY place the human-ready tool description enters the session model; the §4 gate
@@ -569,6 +625,8 @@ function foldWorkerStatus(state: WorkerChannelState, sessionId: string, payload:
   const next = applyWorkerStatusFrame(session, payload as ControlFrame);
   if (next !== session) {
     state.sessions.set(sessionId, next);
+    // Detection trail (#61): the §5 leg observed a worker_status transition.
+    logActivityTransition(state, sessionId, session, next);
     // A worker_status was observed (#41): arm the idle timer on a move INTO idle, clear it on any move
     // off idle. `applyWorkerStatusFrame` returns a NEW session for every well-formed worker_status
     // frame (it advances `lastActivityAt`), so `next !== session` is exactly "a status frame applied";
@@ -639,6 +697,8 @@ export function handleWorkerStatus(
     if (session !== undefined) {
       const next = applyWorkerStatus(session, workerStatus);
       state.sessions.set(sessionId, next);
+      // Detection trail (#61): the §4 gate observed a worker_status transition — same derivation as §5.
+      logActivityTransition(state, sessionId, session, next);
       // The §4 gate is the other place `idle` is observed (#41) — reconcile the idle timer off the
       // resulting activity exactly as the §5 leg does, so one derivation governs both legs.
       reconcileIdleTimer(state, sessionId, next);
@@ -974,6 +1034,14 @@ function reconcileNeedsInput(state: WorkerChannelState, sessionId: string, prev:
   if (isSessionStale(next, Date.now(), state.sessionEvictionGraceMs)) {
     return; // awaiting but heartbeat-stale — eviction's job (#173), not a nudge.
   }
+  // Notification trail (#61/#43): the blocking needs-you, named to the session, is being dispatched.
+  state.logger.log({
+    category: "notification",
+    level: "warn",
+    event: "awaiting-input",
+    sessionId,
+    detail: activity.detail,
+  });
   broadcastEvent(state.eventRelays, sessionId, needsInputEvent(sessionId, activity.detail));
 }
 
@@ -1009,6 +1077,14 @@ function fireIdleEvent(state: WorkerChannelState, sessionId: string, record: Wor
   if (isSessionStale(session, Date.now(), state.sessionEvictionGraceMs)) {
     return; // idle but no longer heart-beating — eviction's job, not a nudge.
   }
+  // Notification trail (#61/#41): the informational idle nudge, named to the session, is being dispatched.
+  state.logger.log({
+    category: "notification",
+    level: "info",
+    event: "idle",
+    sessionId,
+    detail: `idle > ${String(state.sessionIdleThresholdMs)}ms`,
+  });
   broadcastEvent(state.eventRelays, sessionId, idleEvent(sessionId, state.sessionIdleThresholdMs));
 }
 
@@ -1171,6 +1247,17 @@ function considerEviction(state: WorkerChannelState, sessionId: string, record: 
     scheduleEviction(state, sessionId, record);
     return;
   }
+  // Detection trail (#61): the session went silent — no downstream and no heartbeat for a full grace
+  // window — so it is stale and about to be reaped. Naming the stall HERE, right before closeSession
+  // logs the death, is what makes a stalled-then-evicted daemon diagnosable rather than a bare `closed`.
+  state.logger.log({
+    category: "detection",
+    level: "warn",
+    event: "stale",
+    sessionId,
+    activity: session.activity.kind,
+    detail: `no downstream + heartbeat gap > ${String(state.sessionEvictionGraceMs)}ms — evicting`,
+  });
   // Terminally gone: no downstream and no heartbeat for a full grace window. END the session through
   // the one terminal seam — terminal status, row dropped so `GET /api/sessions` ("ccctl attach") stops
   // listing it, relay reaped (#176) so it does not accumulate across evictions — then reap its channel

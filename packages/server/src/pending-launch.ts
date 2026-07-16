@@ -86,7 +86,7 @@
 
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import { createRegisteringSession, type PermissionMode, type Session } from "@ccctl/core";
+import { createRegisteringSession, type Logger, type PermissionMode, type Session } from "@ccctl/core";
 import { closeSessionRelay, type SessionEventRelays } from "./event-stream.js";
 import type { LaunchedSession, SessionLaunchOptions } from "./session-launcher.js";
 import { releaseLaunchedSession } from "./session-release.js";
@@ -196,6 +196,8 @@ export interface PendingLaunchState extends PendingLaunchConsumeState {
   readonly eventRelays: SessionEventRelays;
   /** How long a session may stay `registering` before it is evicted (ms). */
   readonly registrationTimeoutMs: number;
+  /** The structured-log sink (#61) — a launch's `registering` birth and its ghost eviction are emitted here. */
+  readonly logger: Logger;
 }
 
 /**
@@ -301,6 +303,16 @@ export function trackPendingLaunch(
   // session. Idempotent: the ingress already rooted the terminal at this same resolved path.
   const cwd = canonicalCwd(options.cwd);
   state.sessions.set(sessionId, createRegisteringSession(sessionId, options.permissionMode));
+  // Lifecycle birth (#61): a launched session enters as `registering` (its terminal is up, its worker
+  // has not checked in yet). The trail pairs this with the later `closed`/`evicted` for the same id.
+  state.logger.log({
+    category: "session",
+    level: "info",
+    event: "created",
+    sessionId,
+    status: "registering",
+    detail: "launched, awaiting §2 registration",
+  });
   state.launchedSurfaces.set(sessionId, launched);
   const timer = setTimeout(() => {
     // Fire-and-forget: the eviction's terminal half is asynchronous (it PROBES the surface before it
@@ -560,6 +572,17 @@ export async function evictPendingLaunch(state: PendingLaunchState, sessionId: s
     return;
   }
   dropPlaceholder(state, sessionId);
+  // Ghost eviction (#33/#61): a launched session that never registered over the bridge within the
+  // window — its `registering` row is dropped so it cannot leak a slot. Distinct from the clean
+  // `closed` a registered session reaches, so a stuck-at-`registering` launcher is diagnosable.
+  state.logger.log({
+    category: "session",
+    level: "warn",
+    event: "evicted",
+    sessionId,
+    status: "closed",
+    detail: "registration timeout — evicted before §2 check-in",
+  });
   if (pending.mayHoldLiveWorker) {
     // A worker registered somewhere in this launch's (cwd, mode) group and could be sitting in THIS
     // terminal. The row is gone (the list is honest), but the surface stays up — shutdown owns it now.

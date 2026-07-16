@@ -1516,6 +1516,171 @@ export type BridgeCredentialJsonProofs = [
 ];
 
 // ---------------------------------------------------------------------------
+// structured logging — the loggable event contract (#61 / SRV-Q-002)
+//
+// The hub is a long-lived daemon, and its two failure modes are silent: a STALLED
+// session (stuck awaiting a worker that never answers, or gone stale mid-run) and a
+// LEAKED one (created, never closed, holding a `maxSessions` slot forever). Diagnosing
+// either needs a structured TRAIL of what each
+// session did — born, advanced, went stale, closed — alongside the bridge
+// registrations, the worker-status transitions, the needs-you / idle notifications, and
+// the refusals around them. That is the five surfaces this section names.
+//
+// This defines the CONTRACT for that trail and nothing else: the JSON-safe loggable
+// event SHAPES ({@link LogEvent}) plus the {@link Logger} sink interface and a no-op. A
+// concrete sink (a JSON-line writer over `console`) is host-adjacent OUTPUT and ships in
+// `@ccctl/server`, exactly as the file session store does; `@ccctl/core` stays
+// runtime-agnostic (CORE-C-001) — pure types + a sink that drops everything.
+//
+// **Redaction by construction (HARD, #61).** Every {@link LogEvent} variant is built only
+// from {@link JsonValue}-safe fields, so the account OAuth Bearer — an {@link AccountBearer},
+// which is NOT a JSON value — cannot reach a log line by construction: a leak is a `tsc`
+// error, enforced by {@link LogEventJsonProofs} below, exactly as {@link BridgeCredentialJsonProofs}
+// forbids it reaching a snapshot. The scoped {@link SessionIngressToken} (and the work
+// `secret` that carries it) is a JSON-safe branded string, so — like the session store's
+// ingress token and the device store's token — that proof does NOT by itself exclude it; it
+// stays out because NO variant carries a field for it (omission by construction), guarded at
+// runtime by the e2e bearer canary and the server's own redaction test. The loggable shapes
+// carry IDs, statuses, activity kinds, and one-line human detail — never a credential.
+// ---------------------------------------------------------------------------
+
+/** Severity of a structured {@link LogEvent}. */
+export type LogLevel = "info" | "warn" | "error";
+
+/**
+ * The five diagnostic surfaces a structured {@link LogEvent} belongs to (#61): a session's
+ * LIFECYCLE, the bridge REGISTRATION legs (§1/§2/§3), worker-status DETECTION transitions,
+ * NOTIFICATION dispatch (needs-you / idle), and ERROR refusals. The `category` discriminates
+ * the union so a sink can route or filter by surface.
+ */
+export type LogEventCategory = "session" | "registration" | "detection" | "notification" | "error";
+
+/**
+ * A session LIFECYCLE event (#61): the trail that answers "was this session leaked?" — a `created`
+ * row that never reaches a `closed`/`evicted` is a held slot. `status` is the {@link SessionStatus}
+ * AFTER the event; `detail` carries one-line human context (the prior status on a transition, or WHY
+ * a row was evicted) and never a credential.
+ */
+export interface SessionLogEvent {
+  readonly category: "session";
+  readonly level: LogLevel;
+  /** `created` (a row is born), `status` (a lifecycle transition), `closed` (a clean terminal), `evicted` (reaped without a clean close). */
+  readonly event: "created" | "status" | "closed" | "evicted";
+  readonly sessionId: string;
+  readonly status: SessionStatus;
+  readonly detail: string;
+}
+
+/**
+ * A bridge REGISTRATION event (#61): the §1 environment register, the §2 session create, and the §3
+ * work delivery. `sessionId` is `null` on the §1 leg (no session exists yet). `detail` carries the
+ * delivered work item's id and type on §3 — NEVER the work `secret`, which encodes the
+ * {@link SessionIngressToken}.
+ */
+export interface RegistrationLogEvent {
+  readonly category: "registration";
+  readonly level: LogLevel;
+  /** `environment-registered` (§1), `session-created` (§2), `work-delivered` (§3 poll answered). */
+  readonly event: "environment-registered" | "session-created" | "work-delivered";
+  readonly environmentId: string;
+  readonly sessionId: string | null;
+  readonly detail: string;
+}
+
+/**
+ * A worker-status DETECTION event (#61): the trail that answers "is this session stalled?" — an
+ * `activity` transition (running / requires_action / idle), a `worker-registered` generation attach,
+ * or a `stale` heartbeat lapse. `activity` is the session's {@link SessionActivity} kind the event
+ * reflects; `detail` carries the transition ("running→idle"), the worker epoch, or the stale gap.
+ */
+export interface DetectionLogEvent {
+  readonly category: "detection";
+  readonly level: LogLevel;
+  /** `activity` (a `worker_status` transition), `worker-registered` (a worker generation attached), `stale` (heartbeat lapsed). */
+  readonly event: "activity" | "worker-registered" | "stale";
+  readonly sessionId: string;
+  readonly activity: SessionActivity["kind"];
+  readonly detail: string;
+}
+
+/**
+ * A NOTIFICATION dispatch event (#61): the blocking `awaiting-input` needs-you (#43) or the
+ * informational `idle` nudge (#41), each naming the session it concerns. `detail` carries the
+ * awaited-input label or the idle threshold.
+ */
+export interface NotificationLogEvent {
+  readonly category: "notification";
+  readonly level: LogLevel;
+  /** `awaiting-input` (the blocking needs-you, #43), `idle` (the informational "idle > X" nudge, #41). */
+  readonly event: "awaiting-input" | "idle";
+  readonly sessionId: string;
+  readonly detail: string;
+}
+
+/**
+ * An ERROR event (#61): a refusal or failure worth a trail — a rejected bind, a boot rejected for a
+ * bad config, a failed listen, a refused or failed launch (e.g. at-capacity), a failed stop. `event`
+ * is a short stable slug ("bind-refused", "boot-rejected", "listen-failed", "launch-failed",
+ * "stop-failed"); `sessionId` is `null` for a daemon-wide refusal (bind, boot, listen) that concerns
+ * no one session. `detail` is the actionable one-line reason — never a credential. (A missing-auth
+ * refuse-to-start is caught at the CLI edge before the server's logger exists, so it is not one of
+ * these — it fails the process with a non-zero exit, not a structured line.)
+ */
+export interface ErrorLogEvent {
+  readonly category: "error";
+  readonly level: "warn" | "error";
+  readonly event: string;
+  readonly sessionId: string | null;
+  readonly detail: string;
+}
+
+/**
+ * A single structured log event — one line in the daemon's diagnostic trail (#61). The discriminated
+ * union of the five {@link LogEventCategory} surfaces; every variant is a {@link JsonObject} by
+ * construction (proven by {@link LogEventJsonProofs}), so it serializes to one JSON log line AND —
+ * since no variant carries an {@link AccountBearer} field — provably cannot leak the account credential.
+ */
+export type LogEvent =
+  SessionLogEvent | RegistrationLogEvent | DetectionLogEvent | NotificationLogEvent | ErrorLogEvent;
+
+/**
+ * The structured-log sink (#61): the ONE way a {@link LogEvent} leaves the domain. An injected
+ * function seam, like every other host-touching edge in this codebase ({@link ISessionStore}, the
+ * launcher) — `@ccctl/core` defines the interface and a no-op; `@ccctl/server` supplies a concrete
+ * JSON-line writer, and a test a capturing fake. `log` takes only a {@link LogEvent}, so a caller
+ * CANNOT hand the sink a raw credential — the type IS the redaction boundary.
+ */
+export interface Logger {
+  log(event: LogEvent): void;
+}
+
+/**
+ * The sink that drops every event (#61) — the default when a server is configured without a
+ * {@link Logger}, mirroring how an absent launcher disables launching. A single shared stateless
+ * instance: a test or an embedder that wants a quiet server gets one; a daemon wanting a trail
+ * injects a real writer instead.
+ */
+export const NO_OP_LOGGER: Logger = { log: () => undefined };
+
+/**
+ * The compile-time redaction contract for the log trail (#61), exported so it has a referent and is
+ * therefore evaluated (not dropped as unused). Each element proves one loggable shape is
+ * {@link JsonValue}-safe — hence carries no {@link AccountBearer} (a non-JSON class, so a leaked
+ * Bearer field is a `tsc` error), the same guarantee {@link BridgeCredentialJsonProofs} draws for the
+ * wire/snapshot shapes. Each VARIANT is asserted individually, not only the union: `IsJson` over a
+ * union checks only the keys COMMON to every member, so a variant-specific field (a `status`, an
+ * `activity`, an `environmentId`) is proven JSON-safe only by asserting that variant on its own.
+ */
+export type LogEventJsonProofs = [
+  Assert<IsJson<SessionLogEvent>>,
+  Assert<IsJson<RegistrationLogEvent>>,
+  Assert<IsJson<DetectionLogEvent>>,
+  Assert<IsJson<NotificationLogEvent>>,
+  Assert<IsJson<ErrorLogEvent>>,
+  Assert<IsJson<LogEvent>>,
+];
+
+// ---------------------------------------------------------------------------
 // session-store persistence — the runtime-agnostic persistence seam (W3-03)
 //
 // The hub holds its live state in memory: the session registry (every
