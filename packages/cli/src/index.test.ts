@@ -73,6 +73,8 @@ function makeDeps(options: FakeDepsOptions = {}): {
   renderQr: ReturnType<typeof vi.fn>;
   installHeapSnapshotHandler: ReturnType<typeof vi.fn>;
   disposeHeapSnapshotHandler: ReturnType<typeof vi.fn>;
+  installInspectorDiagnosticsHandler: ReturnType<typeof vi.fn>;
+  disposeInspectorDiagnosticsHandler: ReturnType<typeof vi.fn>;
 } {
   // A fake bind: echo the requested host, and resolve `--port 0` to a concrete ephemeral
   // port so a test can prove `server.address` (not the requested port) is what's reported.
@@ -146,8 +148,25 @@ function makeDeps(options: FakeDepsOptions = {}): {
   // process-global SIGUSR2 handler that would leak across the test process.
   const disposeHeapSnapshotHandler = vi.fn(() => undefined);
   const installHeapSnapshotHandler = vi.fn((_options: { readonly logger: Logger }) => disposeHeapSnapshotHandler);
+  // The inspector-attach + FD/handle-count diagnostics signal-arming seam (#63): same shape as the
+  // heap-snapshot seam — records the logger it was handed and returns a spy disposer, so a test asserts
+  // `serve` arms the trigger WITHOUT installing a real process-global SIGUSR1 handler or opening a real
+  // inspector port, both of which would leak across the test process.
+  const disposeInspectorDiagnosticsHandler = vi.fn(() => undefined);
+  const installInspectorDiagnosticsHandler = vi.fn(
+    (_options: { readonly logger: Logger }) => disposeInspectorDiagnosticsHandler,
+  );
   return {
-    deps: { startServer, adapters, runPatcher, sessionClient, launcher, installHeapSnapshotHandler, renderQr },
+    deps: {
+      startServer,
+      adapters,
+      runPatcher,
+      sessionClient,
+      launcher,
+      installHeapSnapshotHandler,
+      installInspectorDiagnosticsHandler,
+      renderQr,
+    },
     startServer,
     establish,
     runPatcher,
@@ -160,6 +179,8 @@ function makeDeps(options: FakeDepsOptions = {}): {
     renderQr,
     installHeapSnapshotHandler,
     disposeHeapSnapshotHandler,
+    installInspectorDiagnosticsHandler,
+    disposeInspectorDiagnosticsHandler,
   };
 }
 
@@ -322,6 +343,22 @@ describe("ccctl serve — starts the daemon (AC2)", () => {
     // The one-time operator hint names the signal and how to send it.
     expect(loggedText()).toContain("SIGUSR2");
     expect(loggedText()).toContain("heap snapshot");
+  });
+
+  it("arms the inspector-attach + FD/handle-count diagnostics trigger (#63) with the SAME sink, and prints how to trigger it", async () => {
+    const { deps, startServer, installInspectorDiagnosticsHandler, disposeInspectorDiagnosticsHandler } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve"], { from: "user" });
+    // Armed exactly once, and NOT torn down at serve-return — the handler lives for the daemon's lifetime.
+    expect(installInspectorDiagnosticsHandler).toHaveBeenCalledTimes(1);
+    expect(disposeInspectorDiagnosticsHandler).not.toHaveBeenCalled();
+    // One shared structured-log sink: the daemon trail (#61), heap-snapshot (#62), AND the inspector /
+    // FD-handle report (#63) all ride the same object, so everything lands on the one JSON stdout.
+    const serverLogger = (startServer.mock.calls[0][0] as { logger: unknown }).logger;
+    const handlerLogger = (installInspectorDiagnosticsHandler.mock.calls[0][0] as { logger: unknown }).logger;
+    expect(handlerLogger).toBe(serverLogger);
+    // The one-time operator hint names the signal and what it does.
+    expect(loggedText()).toContain("SIGUSR1");
+    expect(loggedText()).toContain("inspector attach");
   });
 });
 

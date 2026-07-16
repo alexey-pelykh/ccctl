@@ -1552,9 +1552,9 @@ export type LogLevel = "info" | "warn" | "error";
  * The six diagnostic surfaces a structured {@link LogEvent} belongs to: the five AUTOMATIC ones
  * the lifecycle turns on (#61) — a session's LIFECYCLE, the bridge REGISTRATION legs (§1/§2/§3),
  * worker-status DETECTION transitions, NOTIFICATION dispatch (needs-you / idle), and ERROR
- * refusals — plus the on-demand DIAGNOSTIC surface (#62), an operator-triggered runtime action
- * (a live heap snapshot). The `category` discriminates the union so a sink can route or filter by
- * surface.
+ * refusals — plus the on-demand DIAGNOSTIC surface (#62, #63), operator-triggered runtime actions
+ * (a live heap snapshot; an inspector attach + FD/handle-count report). The `category` discriminates
+ * the union so a sink can route or filter by surface.
  */
 export type LogEventCategory = "session" | "registration" | "detection" | "notification" | "error" | "diagnostic";
 
@@ -1638,22 +1638,42 @@ export interface ErrorLogEvent {
 }
 
 /**
- * A DIAGNOSTIC event (#62): an operator-triggered runtime diagnostic action the daemon performed
- * on demand — the first being an on-demand HEAP SNAPSHOT, taken live (no restart) when the daemon
- * is signalled, for chasing a long-run memory-growth vector. Unlike the five AUTOMATIC surfaces
- * above, a diagnostic event fires ONLY when an operator explicitly asks: `heap-snapshot` on a
- * written snapshot, `heap-snapshot-failed` on a failed attempt. `sessionId` is always `null` — a
- * heap snapshot is daemon-wide, concerning no one session. `detail` carries the written snapshot's
- * PATH on success and the one-line failure reason on failure — never a credential. (The snapshot
- * FILE holds a copy of process memory, so it is written owner-only `0600`; this log line names only
- * its path, so — like every other variant — it carries no {@link AccountBearer} or
- * {@link SessionIngressToken}.)
+ * A DIAGNOSTIC event (#62, #63): an operator-triggered runtime diagnostic action the daemon
+ * performed on demand — taken live (no restart) when the daemon is signalled, for chasing a long-run
+ * leak. Unlike the five AUTOMATIC surfaces above, a diagnostic event fires ONLY when an operator
+ * explicitly asks. Three families ride this category:
+ *
+ * - **Heap snapshot (#62), on `SIGUSR2`** — `heap-snapshot` on a written snapshot (`detail` = its
+ *   PATH), `heap-snapshot-failed` on a failed attempt (`detail` = the one-line reason).
+ * - **Inspector attach (#63), on `SIGUSR1`** — `inspector-open` when the Node inspector is open for
+ *   deeper diagnosis (`detail` = its loopback `ws://` URL), `inspector-open-failed` when it could not
+ *   be opened (`detail` = the reason).
+ * - **FD/handle-count report (#63), on `SIGUSR1`** — `handle-report` naming the current active
+ *   libuv resource (file-descriptor / handle) counts for leak-vector visibility (`detail` = a compact
+ *   `total — type=count, …` tally), `handle-report-failed` on a failed sample (`detail` = the reason).
+ *
+ * `sessionId` is always `null` — a diagnostic is daemon-wide, concerning no one session. `detail`
+ * never carries a credential: a path, a loopback inspector URL, or a resource-count tally — never an
+ * {@link AccountBearer} or {@link SessionIngressToken}. (The heap-snapshot FILE holds a copy of
+ * process memory, so it is written owner-only `0600`; this log line names only its path. The
+ * inspector binds LOOPBACK and is reachable only by a same-uid local process — the signal trigger's
+ * OS-level authorization is the "local auth" the diagnostic surface holds to.)
  */
 export interface DiagnosticLogEvent {
   readonly category: "diagnostic";
   readonly level: LogLevel;
-  /** `heap-snapshot` (a live heap snapshot was written), `heap-snapshot-failed` (the attempt failed). */
-  readonly event: "heap-snapshot" | "heap-snapshot-failed";
+  /**
+   * `heap-snapshot` / `heap-snapshot-failed` (a live heap snapshot, #62); `inspector-open` /
+   * `inspector-open-failed` (the Node inspector attach, #63); `handle-report` / `handle-report-failed`
+   * (the FD/handle-count report, #63).
+   */
+  readonly event:
+    | "heap-snapshot"
+    | "heap-snapshot-failed"
+    | "inspector-open"
+    | "inspector-open-failed"
+    | "handle-report"
+    | "handle-report-failed";
   readonly sessionId: null;
   readonly detail: string;
 }

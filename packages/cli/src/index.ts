@@ -62,6 +62,7 @@ import {
   createJsonLineLogger,
   DEFAULT_HOST,
   HEAP_SNAPSHOT_SIGNAL,
+  INSPECTOR_DIAGNOSTICS_SIGNAL,
   mintDeviceToken,
   requireLocalServerAuth,
   resolveBindHost,
@@ -331,14 +332,23 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       // disposer is intentionally not held: the handler lives for the daemon's lifetime and process exit
       // tears it down.
       deps.installHeapSnapshotHandler({ logger });
+      // Arm the on-demand inspector-attach + FD/handle-count diagnostics trigger (#63): SIGUSR1 samples
+      // the daemon's active FD/handle counts onto the trail AND attaches the loopback-bound Node
+      // inspector for deeper diagnosis — reachable only by a same-uid local process (OS-enforced local
+      // auth, the same choice as the heap snapshot). Same one shared #61 sink; disposer not held (the
+      // handler lives for the daemon's lifetime and process exit tears it down).
+      deps.installInspectorDiagnosticsHandler({ logger });
       // Report the address actually bound (`server.address` carries the resolved port,
       // which matters when `--port 0` selects an ephemeral one).
       console.log(`ccctl: serving on ${serverUrl(server.address.host, server.address.port)}`);
-      // One-time operator hint (plain text, printed before the JSON trail flows — like the line above):
-      // how to take a heap snapshot and where it lands. The snapshot file is written owner-only 0600
-      // because it holds process memory.
+      // One-time operator hints (plain text, printed before the JSON trail flows — like the line above):
+      // how to take a heap snapshot and where it lands (the file is written owner-only 0600 because it
+      // holds process memory), and how to attach the inspector / dump FD-handle counts for a leak hunt.
       console.log(
         `ccctl: heap snapshot on ${HEAP_SNAPSHOT_SIGNAL} (\`kill -s ${HEAP_SNAPSHOT_SIGNAL} ${process.pid}\`) → ${resolveHeapSnapshotDir()}`,
+      );
+      console.log(
+        `ccctl: inspector attach + FD/handle report on ${INSPECTOR_DIAGNOSTICS_SIGNAL} (\`kill -s ${INSPECTOR_DIAGNOSTICS_SIGNAL} ${process.pid}\`) → loopback inspector URL + counts on the trail`,
       );
 
       if (kind !== undefined) {

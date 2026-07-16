@@ -22,6 +22,7 @@ import {
   createFallbackSessionLauncher,
   createTmuxSessionLauncher,
   installHeapSnapshotSignalHandler,
+  installInspectorDiagnosticsSignalHandler,
   startServer,
   type CcctlServer,
   type ISessionLauncher,
@@ -70,6 +71,17 @@ export interface CliDependencies {
    * structured-log sink is passed through so a snapshot (or a failure) rides the daemon's #61 trail.
    */
   readonly installHeapSnapshotHandler: (options: { readonly logger: Logger }) => () => void;
+  /**
+   * Arm the daemon's on-demand inspector-attach + FD/handle-count diagnostics trigger (#63) — install
+   * the {@link https://ccctl | INSPECTOR_DIAGNOSTICS_SIGNAL} (`SIGUSR1`) handler that, on each poke,
+   * samples the daemon's active FD/handle counts onto the trail AND attaches the loopback-bound Node
+   * inspector for deeper diagnosis, and return a disposer. {@link installInspectorDiagnosticsSignalHandler}
+   * in production; behind a seam so `serve` is exercised WITHOUT registering a real process-global
+   * signal handler or opening a real inspector port (which would leak across the test process), the
+   * same determinism discipline as the seams above. The daemon's structured-log sink is passed through
+   * so a report (or a failure) rides the daemon's #61 trail.
+   */
+  readonly installInspectorDiagnosticsHandler: (options: { readonly logger: Logger }) => () => void;
   /**
    * Render a scannable terminal QR of `text` — the QR-pair onboarding block `serve` / `tunnel`
    * print after a tunnel is up (#74) — {@link defaultRenderQr} (a zero-dependency `qrcode-terminal`)
@@ -141,6 +153,7 @@ export const defaultDependencies: CliDependencies = {
   runPatcher: defaultRunPatcher,
   sessionClient: defaultSessionClient,
   installHeapSnapshotHandler: (options) => installHeapSnapshotSignalHandler(options),
+  installInspectorDiagnosticsHandler: (options) => installInspectorDiagnosticsSignalHandler(options),
   renderQr: defaultRenderQr,
   // Compose the tmux backend (#29) behind the fallback launcher composite (#31) — the documented
   // composition-root shape — driving the production `remote-control` worker-argv builder (#157) on

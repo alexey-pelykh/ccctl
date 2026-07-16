@@ -111,6 +111,24 @@ describe("LogEvent JSON-safety (runtime complement to LogEventJsonProofs)", () =
     }
   });
 
+  // Rule: every DIAGNOSTIC event name (#62 heap snapshot, #63 inspector attach + FD/handle report)
+  // shares the one all-string/null shape and round-trips unchanged — so a new diagnostic action never
+  // smuggles a non-JSON (credential-shaped) field onto the trail.
+  it("round-trips every diagnostic event name unchanged (#62, #63)", () => {
+    const diagnosticEventNames: readonly DiagnosticLogEvent["event"][] = [
+      "heap-snapshot",
+      "heap-snapshot-failed",
+      "inspector-open",
+      "inspector-open-failed",
+      "handle-report",
+      "handle-report-failed",
+    ];
+    for (const event of diagnosticEventNames) {
+      const logged: DiagnosticLogEvent = { category: "diagnostic", level: "info", event, sessionId: null, detail: "d" };
+      expect(JSON.parse(JSON.stringify(logged))).toEqual(logged);
+    }
+  });
+
   it("serializes only the declared safe keys — no credential-shaped field exists to carry a token", () => {
     // The redaction-by-construction guarantee, observed on the wire: a fully-populated
     // event of each category exposes ONLY ids, statuses, activity kinds, level, and the
