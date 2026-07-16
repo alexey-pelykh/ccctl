@@ -185,6 +185,62 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   watching. Hermetic (loopback, fake launcher, no credentials), so it gates on **every** run; it
   deliberately makes **no** claim about AC3, which is the fenced oracle's alone.
 
+- **The AC-5 assertion inside the full-flow release gate (#67, traces E2E-B-002)** —
+  `full-flow-gate.ts` is the fenced, self-classifying **release gate**
+  [`docs/security-posture.md`](../../docs/security-posture.md) names as the hard gate before any
+  real-worker rollout. The hermetic skeleton above proves the split for **one** session over
+  loopback, in isolation; this runs the same guarantee inside the flow a release actually ships —
+  **two concurrent sessions plus one launched from the phone**, multiplexed through one daemon,
+  over a **real tunnel** — and asserts it **per session**. Per-session is the whole point: an
+  **aggregate** "did inference reach Anthropic?" stays green while one session is quietly proxied
+  through the local control plane, because its siblings' honest traffic answers for it — the one
+  question the one-session slice structurally cannot ask.
+  `assertEverySessionInferenceUntouched` (in `inference-guarantee.ts`) encodes it by **delegating**
+  to `assertInferenceUntouched` — the single definition of the bidirectional claim, which is what
+  fails the gate on a redirect (AC-3) — and adding one clause of its own: **every carried session
+  has its own observed turn reaching `api.anthropic.com`** (AC-2), naming any that does not.
+  **AC-1 ("runs as part of the gate, not a separate optional check") is structural, not a
+  convention**: `classifyFullFlowGate` cannot return `verified` unless the assertion demonstrably
+  ran across the flow's own carried sessions — enforced by the **inconclusive gap checks** (a
+  capture with nothing observed, or with fewer than two concurrent sessions, is `inconclusive`
+  before the verified path is reachable, and each of those gaps is at least as strict as a
+  condition under which the assertion is skipped, so passing them entails the assertion having run).
+  `assertedSessionIds` is the **receipt** of that property — it names the sessions actually covered,
+  so a caller can check rather than trust — not the thing imposing it.
+  **Attribution stays receiver-of-record**: a turn carries its session marker outbound, and the
+  observation's session is read back off **the stand-in's own log** — never echoed from the
+  caller's variable. That asymmetry is load-bearing rather than stylistic: a leg the stand-in never
+  took has no record to read, so a **redirected turn yields no attribution and can never vouch for
+  its own session**. Were the marker echoed from the sender, the gate would pass by construction on
+  a real leak. The negative reads are self-guarded by the liveness canary (#134).
+  **Scope**: this gate judges the **inference split**, not UC1/UC2 — their correctness belongs to
+  their own oracles (#65/#66) and re-classifying it here would be a second, drifting copy; here
+  those legs are the **context** the assertion must run in, and a flow that never came up is an
+  `inconclusive` precondition gap, not a UC1 failure re-reported.
+  **Fenced / opt-in** on `CCCTL_E2E` + `CCCTL_E2E_TAILSCALE` (`resolveTunnelE2EEnv`, **reused** from
+  #65 — the same single real tailnet), so it lives outside the credential-free CI `e2e` lane;
+  `full-flow-gate.e2e.test.ts` drives it. What is fenced is the **transport**, not the judgment:
+  the classifier and the per-session assertion are unit-tested credential-free in
+  `full-flow-gate.test.ts` + `inference-guarantee.test.ts`. Its loopback skeleton is
+  `full-flow-inference.test.ts`.
+
+- **The multi-session inference composition over loopback (#67)** — `full-flow-inference.test.ts`
+  is the **hermetic skeleton** the gate above graduates, in the posture every other oracle here
+  holds (`multi-session-harness` #20 → #65; `launch-lifecycle.test.ts` → #66). It pins, over the
+  **real** HTTP legs and with **no tunnel at all**, the one composition the fenced gate's judgment
+  rests on and that nothing else pinned: that several concurrent sessions each performing a model
+  turn yield **per-session, receiver-grounded** attribution surviving a real round-trip, and that a
+  redirect of **one session among several** is caught. (`inference-guarantee.test.ts` pins the
+  assertion as a **pure function** over constructed observations; `inference-untouched.e2e.test.ts`
+  drives real traffic but for exactly **one** session, with no attribution at all.) Its **negative
+  controls** — a really-redirected session among honest siblings, and a turn the stand-in never
+  took yielding **no** attribution — are what keep the positive non-vacuous. This is the
+  `probeStandInLiveness` (#134) **self-guard** posture: prove the composition works with nothing in
+  the way, so a fenced `drift` reads as "the tunnel leg broke it" rather than "the harness was
+  never right" — a distinction that otherwise only surfaces on an operator's tailnet, where no CI
+  is watching. Hermetic (loopback, stand-in workers, no credentials), so it gates on **every** run;
+  it deliberately makes **no** claim about the real tunnel, which is the fenced gate's alone.
+
 ## What is fenced to the credentialed wave
 
 - The **live-worker oracle** above is wired but **fenced** — it runs only when
@@ -206,6 +262,18 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   patched worker + API key, so it carries its own arm distinct from the live-worker oracle's;
   an absent tailnet surfaces **safely** as `inconclusive`, never a fake green. The hermetic
   `multi-session-harness` (#20) is the loopback skeleton it graduates to a real tunnel.
+
+- The **full-flow release gate** (#67) shares that same arm (`CCCTL_E2E` + `CCCTL_E2E_TAILSCALE`) and
+  the same single prerequisite — one real, authenticated tailnet — so it reuses the UC1 oracle's
+  fence rather than carrying a third copy. Its workers, session launcher, and `api.anthropic.com`
+  itself are **stand-ins**, for the reason named in the live-worker bullet above: the repo ships no
+  packaged patched worker. So the gate proves the **split and the assertion's integration across a
+  real multi-session flow**; it does **not** yet prove a real patched worker's real egress against
+  the real host. That last leg is the credentialed wave's, and
+  [`docs/security-posture.md`](../../docs/security-posture.md) stays **PARTIAL** until it lands —
+  landing #67 wires the gate, it does not on its own authorize a real-credential rollout. When the
+  patched-worker packaging lands, the stand-in worker + the Anthropic stand-in are the seams to
+  swap; the gate's fence, classifier and ACs need no churn.
 
 - The **UC2 launch tunnel oracle** above shares that same arm (`CCCTL_E2E` + `CCCTL_E2E_TAILSCALE`)
   and the same single infra prerequisite — one real, authenticated tailnet — so it reuses the UC1

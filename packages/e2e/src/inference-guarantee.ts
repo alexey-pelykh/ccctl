@@ -56,6 +56,19 @@ export interface ObservedConnection {
   readonly receivedBy: TrafficReceiver;
   /** The `Host` the connection carried, as seen by the receiver. */
   readonly intendedHost: string;
+  /**
+   * The session this connection belongs to, when the receiver could attribute it —
+   * read from the receiver's own record (the marker the request carried, echoed back
+   * out of the stand-in's log), NEVER from the sender's own variable.
+   *
+   * Optional because attribution is not always feasible: AC-5's full-flow clause is
+   * "per-session where attribution is feasible, else aggregate" (#67). `undefined`
+   * means "this observation is aggregate-only" — it still counts for the aggregate
+   * clauses of {@link assertInferenceUntouched}, but it can never satisfy a
+   * per-session coverage requirement (see {@link assertEverySessionInferenceUntouched}),
+   * so an unattributable observation is never mistaken for a session's proof.
+   */
+  readonly sessionId?: string | undefined;
 }
 
 /** What {@link assertInferenceUntouched} checks the observations against. */
@@ -129,6 +142,93 @@ export function assertInferenceUntouched(
   if (wrongHost) {
     throw new InferenceGuaranteeViolation(
       `inference traffic carried host ${wrongHost.intendedHost}, expected ${inferenceHost}`,
+    );
+  }
+}
+
+/** What {@link assertEverySessionInferenceUntouched} checks the observations against. */
+export interface SessionInferenceExpectation extends InferenceGuaranteeExpectation {
+  /**
+   * Every session the flow carried — each one MUST have its own observed inference
+   * reaching {@link InferenceGuaranteeExpectation.inferenceHost}. This is the set the
+   * coverage clause is checked against, so it must be the flow's OWN record of what it
+   * carried (the ids the server minted), not a count the caller hopes for.
+   */
+  readonly expectedSessionIds: readonly string[];
+}
+
+/**
+ * Assert the inference-untouched guarantee across EVERY session of a multi-session flow —
+ * the full-flow-gate form of {@link assertInferenceUntouched} (issue #67, traces E2E-B-002).
+ *
+ * The skeleton's aggregate claim answers "did inference reach Anthropic?"; a gate carrying
+ * ≥2 concurrent sessions plus a launched one must answer the strictly stronger "did EVERY
+ * session's inference reach Anthropic?" — otherwise one session quietly proxied through the
+ * local control plane hides behind its siblings' honest traffic, and the aggregate stays
+ * green while the guarantee is broken for a real user's session.
+ *
+ * This does NOT re-define "inference untouched" — clause 1 DELEGATES to
+ * {@link assertInferenceUntouched}, which remains the single definition of the bidirectional
+ * claim. Clause 2 adds the one thing per-session attribution makes newly checkable:
+ *
+ *   1. **The shared bidirectional claim** — control reached the local server and only it;
+ *      inference reached `inferenceHost` and NEVER the local server. This is the clause that
+ *      fails the gate on a redirect (AC-3), including a redirect that carries no session
+ *      attribution at all — which, in the stand-in harness, is every redirect there is: a leg
+ *      the Anthropic stand-in never took leaves no record to attribute it from (see
+ *      `traffic-harness.ts` § observeInferenceLeg).
+ *   2. **Per-session coverage** (AC-2) — every id in `expectedSessionIds` has at least one
+ *      inference observation OF ITS OWN reaching `inferenceHost`. This is the clause that
+ *      NAMES a session whose inference was never proven, and it is receiver-grounded in the
+ *      negative: the absence of a session's marker in the stand-in's log is the stand-in's own
+ *      testimony, made non-vacuous by the liveness canary (#134) the caller pairs it with.
+ *
+ * Fails closed throughout: an empty `expectedSessionIds`, or a carried session with no
+ * inference observation attributed to it, is a violation — never a vacuous pass. "We observed
+ * nothing for this session" is not evidence its inference was untouched, and a gate that let
+ * it pass would report green for a flow it never actually exercised.
+ */
+export function assertEverySessionInferenceUntouched(
+  observed: readonly ObservedConnection[],
+  expectation: SessionInferenceExpectation,
+): void {
+  const { inferenceHost, expectedSessionIds } = expectation;
+
+  // Clause 1 — the shared bidirectional claim, unchanged and undiluted.
+  assertInferenceUntouched(observed, { inferenceHost });
+
+  // Clause 2 — per-session coverage. Fails closed on a degenerate carry: a gate that
+  // carried no sessions proves nothing about a multi-session guarantee.
+  if (expectedSessionIds.length === 0) {
+    throw new InferenceGuaranteeViolation(
+      "no sessions were carried, so no per-session inference guarantee was proven — " +
+        "an empty flow is not evidence the guarantee holds",
+    );
+  }
+  // Deliberate, knowing redundancy: given clause 1 above, every surviving inference observation
+  // ALREADY has `receivedBy === "anthropic"` and the right host (it would have thrown otherwise),
+  // and a `sessionId` of `undefined` could never match a carried id anyway. These sub-clauses are
+  // therefore inert TODAY and no test can prove them. They are kept so that this clause is correct
+  // STANDALONE — it states the full condition for "this observation proves this session", rather
+  // than silently inheriting it from the delegate above. In a gate whose failure mode is a false
+  // green on a credential-leak guarantee, a clause that does not depend on a neighbour holding is
+  // worth three redundant comparisons.
+  const covered = new Set(
+    observed
+      .filter(
+        (connection) =>
+          connection.leg === "inference" &&
+          connection.sessionId !== undefined &&
+          connection.receivedBy === "anthropic" &&
+          connection.intendedHost === inferenceHost,
+      )
+      .map((connection) => connection.sessionId),
+  );
+  const uncovered = expectedSessionIds.filter((sessionId) => !covered.has(sessionId));
+  if (uncovered.length > 0) {
+    throw new InferenceGuaranteeViolation(
+      `no inference reaching ${inferenceHost} was observed for session(s) ${uncovered.join(", ")} — ` +
+        "every carried session must be proven, not just the flow in aggregate",
     );
   }
 }

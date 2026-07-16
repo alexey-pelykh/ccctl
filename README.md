@@ -48,10 +48,13 @@ workspace.
   and expose it through a `tunnel`; plus `launch` / `attach` / `steer` to launch, list,
   and drive sessions on a running daemon.
 - **`@ccctl/e2e`** — end-to-end test package. The inference-untouched guarantee
-  (above) is verified today only by a hermetic skeleton — **necessary but not
-  sufficient**; the full-flow release gate
-  ([#67](https://github.com/alexey-pelykh/ccctl/issues/67)) must prove it
-  end-to-end before any real-worker rollout (see
+  (above) is asserted by a hermetic skeleton and, since
+  [#67](https://github.com/alexey-pelykh/ccctl/issues/67), re-verified **per
+  session** inside the full-flow release gate — two concurrent sessions plus one
+  launched from the phone, over a real tunnel. That gate's worker and its
+  `api.anthropic.com` receiver are still stand-ins (no packaged patched worker
+  exists yet), so the guarantee stays **necessary but not sufficient** and must
+  still be proven against the real host before any real-worker rollout (see
   [Security posture](docs/security-posture.md)). Target scenario: _patched
   headless worker → local server → SSE → inference still hits
   `api.anthropic.com`._

@@ -50,7 +50,17 @@
  *     server (booted with a SHORT liveness interval) and asserts the idle downstream stays
  *     open past the timeout, with a `client_event` liveness frame in the window and no drop /
  *     re-register. A starved negative control self-guards the "no drop" verdict (the #134
- *     posture). Hermetic — gates on every run (see `worker-idle-hold.e2e.test.ts`).
+ *     posture). Hermetic — gates on every run (see `worker-idle-hold.e2e.test.ts`); and
+ *   - the fenced, self-classifying FULL-FLOW RELEASE GATE (#67) — {@link driveFullFlowGate} +
+ *     {@link classifyFullFlowGate}, the AC-5 guarantee re-verified inside the release-blocking
+ *     run rather than only in the one-session slice: two concurrent sessions PLUS one launched
+ *     from the phone, carried through one daemon over a real tunnel, with the guarantee asserted
+ *     PER SESSION ({@link assertEverySessionInferenceUntouched}). The skeleton's AGGREGATE claim
+ *     structurally cannot see a single leaked session — its siblings' honest traffic answers for
+ *     it — which is the hole this closes. Fenced on CCCTL_E2E + CCCTL_E2E_TAILSCALE;
+ *     skips-never-fakes (see `full-flow-gate.e2e.test.ts`), with its JUDGMENT proven
+ *     credential-free in `full-flow-gate.test.ts` and its COMPOSITION hermetically in
+ *     `full-flow-inference.test.ts`.
  *
  * The live-worker oracle drives the full happy path with a REAL patched worker and a
  * real egress to api.anthropic.com — fenced to the credentialed wave; the hermetic
@@ -89,6 +99,7 @@ export * from "./one-session-harness.js";
 export * from "./multi-session-harness.js";
 export * from "./multi-session-tunnel.js";
 export * from "./launch-tunnel.js";
+export * from "./full-flow-gate.js";
 export * from "./bearer-canary.js";
 export * from "./live-worker-oracle.js";
 export * from "./worker-idle-hold.js";

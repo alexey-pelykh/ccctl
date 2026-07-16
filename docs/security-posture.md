@@ -44,6 +44,35 @@ tunnel, against the real host ([#67]). **#67 is a hard gate — it MUST pass bef
 skeleton passing does **not**, on its own, authorize a real-credential /
 real-worker rollout.
 
+**What [#67] has wired, and what it deliberately has not.** The gate itself now
+exists ([`full-flow-gate.ts`]): it carries two concurrent sessions **plus one
+launched from the phone** through one daemon over a **real tunnel**, has the
+phone drive list / view / steer across them, and asserts the guarantee **per
+session** — every carried session must be observed reaching `api.anthropic.com`,
+and any session's inference reaching the local server fails the release. That
+closes a hole the one-session skeleton structurally could not see: an
+**aggregate** claim stays green while a single session is quietly proxied through
+the control plane, because its siblings' honest traffic answers for it. The
+assertion is not an optional check bolted beside the flow — a run that observed
+nothing, or that carried too few sessions, self-classifies `inconclusive` and
+cannot reach a pass, and the gate reports back the sessions it actually asserted
+across so the property is checkable rather than merely promised.
+
+**This does not, on its own, flip the status above to proven, and the remaining
+gap is precisely the "against the real host" clause.** The gate's workers, its
+session launcher, and `api.anthropic.com` itself are still **stand-ins**, for the
+same reason the live-worker oracle ([#133]) and the UC2 launcher ([#66]) carry
+theirs: the repo ships **no packaged patched worker**, so there is nothing real to
+spawn and nothing real to egress. What #67 proves is the **split and the
+assertion's integration across a real multi-session flow**; what stays unproven is
+the real, separate-codebase worker doing something a stand-in never anticipated —
+exactly the risk the skeleton's own "necessary but not sufficient" framing names.
+So the status remains **PARTIAL** until the patched-worker packaging lands and the
+gate's two stand-in seams (the worker, the Anthropic receiver) are swapped for
+the real thing. **Wiring the gate is not passing it against a live worker**; do
+not read a green fenced run on an operator's tailnet as authorization for a
+real-credential rollout.
+
 **Oracle-independence — receiver-of-record attribution (do not weaken in a
 refactor).** What makes the hermetic gate meaningful is _who_ decides where a
 connection went. Every "reached X" verdict is read from the **receiver's own
@@ -369,5 +398,8 @@ still forward-looking:
   channel beyond the mandatory-auth gate.
 
 [#18]: https://github.com/alexey-pelykh/ccctl/issues/18
+[#66]: https://github.com/alexey-pelykh/ccctl/issues/66
 [#67]: https://github.com/alexey-pelykh/ccctl/issues/67
+[#133]: https://github.com/alexey-pelykh/ccctl/issues/133
 [pr #104]: https://github.com/alexey-pelykh/ccctl/pull/104
+[`full-flow-gate.ts`]: ../packages/e2e/src/full-flow-gate.ts
