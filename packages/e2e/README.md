@@ -143,6 +143,48 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   drives it; the pure fence + reachable-base helpers + tri-state classifier (the Tier-A encoding of
   UC1's three ACs) are unit-tested credential-free in `multi-session-tunnel.test.ts`.
 
+- **Launch a session from the phone over a real Tailscale tunnel (UC2, #66, traces E2E-B-001)** —
+  `launch-tunnel.ts` is the fenced, self-classifying oracle for the verb UC1 does not cover: the one
+  that brings a session **into being** from the phone. It drives the whole UC2 lifecycle over a real
+  tunnel — the phone **launches** (`POST /api/sessions`, carrying the body the **real**
+  [`@ccctl/web-ui`](../web-ui) `launchRequest` builds, #37), the session is **listed from birth** as
+  `registering` (#33) before any worker checks in, its worker **registers** over the bridge (§2,
+  on-box/loopback as in reality) at the cwd it was launched at, and the phone then **views + steers**
+  it — all through the tunnel's `https://<tailnet-host>` base. Then it **self-classifies**:
+  `verified`, `drift` (a violation was **observed**; the run **fails**, naming the check), or
+  `inconclusive` (a leg was never captured — **runtime-skip**, never a fabricated green).
+  **Id continuity is the proof of "the launched session registers"**, and it is the whole point: the
+  §2 leg is literally `claimPendingLaunch(…) ?? randomUUID()`, so a claim that MISSES still answers a
+  `201` and still yields a live, listable, steerable session — only **which id came back** tells the
+  two apart. An oracle checking merely "a session registered" would pass a daemon in which every
+  phone-launched session silently disowns the row the operator is watching. What is **real** here: the
+  tunnel, the launch ingress, the pending-launch bookkeeping, the §2 claim correlation, the registry,
+  the SSE relay, and the phone's own request body. What is a **stand-in**: the `ISessionLauncher`
+  backend and the launched worker — both on the far side of ports the daemon calls **out** through
+  (the assertion is the daemon's launch lifecycle, not tmux), and both necessarily so, since the repo
+  ships no packaged patched worker (see below) — the real backend's surface + FD residual is #68's job.
+  **Fenced / opt-in** on `CCCTL_E2E` + `CCCTL_E2E_TAILSCALE` (`resolveTunnelE2EEnv`, **reused** from
+  the UC1 oracle — the infra prerequisite is the same single real tailnet), so it lives **outside** the
+  credential-free CI `e2e` lane. `launch-tunnel-flow.e2e.test.ts` drives it; the pure classifier — the
+  Tier-A encoding of UC2's three ACs — is unit-tested credential-free in `launch-tunnel.test.ts`, so
+  what is fenced is the **transport**, not the **judgment**.
+
+- **UC2 launch lifecycle over loopback (#66)** — `launch-lifecycle.test.ts` is the **hermetic skeleton**
+  the tunnel oracle above graduates, in the posture every other oracle here already holds
+  (`multi-session-harness` #20 → the UC1 tunnel oracle; `one-session-harness` → the live-worker oracle).
+  It pins, over the **real** HTTP legs and with **no tunnel at all**, the one composition the fenced
+  oracle's judgment rests on and that nothing else pinned: launch → born `registering` → the §2
+  registration at the launched cwd **claims** it → the row advances **in place**, same id, no second
+  row. (`pending-launch.test.ts` pins `claimPendingLaunch` as a **pure function**, called directly;
+  `web-ui-launch-flow.test.ts` pins the launch and the born row — neither drives the claim over HTTP.)
+  Its **negative control** — a registration from a _different_ directory must **not** claim, and mints
+  its own id as the UC1 attach it is — is what keeps the positive non-vacuous. This is the
+  `probeStandInLiveness` (#134) **self-guard** posture: prove the composition works with nothing in the
+  way, so a fenced `drift` reads as "the tunnel leg broke it" rather than "the harness was never
+  right" — a distinction that otherwise only surfaces on an operator's tailnet, where no CI is
+  watching. Hermetic (loopback, fake launcher, no credentials), so it gates on **every** run; it
+  deliberately makes **no** claim about AC3, which is the fenced oracle's alone.
+
 ## What is fenced to the credentialed wave
 
 - The **live-worker oracle** above is wired but **fenced** — it runs only when
@@ -164,6 +206,17 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   patched worker + API key, so it carries its own arm distinct from the live-worker oracle's;
   an absent tailnet surfaces **safely** as `inconclusive`, never a fake green. The hermetic
   `multi-session-harness` (#20) is the loopback skeleton it graduates to a real tunnel.
+
+- The **UC2 launch tunnel oracle** above shares that same arm (`CCCTL_E2E` + `CCCTL_E2E_TAILSCALE`)
+  and the same single infra prerequisite — one real, authenticated tailnet — so it reuses the UC1
+  oracle's fence rather than carrying a second copy of it. Its **launcher** is a stand-in for the
+  reason named in the live-worker bullet above: the repo ships no packaged patched worker, so a real
+  tmux/pty surface would open a terminal running nothing that could ever register over §2, and AC2
+  ("the launched session registers") would be an unreachable `inconclusive` on every run rather than a
+  tested claim. The real backend's own surface + FD-residual behavior is #68's; the tmux (#29) and
+  owned-pty (#30) backends are unit-proven in [`@ccctl/server`](../server). When the patched-worker
+  packaging lands, the stand-in launcher is the one seam to swap — the oracle's fence, classifier and
+  ACs need no churn. Its loopback skeleton is `launch-lifecycle.test.ts`.
 
 ## Running
 

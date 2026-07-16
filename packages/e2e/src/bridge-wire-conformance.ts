@@ -296,9 +296,28 @@ export async function registerEnvironment(server: CcctlServer, bearer: string): 
  * §2 — create a session (`POST /v1/sessions`, account Bearer). Asserts the `201` and
  * the pinned `{ session_id }` wire (NO `ws_url`, #130); returns the session id. The
  * server AUTO-ENQUEUES this session's `session` work item, which §3 then delivers.
+ *
+ * `cwd` OVERRIDES the pinned body's `session_context.cwd` — everything else, including the
+ * `permission_mode`, stays exactly as pinned. It exists for ONE caller: the UC2 launch oracle
+ * (`launch-tunnel.ts`, #66), where the registering worker is one the server LAUNCHED, so its
+ * `(cwd, permission_mode)` pair is what the daemon correlates the registration back to its pending
+ * launch on (`pending-launch.ts` § Correlation). A launched worker reports the directory it was
+ * actually launched at — a REAL one, since a launch at a non-existent path is refused `invalid-cwd`
+ * before any backend runs — whereas the pinned `/e2e/proj` is a fixture that exists nowhere and
+ * could therefore never be claimed. Absent (every other caller), the pinned body is POSTed verbatim,
+ * so the golden's own conformance run is untouched.
+ *
+ * The override lives HERE rather than as a second §2 POST in the oracle deliberately: these driving
+ * helpers are "the single place the harness speaks the current flow" (see the package README), and a
+ * duplicate §2 body in another module is a second copy of the wire to keep in step — exactly the
+ * drift the single seam exists to prevent.
  */
-export async function createSession(server: CcctlServer, bearer: string): Promise<CreatedSession> {
-  const res = await postJson(bridgeUrl(server, SESSIONS_PATH), bearer, BRIDGE_SESSION_CREATE_BODY);
+export async function createSession(server: CcctlServer, bearer: string, cwd?: string): Promise<CreatedSession> {
+  const body =
+    cwd === undefined
+      ? BRIDGE_SESSION_CREATE_BODY
+      : { ...BRIDGE_SESSION_CREATE_BODY, session_context: { ...BRIDGE_SESSION_CREATE_BODY.session_context, cwd } };
+  const res = await postJson(bridgeUrl(server, SESSIONS_PATH), bearer, body);
   if (res.status !== 201) {
     throw new Error(`ccctl e2e: session create expected 201 from the local server, got ${res.status}`);
   }
