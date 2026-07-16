@@ -83,6 +83,24 @@
  *     classifier AND the drive's own mechanics are all credential-free
  *     (`daemon-soak-lifecycle.test.ts` + `daemon-soak.test.ts`), so they gate every run.
  *
+ *   - the TEARDOWN-TIMING RESIDUAL (#70) — {@link driveTeardownTimingResidual} +
+ *     {@link classifyTeardownTimingResidual}, the third of W7's residual specs and the one that
+ *     closes the gap between the other two. #68 asks the per-fd question ONCE, UNPRESSURED, over the
+ *     whole-daemon shutdown path; #69 drives many lifecycles but PACES them and is structurally
+ *     fd-BLIND (#63's sampler counts ref'd libuv resources, not bare descriptors — `daemon-soak.ts`'s
+ *     own module doc: "A raw fd leak is invisible HERE"). So a handle that lingers only when RACED is
+ *     unasked by the first and unseeable by the second. This drives rapid, back-to-back launch/stop
+ *     cycles against the REAL node-pty backend — no settling anywhere — and asks the kernel per
+ *     cycle. The STOP path (#76) is FORCED by AC1 rather than chosen: shutdown is terminal and the
+ *     ghost-reaper is a timer, so it is the only teardown a drive can cycle — and it is the one
+ *     where timing is load-bearing by the server's own documentation. TWO self-guards, because it
+ *     asserts two absences: the readings must DISAGREE per cycle (#68's), and the PRESSURE is itself
+ *     a claim under test — the plan is declared ({@link TeardownTimingPlan}), the launch→stop gap is
+ *     MEASURED, and {@link classifyTeardownTimingResidual} refuses to verify a run that fell short
+ *     of either axis. Fenced on #68's arm (CCCTL_E2E + CCCTL_E2E_PTY), SHARED deliberately: the
+ *     prerequisite is not merely similar but identical — an arm should name a prerequisite, not a
+ *     spec. Judgment + drive mechanics are credential-free (`teardown-timing-residual.test.ts`).
+ *
  * The live-worker oracle drives the full happy path with a REAL patched worker and a
  * real egress to api.anthropic.com — fenced to the credentialed wave; the hermetic
  * skeletons above stay loopback-only.
@@ -126,3 +144,4 @@ export * from "./live-worker-oracle.js";
 export * from "./worker-idle-hold.js";
 export * from "./pty-handle-residual.js";
 export * from "./daemon-soak.js";
+export * from "./teardown-timing-residual.js";

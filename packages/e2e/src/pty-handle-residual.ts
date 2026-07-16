@@ -301,6 +301,19 @@ export interface ObservingSpawner {
   readonly spawn: PtySpawner;
   /** What the real spawn yielded, or `undefined` if it never got that far. */
   readonly observed: () => ObservedSpawn | undefined;
+  /**
+   * EVERY spawn this observer has seen, oldest first — the full record {@link observed} is the tail of.
+   *
+   * #68 launches exactly once, so its own callers read {@link observed} and the list is a singleton. The
+   * list exists for the MULTI-LAUNCH caller (`teardown-timing-residual.ts`, #70), and the reason is a
+   * correctness one rather than convenience: with a single slot, a cycle whose launch spawned NOTHING
+   * would read the PREVIOUS cycle's pid + fd and probe a handle belonging to a session that is already
+   * gone. That stale reading fabricates a verdict in EITHER direction — a residual reported against a
+   * cycle that never opened one, or a clean reading credited to a teardown that never ran — so a caller
+   * driving more than one launch must be able to ask "did THIS launch produce a new spawn?", which only
+   * a growing record can answer.
+   */
+  readonly spawns: () => readonly ObservedSpawn[];
 }
 
 /**
@@ -315,14 +328,15 @@ export interface ObservingSpawner {
  * substitute for it.
  */
 export function createObservingPtySpawner(inner: PtySpawner = defaultPtySpawner()): ObservingSpawner {
-  let observed: ObservedSpawn | undefined;
+  const spawns: ObservedSpawn[] = [];
   return {
     spawn: async (file, args, options) => {
       const pty = await inner(file, args, options);
-      observed = { pid: pty.pid, fd: readMasterFd(pty) };
+      spawns.push({ pid: pty.pid, fd: readMasterFd(pty) });
       return pty;
     },
-    observed: () => observed,
+    observed: () => spawns.at(-1),
+    spawns: () => spawns,
   };
 }
 
@@ -334,6 +348,7 @@ export function createObservingPtySpawner(inner: PtySpawner = defaultPtySpawner(
 export function createObservedPtyLauncher(inner?: PtySpawner): {
   readonly launcher: ISessionLauncher;
   readonly observed: () => ObservedSpawn | undefined;
+  readonly spawns: () => readonly ObservedSpawn[];
 } {
   const spawner = createObservingPtySpawner(inner);
   return {
@@ -342,6 +357,7 @@ export function createObservedPtyLauncher(inner?: PtySpawner): {
       spawn: spawner.spawn,
     }),
     observed: spawner.observed,
+    spawns: spawner.spawns,
   };
 }
 
@@ -366,11 +382,16 @@ export function createObservedPtyLauncher(inner?: PtySpawner): {
  *
  * `reap()` is the caller's obligation: this launcher leaks ON PURPOSE, so the test must kill the
  * child it stranded. It is uncatchable (`SIGKILL`) because the whole point of the control is a
- * teardown that does not work, and safe on an already-gone child.
+ * teardown that does not work, and safe on an already-gone child. It reaps EVERY child this launcher
+ * stranded rather than only the last: #68's own control launches once, but a control that drives more
+ * than one launch (#70's, over rapid cycles) strands one child PER cycle, and a `reap()` that freed
+ * only the newest would leave the rest of them running on the operator's box — a test helper that
+ * leaks on purpose must clean up everything it leaked, not merely its most recent.
  */
 export function createLeakingPtyLauncher(inner?: PtySpawner): {
   readonly launcher: ISessionLauncher;
   readonly observed: () => ObservedSpawn | undefined;
+  readonly spawns: () => readonly ObservedSpawn[];
   readonly reap: () => void;
 } {
   const real = createObservedPtyLauncher(inner);
@@ -387,9 +408,9 @@ export function createLeakingPtyLauncher(inner?: PtySpawner): {
       },
     },
     observed: real.observed,
+    spawns: real.spawns,
     reap: (): void => {
-      const pid = real.observed()?.pid;
-      if (pid !== undefined) {
+      for (const { pid } of real.spawns()) {
         try {
           process.kill(pid, "SIGKILL");
         } catch {
@@ -756,8 +777,15 @@ export async function drivePtyHandleResidual(config: PtyResidualDriveConfig): Pr
  * Returning the last reading either way is what keeps a real leak a leak — a genuine residual simply
  * never settles, the deadline passes, and the final reading still shows it, which the classifier reads
  * as `drift`. So the timeout costs time only on a run that is already failing.
+ *
+ * Exported for the SECOND residual caller (`teardown-timing-residual.ts`, #70), which reads the same
+ * two handles after a different teardown and on a much shorter deadline of its own. What it needs is
+ * this SETTLE RULE — "the child reaped, and the fd closed or recycled onto a different object" — and
+ * that rule must exist exactly once: a second copy would be free to drift out of agreement with
+ * {@link classifyPtyHandleResidual}, and the copy that drifted would be the one deciding when to stop
+ * polling. The deadline is already a parameter, which is the only thing the two callers differ on.
  */
-async function waitForResidualToSettle(
+export async function waitForResidualToSettle(
   pid: number,
   fd: number,
   atLaunch: HandleReading | undefined,
