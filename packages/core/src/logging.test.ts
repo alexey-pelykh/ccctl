@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   NO_OP_LOGGER,
   type DetectionLogEvent,
+  type DiagnosticLogEvent,
   type ErrorLogEvent,
   type LogEvent,
   type Logger,
@@ -53,12 +54,20 @@ const errorEvent: ErrorLogEvent = {
   sessionId: null,
   detail: "refused non-loopback host 0.0.0.0",
 };
+const diagnosticEvent: DiagnosticLogEvent = {
+  category: "diagnostic",
+  level: "info",
+  event: "heap-snapshot",
+  sessionId: null,
+  detail: "/tmp/ccctl-heap-4321-2026-07-16T00-00-00-000Z.heapsnapshot",
+};
 const everyCategory: readonly LogEvent[] = [
   sessionEvent,
   registrationEvent,
   detectionEvent,
   notificationEvent,
   errorEvent,
+  diagnosticEvent,
 ];
 
 describe("NO_OP_LOGGER", () => {
@@ -115,5 +124,28 @@ describe("LogEvent JSON-safety (runtime complement to LogEventJsonProofs)", () =
         expect(keys).not.toContain(forbidden);
       }
     }
+  });
+});
+
+describe("DiagnosticLogEvent (#62 — the on-demand diagnostic surface)", () => {
+  // Rule: the diagnostic surface records an operator-triggered runtime action (a live heap snapshot),
+  // daemon-wide (sessionId null), carrying the snapshot's PATH — never its contents — in `detail`.
+  it("carries the snapshot path in detail and is daemon-wide (sessionId null)", () => {
+    expect(diagnosticEvent.category).toBe("diagnostic");
+    expect(diagnosticEvent.sessionId).toBeNull();
+    expect(diagnosticEvent.detail).toContain(".heapsnapshot");
+  });
+
+  it("supports both the success and failure events at their respective levels", () => {
+    const failed: DiagnosticLogEvent = {
+      category: "diagnostic",
+      level: "error",
+      event: "heap-snapshot-failed",
+      sessionId: null,
+      detail: "heap snapshot to /tmp/x.heapsnapshot failed: EACCES",
+    };
+    // Both are JsonValue-safe by construction — the failure path is a log line like any other.
+    expect(JSON.parse(JSON.stringify(failed))).toEqual(failed);
+    expect(failed.level).toBe("error");
   });
 });

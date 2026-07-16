@@ -136,6 +136,25 @@ export { toSessionCreateResponseWire, type SessionCreateResponseWire } from "./s
 // to turn on the diagnostic trail; the `Logger` / `LogEvent` / `NO_OP_LOGGER` types live in `@ccctl/core`.
 export { createJsonLineLogger, type LogLineWriter } from "./logger.js";
 
+// On-demand heap snapshot (#62): a live daemon heap dump for chasing a long-run memory-growth vector,
+// triggered by SIGUSR2 (local auth = OS process ownership), written owner-only 0600 (it holds process
+// memory), and recorded on the #61 trail as the DIAGNOSTIC category. The CLI arms the signal handler at
+// the daemon composition root; the capture/wiring seams are injectable for deterministic tests.
+export {
+  captureHeapSnapshot,
+  heapSnapshotFileName,
+  installHeapSnapshotSignalHandler,
+  resolveHeapSnapshotDir,
+  HEAP_SNAPSHOT_DIR_ENV,
+  HEAP_SNAPSHOT_FILE_MODE,
+  HEAP_SNAPSHOT_SIGNAL,
+  type HeapSnapshotDeps,
+  type HeapSnapshotOutcome,
+  type HeapSnapshotSignalDeps,
+  type HeapSnapshotWriter,
+  type SignalSource,
+} from "./heap-snapshot.js";
+
 // Re-export the browser-facing session-namespace wire types (#20 list, #31 launch) on the
 // public surface, for the SAME contract-consumer reason as the §2 session-create wire above:
 // a UI client — the web UI, and now the `ccctl` CLI's launch/attach on-ramp (#38) — asserts
