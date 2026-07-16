@@ -20,8 +20,8 @@
  * ESM. The mirrored contract (`GET /api/devices` → `{ devices }`):
  *
  *   DeviceSummaryWire = { id: string, name: string, lastSeen: number, current: boolean }
- *   id       — stable device identity (`PairedDevice.id`, #84); the row key, and the entry
- *              point a per-device revoke (W6-19, AC3) will hang off.
+ *   id       — stable device identity (`PairedDevice.id`, #84); the row key, and the id a
+ *              per-device revoke (W6-19, AC3) addresses via {@link deviceRevokePath}.
  *   name     — human device name ("Alex's phone", #84), shown in the row (AC1).
  *   lastSeen — epoch millis of the device's most recent activity (`PairedDevice.lastSeen`,
  *              #84), rendered relative by {@link formatLastSeen} (AC1).
@@ -45,6 +45,27 @@
 
 /** The browser-facing device-list route this surface fetches (mirrors the server's `/api/devices`). */
 export const DEVICES_PATH = "/api/devices";
+
+/**
+ * The browser-facing per-device REVOKE target (#81 / W6-19, AC3): `DELETE /api/devices/{id}` — the
+ * {@link DEVICES_PATH} collection addressed by one device's stable `id` (the row key). DELETE (no
+ * body — the id in the path is the whole request) is the idempotent verb for "this device is
+ * gone": revoking an already-absent device succeeds, mirroring the server-side `revokeDevice`
+ * transform's no-op-on-absent semantics. `id` is `encodeURIComponent`-escaped so a device id can
+ * never break out of its path segment.
+ *
+ * Server-side this route is not yet wired — it lands with the credentialed wave alongside
+ * `GET /api/devices` and the token verification a revoke enforces — so, exactly like the list
+ * fetch, the client revoke rides ahead of server enforcement (the `pairing.js` / #85
+ * walking-skeleton pattern). The at-rest token invalidation a revoke drives is the `revokeDevice`
+ * primitive's story, not this path builder's.
+ *
+ * @param {string} id - a `PairedDevice.id` (a non-blank string, per {@link isRenderableDevice}).
+ * @returns {string}
+ */
+export function deviceRevokePath(id) {
+  return `${DEVICES_PATH}/${encodeURIComponent(id)}`;
+}
 
 /** Relative-band thresholds for {@link formatLastSeen} (epoch-millis math). */
 const SECOND_MS = 1000;

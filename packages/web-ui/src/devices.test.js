@@ -4,6 +4,7 @@
 import { describe, it, expect } from "vitest";
 import {
   DEVICES_PATH,
+  deviceRevokePath,
   formatLastSeen,
   deviceName,
   deviceLabel,
@@ -22,6 +23,21 @@ function device({ id = "dev-1", name = "Alex's phone", lastSeen = NOW, current =
 describe("DEVICES_PATH", () => {
   it("mirrors the server's browser-facing device-list route", () => {
     expect(DEVICES_PATH).toBe("/api/devices");
+  });
+});
+
+describe("deviceRevokePath", () => {
+  it("addresses one device's revoke as the id-suffixed device route (AC3)", () => {
+    expect(deviceRevokePath("dev-1")).toBe("/api/devices/dev-1");
+  });
+
+  it("hangs off DEVICES_PATH, so the two stay in lockstep", () => {
+    expect(deviceRevokePath("dev-1")).toBe(`${DEVICES_PATH}/dev-1`);
+  });
+
+  it("percent-encodes the id so it can never break out of its path segment", () => {
+    expect(deviceRevokePath("a/b?c#d")).toBe("/api/devices/a%2Fb%3Fc%23d");
+    expect(deviceRevokePath("dev 1")).toBe("/api/devices/dev%201");
   });
 });
 

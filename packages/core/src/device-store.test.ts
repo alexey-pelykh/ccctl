@@ -7,6 +7,7 @@ import {
   deviceTokenHash,
   pairedDevice,
   renameDevice,
+  revokeDevice,
   touchDevice,
   type DeviceStoreSnapshot,
   type PairedDevice,
@@ -97,6 +98,63 @@ describe("touchDevice (last-seen, AC4)", () => {
   it("is pure — it never mutates the input record", () => {
     touchDevice(device, T0 + 5_000);
     expect(device.lastSeen).toBe(T0);
+  });
+});
+
+describe("revokeDevice (per-device revoke, #81 / W6-19)", () => {
+  const phone = pairedDevice({ id: "dev-1", name: "Alex's phone", tokenHash: HASH, now: T0 });
+  const tablet = pairedDevice({ id: "dev-2", name: "tablet", tokenHash: deviceTokenHash("beef"), now: T0 + 10 });
+  const laptop = pairedDevice({ id: "dev-3", name: "laptop", tokenHash: deviceTokenHash("cafe"), now: T0 + 20 });
+  const snapshot: DeviceStoreSnapshot = {
+    version: DEVICE_STORE_SNAPSHOT_VERSION,
+    devices: [phone, tablet, laptop],
+  };
+
+  it("removes the named device from the registry (AC1) — its record, and its token hash, are gone", () => {
+    const revoked = revokeDevice(snapshot, "dev-1");
+    expect(revoked.devices.map((device) => device.id)).toEqual(["dev-2", "dev-3"]);
+    // The revoked device's ONLY at-rest token projection is gone, so a hash-and-compare verifier
+    // (present or future) finds no match and refuses that token on its next use.
+    expect(revoked.devices.some((device) => device.tokenHash === HASH)).toBe(false);
+  });
+
+  it("leaves every other device — and its token hash — untouched (AC2)", () => {
+    const revoked = revokeDevice(snapshot, "dev-1");
+    expect(revoked.devices).toEqual([tablet, laptop]);
+    // Surviving records ride through unchanged, by reference — one device's revoke touches no other.
+    expect(revoked.devices[0]).toBe(tablet);
+    expect(revoked.devices[1]).toBe(laptop);
+  });
+
+  it("preserves the snapshot version and the order of the remaining devices", () => {
+    const revoked = revokeDevice(snapshot, "dev-2");
+    expect(revoked.version).toBe(DEVICE_STORE_SNAPSHOT_VERSION);
+    expect(revoked.devices.map((device) => device.id)).toEqual(["dev-1", "dev-3"]);
+  });
+
+  it("is pure — it never mutates the input snapshot or its devices array", () => {
+    revokeDevice(snapshot, "dev-1");
+    expect(snapshot.devices.map((device) => device.id)).toEqual(["dev-1", "dev-2", "dev-3"]);
+  });
+
+  it("is idempotent over an absent id — a no-op returns an equal, freshly built snapshot, never throwing", () => {
+    const revoked = revokeDevice(snapshot, "does-not-exist");
+    expect(revoked).toEqual(snapshot);
+    expect(revoked).not.toBe(snapshot);
+    // A double-revoke (or one racing a concurrent revoke) settles to the same end state as one.
+    expect(revokeDevice(revokeDevice(snapshot, "dev-1"), "dev-1").devices.map((device) => device.id)).toEqual([
+      "dev-2",
+      "dev-3",
+    ]);
+  });
+
+  it("revoking the last device yields an explicitly-empty registry (the reachable empty state)", () => {
+    const single: DeviceStoreSnapshot = { version: DEVICE_STORE_SNAPSHOT_VERSION, devices: [phone] };
+    const revoked = revokeDevice(single, "dev-1");
+    expect(revoked.devices).toEqual([]);
+    expect(revoked.version).toBe(DEVICE_STORE_SNAPSHOT_VERSION);
+    // Still a valid snapshot that round-trips through JSON — listing it is an empty registry, not `null`.
+    expect(JSON.parse(JSON.stringify(revoked))).toEqual(revoked);
   });
 });
 
