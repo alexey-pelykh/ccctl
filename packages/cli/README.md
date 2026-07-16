@@ -55,12 +55,16 @@ registers; if the worker never does, the daemon evicts it rather than leaving a 
 behind. A launch that cannot start at all fails with a typed reason — a directory that does not
 exist, a missing terminal backend — so the message names what to fix.
 
-## Panic control
+## Local control floor
 
-One verb revokes **every** paired device at once — the panic kill:
+The operator at the machine can **always** kill sessions, revoke every device, and stop the server —
+even with a lost phone and every device token revoked. Device-auth gates _remote_ control (over the
+tunnel); it never gates the local control path (see [Security posture](../../docs/security-posture.md)
+§ "Local control floor"). Two **out-of-band** controls carry the floor — neither touches the daemon's
+device-auth-gated HTTP surface, so neither can be gated on a device token:
 
-- **`ccctl revoke-all`** — revoke all paired devices in one action and force re-pairing. It empties
-  the server-side paired-device registry (the `0600` device-store snapshot from
+- **`ccctl revoke-all`** — revoke all paired devices in one action and force re-pairing (the panic
+  kill). It empties the server-side paired-device registry (the `0600` device-store snapshot from
   [`@ccctl/server`](../server)), which drops every device's at-rest token hash — the token's only
   stored projection — so every existing device token is refused on next use and every device must
   re-pair (scan a fresh QR from `ccctl serve --tunnel` / `ccctl tunnel`). It reports how many devices
@@ -70,6 +74,15 @@ One verb revokes **every** paired device at once — the panic kill:
     touching no tunnel adapter and needing no running daemon or network round-trip — so it works even
     when the daemon or its tunnel is down, which is exactly when a panic control is reached. This is
     the whole-registry counterpart to per-device revoke: `revoke-all` wipes them all, not one.
+
+- **Stop the daemon — `Ctrl-C` / `SIGTERM`.** `ccctl serve` arms `SIGTERM` and `SIGINT` (`Ctrl-C`, or
+  `kill <pid>`) for a **graceful** local shutdown: the daemon closes down — releasing every session it
+  launched (a taken-over one is left running for you) — and exits. A POSIX signal is deliverable only
+  by a same-uid (or root) process on the **same host**, so it is unreachable over the tunnel and needs
+  no device token — "local auth" in its strongest form, the same trigger the `SIGUSR1`/`SIGUSR2`
+  diagnostics use. A second signal while the close is still running force-exits, so a wedged teardown
+  can't trap you. Stopping the daemon is the ultimate local kill: every session it owns goes down with
+  it.
 
 ## Layout
 

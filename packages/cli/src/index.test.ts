@@ -78,6 +78,8 @@ function makeDeps(options: FakeDepsOptions = {}): {
   disposeHeapSnapshotHandler: ReturnType<typeof vi.fn>;
   installInspectorDiagnosticsHandler: ReturnType<typeof vi.fn>;
   disposeInspectorDiagnosticsHandler: ReturnType<typeof vi.fn>;
+  installShutdownHandler: ReturnType<typeof vi.fn>;
+  disposeShutdownHandler: ReturnType<typeof vi.fn>;
   deviceStore: IDeviceStore;
   deviceSaves: DeviceStoreSnapshot[];
 } {
@@ -161,6 +163,14 @@ function makeDeps(options: FakeDepsOptions = {}): {
   const installInspectorDiagnosticsHandler = vi.fn(
     (_options: { readonly logger: Logger }) => disposeInspectorDiagnosticsHandler,
   );
+  // The local-shutdown signal-arming seam (#82): the SIGTERM/SIGINT graceful-shutdown floor. A fake that
+  // records the bound server + logger it was handed and returns a spy disposer — so a test asserts `serve`
+  // arms the trigger WITHOUT installing a real process-global SIGTERM/SIGINT handler (which would leak) or
+  // wiring a real `process.exit` (which would kill the test process on a delivered signal).
+  const disposeShutdownHandler = vi.fn(() => undefined);
+  const installShutdownHandler = vi.fn(
+    (_options: { readonly server: CcctlServer; readonly logger: Logger }) => disposeShutdownHandler,
+  );
   // The device store the `revoke-all` verb drives (#88). A minimal in-memory IDeviceStore seeded
   // from `deviceSnapshot` (default `null` — nothing paired) that records every `save`, so a test
   // asserts both the reported count AND whether a save happened (the nothing-to-revoke path must
@@ -185,6 +195,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
       launcher,
       installHeapSnapshotHandler,
       installInspectorDiagnosticsHandler,
+      installShutdownHandler,
       renderQr,
     },
     startServer,
@@ -201,6 +212,8 @@ function makeDeps(options: FakeDepsOptions = {}): {
     disposeHeapSnapshotHandler,
     installInspectorDiagnosticsHandler,
     disposeInspectorDiagnosticsHandler,
+    installShutdownHandler,
+    disposeShutdownHandler,
     deviceStore,
     deviceSaves,
   };
@@ -381,6 +394,26 @@ describe("ccctl serve — starts the daemon (AC2)", () => {
     // The one-time operator hint names the signal and what it does.
     expect(loggedText()).toContain("SIGUSR1");
     expect(loggedText()).toContain("inspector attach");
+  });
+
+  it("arms the local-shutdown floor (#82) with the bound server + the SAME sink, and prints how to trigger it", async () => {
+    const { deps, startServer, installShutdownHandler, disposeShutdownHandler } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve"], { from: "user" });
+    // Armed exactly once, and NOT torn down at serve-return — the handler lives for the daemon's lifetime.
+    expect(installShutdownHandler).toHaveBeenCalledTimes(1);
+    expect(disposeShutdownHandler).not.toHaveBeenCalled();
+    // It is handed the BOUND server to close (the exact object `startServer` resolved) and the SAME
+    // structured-log sink the daemon got, so a failed shutdown rides the one #61 trail.
+    const resolvedServer = await startServer.mock.results[0]?.value;
+    const serverLogger = (startServer.mock.calls[0][0] as { logger: unknown }).logger;
+    const handlerArg = installShutdownHandler.mock.calls[0][0] as { server: unknown; logger: unknown };
+    expect(handlerArg.server).toBe(resolvedServer);
+    expect(handlerArg.logger).toBe(serverLogger);
+    // The one-time operator hint names the termination signals and that no device token is needed —
+    // the "stop the server from the local machine" floor (AC1/AC2).
+    expect(loggedText()).toContain("SIGTERM");
+    expect(loggedText()).toContain("SIGINT");
+    expect(loggedText()).toContain("no device token needed");
   });
 });
 
