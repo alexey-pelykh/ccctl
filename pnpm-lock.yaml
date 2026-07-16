@@ -96,6 +96,9 @@ importers:
       '@ccctl/server':
         specifier: workspace:*
         version: link:../server
+      '@ccctl/tunnel-adapters':
+        specifier: workspace:*
+        version: link:../tunnel-adapters
       '@ccctl/web-ui':
         specifier: workspace:*
         version: link:../web-ui

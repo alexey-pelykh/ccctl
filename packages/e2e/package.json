@@ -28,6 +28,7 @@
     "@ccctl/cli": "workspace:*",
     "@ccctl/core": "workspace:*",
     "@ccctl/server": "workspace:*",
+    "@ccctl/tunnel-adapters": "workspace:*",
     "@ccctl/web-ui": "workspace:*"
   }
 }

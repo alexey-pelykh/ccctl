@@ -87,6 +87,7 @@ export * from "./bridge-wire-conformance.js";
 export * from "./traffic-harness.js";
 export * from "./one-session-harness.js";
 export * from "./multi-session-harness.js";
+export * from "./multi-session-tunnel.js";
 export * from "./bearer-canary.js";
 export * from "./live-worker-oracle.js";
 export * from "./worker-idle-hold.js";

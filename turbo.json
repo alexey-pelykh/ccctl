@@ -15,7 +15,7 @@
     "test:e2e": {
       "dependsOn": ["build"],
       "cache": false,
-      "passThroughEnv": ["CCCTL_E2E", "CCCTL_SDK_URL", "ANTHROPIC_API_KEY", "HOME"]
+      "passThroughEnv": ["CCCTL_E2E", "CCCTL_E2E_TAILSCALE", "CCCTL_SDK_URL", "ANTHROPIC_API_KEY", "HOME"]
     },
     "typecheck": {
       "dependsOn": ["^build"]

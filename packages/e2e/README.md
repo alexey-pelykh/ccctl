@@ -116,6 +116,33 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   so it gates on every run: `worker-idle-hold.e2e.test.ts` drives it against the real server and
   `worker-idle-hold.test.ts` pins the pure `classifyIdleHold` verdict credential-free.
 
+- **Multi-session over a real Tailscale tunnel (UC1, #65, traces E2E-B-001)** —
+  `multi-session-tunnel.ts` is the fenced, self-classifying oracle that graduates the hermetic
+  multi-session flow (`multi-session-flow.e2e.test.ts`, #20 — ≥2 concurrent sessions listed /
+  viewed / steered, never cross-wired, over **loopback**) to run over a **real Tailscale tunnel**:
+  the phone is a remote tailnet device reaching the loopback-bound `@ccctl/server` **through the
+  tunnel** (no public IP, no open inbound ports), while the bridge + worker legs stay on-box
+  (loopback), exactly as in reality. It drives a real [`TailscaleTunnel`](../tunnel-adapters)
+  (`establish` → `serve`, never `funnel`), carries ≥2 sessions, and has each phone **list**
+  (`GET /api/sessions`), **view** (per-session SSE), and **steer** (`POST …/command`) its own
+  session over the tunnel's resolved `https://<tailnet-host>` base — then **self-classifies**:
+  `verified` (≥2 carried; the phone listed all with per-session status and viewed + steered each
+  over the tunnel, no cross-wiring, over a tailnet-scoped base), `drift` (a violation was
+  **observed** — a steer/transcript crossed sessions, the listed set diverged, or the reachable
+  base was a **public** host; the run **fails**, naming the check), or `inconclusive` (a leg was
+  never captured — no tailnet, an unreachable base — **runtime-skip**, never a fabricated green).
+  The "no public IP / open ports" AC is receiver-grounded twice over: the reachable base must be a
+  **tailnet-scoped** host (`isTailnetHost` — MagicDNS `*.ts.net`, CGNAT `100.64.0.0/10`, or the
+  Tailscale IPv6 ULA), **and** `TailscaleTunnel` only ever `serve`s (unit-proven in
+  `@ccctl/tunnel-adapters`). Every hop is receiver-read (the server's own session records, each
+  worker's own inbound frames, each phone's own over-tunnel SSE log), and view isolation is an
+  **exact** match of each phone's relayed bytes to its own worker's emitted transcript.
+  **Fenced / opt-in**: the whole suite is gated on `CCCTL_E2E` + `CCCTL_E2E_TAILSCALE`
+  (`resolveTunnelE2EEnv`) and `describe.skipIf`-skips when they are absent, so it lives **outside**
+  the credential-free CI `e2e` lane and never runs — nor fails — there. `multi-session-tunnel-flow.e2e.test.ts`
+  drives it; the pure fence + reachable-base helpers + tri-state classifier (the Tier-A encoding of
+  UC1's three ACs) are unit-tested credential-free in `multi-session-tunnel.test.ts`.
+
 ## What is fenced to the credentialed wave
 
 - The **live-worker oracle** above is wired but **fenced** — it runs only when
@@ -129,6 +156,14 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   green. The launcher is injectable, so that contract can firm up when the patched-worker
   packaging lands with no churn to the oracle. The hermetic `one-session-harness` is the
   skeleton the live oracle graduates from.
+
+- The **multi-session tunnel oracle** above is likewise wired but **fenced** — it runs only
+  when `CCCTL_E2E` + `CCCTL_E2E_TAILSCALE` are set (turbo passes them through to `test:e2e`)
+  and a real, authenticated tailnet is present on the box (`TailscaleTunnel.establish` refuses
+  otherwise — mandatory tunnel-auth). Its infra prerequisite is a live tailnet rather than a
+  patched worker + API key, so it carries its own arm distinct from the live-worker oracle's;
+  an absent tailnet surfaces **safely** as `inconclusive`, never a fake green. The hermetic
+  `multi-session-harness` (#20) is the loopback skeleton it graduates to a real tunnel.
 
 ## Running
 
