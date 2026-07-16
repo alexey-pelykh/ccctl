@@ -23,6 +23,23 @@
  * A `worker_status` frame is the session's CURRENT TURN (what the worker is
  * doing right now), rendered as an in-place activity indicator; every other
  * control event is a TRANSCRIPT line, appended in order.
+ *
+ * Not everything on the stream came from the worker. The server SYNTHESIZES its
+ * own frames onto the same relay, namespaced `ccctl_` so they cannot collide
+ * with a real `stream-json` payload, and this module decodes the one that
+ * changes what the page should DO:
+ *
+ *   ccctl_session_closed = { type: "ccctl_session_closed", session_id: string,
+ *                            status: "closed" | "errored" }
+ *
+ * — the session's TERMINAL frame (#196, `@ccctl/server` § `session-close.ts`),
+ * delivered just before the server ends the stream. It is why this decoder
+ * exists at all: without it the stream simply stops, which is also what a dead
+ * phone link looks like, so a client WATCHING a session someone else stopped
+ * could not tell the two apart without re-polling the session list. Decoding it
+ * is the client half of a deliberately COORDINATED change — an undecoded
+ * `ccctl_` frame renders as a raw `unparsed` blob, so shipping the server frame
+ * without this would have degraded the very surface it exists to inform.
  */
 
 /** The `type` discriminator every control frame from the worker carries. */
@@ -40,6 +57,27 @@ export const WORKER_STATUSES = ["running", "requires_action", "idle"];
  * `@ccctl/core`'s `DEFAULT_REQUIRES_ACTION_DETAIL`.
  */
 export const DEFAULT_REQUIRES_ACTION_DETAIL = "Awaiting input.";
+
+/**
+ * The pinned `type` of the server's TERMINAL frame (#196) — mirrors
+ * `@ccctl/server` § `session-close.ts`'s `SESSION_CLOSED_EVENT_TYPE`.
+ */
+export const SESSION_CLOSED_EVENT_TYPE = "ccctl_session_closed";
+
+/**
+ * The terminal statuses a {@link SESSION_CLOSED_EVENT_TYPE} frame may report —
+ * the closed subset of `@ccctl/core`'s `SessionStatus`, mirrored. `closed` is a
+ * session that ended; `errored` is one that had already failed on its own, whose
+ * diagnosis the server deliberately preserves rather than overwriting with the
+ * fact that it was later stopped (`markSessionClosed`).
+ *
+ * A CLOSED set, checked rather than trusted — the same fail-closed posture
+ * {@link isWorkerStatusEvent} takes over {@link WORKER_STATUSES}. A server that
+ * one day reports a third terminal status is a coordinated change, and until it
+ * is made, the honest render for a status this client does not know is the raw
+ * line, not a confident "ended" over a state it cannot describe.
+ */
+export const TERMINAL_SESSION_STATUSES = ["closed", "errored"];
 
 /**
  * Decode one SSE `data:` payload into a `ControlEvent`, or a failure. Never
@@ -65,6 +103,62 @@ export function decodeControlEvent(data) {
     return { ok: false };
   }
   return { ok: true, event: value };
+}
+
+/**
+ * Decode one SSE `data:` payload into the session's TERMINAL frame (#196), or
+ * `null` when it is not one. The sibling of {@link decodeControlEvent} over the
+ * server's own `ccctl_`-namespaced shape, and fail-closed in the same way:
+ * invalid JSON, a non-object, a `type` that is not {@link SESSION_CLOSED_EVENT_TYPE},
+ * or a `status` outside {@link TERMINAL_SESSION_STATUSES} all yield `null`.
+ *
+ * Fail-closed matters more here than for a transcript line, because the two
+ * failure directions are not symmetric: a malformed frame that fell through to
+ * `unparsed` shows the operator a raw line they can read, while one decoded
+ * LOOSELY would announce that a session ended — and the page would close its own
+ * stream on that word. Announcing a live session dead is the one wrong answer
+ * this frame must never give, so a frame that is not exactly right is not this
+ * frame.
+ *
+ * `session_id` is deliberately NOT read: the stream is per-session (#20), so the
+ * frame arrived on the only stream it could have, and the client already knows
+ * which session it is watching. Keying off a self-reported id would invite
+ * trusting it over the channel it came in on.
+ *
+ * @param {string} data - one SSE `data:` line.
+ * @returns {{ status: string } | null}
+ */
+export function decodeSessionClosed(data) {
+  let value;
+  try {
+    value = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  if (value.type !== SESSION_CLOSED_EVENT_TYPE || !TERMINAL_SESSION_STATUSES.includes(value.status)) {
+    return null;
+  }
+  return { status: value.status };
+}
+
+/**
+ * The human-ready line for a session that has ended. Total over
+ * {@link TERMINAL_SESSION_STATUSES} — the only statuses {@link decodeSessionClosed}
+ * lets through — so it needs no defensive fallback branch that could never run.
+ *
+ * Both lines lead with the same words, because the fact the operator most needs
+ * is the one they share: it is over. `errored` then says which of the two ways it
+ * got there, since a session that failed on its own and one that was stopped are
+ * different news to whoever is watching.
+ *
+ * @param {string} status - one of {@link TERMINAL_SESSION_STATUSES}.
+ * @returns {string}
+ */
+export function closedText(status) {
+  return status === "errored" ? "Session ended — errored." : "Session ended.";
 }
 
 /**
@@ -166,23 +260,37 @@ export function formatTranscriptEntry(event) {
  *     (rendered in place, latest wins);
  *   - `{ kind: "transcript", subtype, summary }` — any other control event
  *     (appended to the transcript in order);
+ *   - `{ kind: "closed", status, text }`       — the session's terminal frame
+ *     (#196): it is OVER, and this is the last event its stream will carry;
  *   - `{ kind: "unparsed", raw }`              — an undecodable line (surfaced
  *     verbatim rather than dropped, so a malformed frame is visible, not silent).
+ *
+ * The two decoders are tried control-event-FIRST purely so the hot path — every
+ * transcript line the worker emits — parses once rather than twice. It is not
+ * load-bearing: the shapes are disjoint by `type` (a `control_event` is never a
+ * `ccctl_session_closed`, and vice versa), so each decoder rejects what the other
+ * accepts and the order cannot change any verdict.
  *
  * @param {string} data - one SSE `data:` line.
  * @returns {{ kind: "activity", status: string, text: string }
  *          | { kind: "transcript", subtype: string, summary: string }
+ *          | { kind: "closed", status: string, text: string }
  *          | { kind: "unparsed", raw: string }}
  */
 export function processEventData(data) {
   const decoded = decodeControlEvent(data);
-  if (!decoded.ok) {
-    return { kind: "unparsed", raw: data };
+  if (decoded.ok) {
+    const activity = activityFromEvent(decoded.event);
+    if (activity !== null) {
+      return { kind: "activity", status: activity.status, text: activity.text };
+    }
+    const entry = formatTranscriptEntry(decoded.event);
+    return { kind: "transcript", subtype: entry.subtype, summary: entry.summary };
   }
-  const activity = activityFromEvent(decoded.event);
-  if (activity !== null) {
-    return { kind: "activity", status: activity.status, text: activity.text };
+  // Not something the worker said — it may be the server's own terminal frame (#196).
+  const closed = decodeSessionClosed(data);
+  if (closed !== null) {
+    return { kind: "closed", status: closed.status, text: closedText(closed.status) };
   }
-  const entry = formatTranscriptEntry(decoded.event);
-  return { kind: "transcript", subtype: entry.subtype, summary: entry.summary };
+  return { kind: "unparsed", raw: data };
 }

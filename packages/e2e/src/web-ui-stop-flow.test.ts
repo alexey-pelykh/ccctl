@@ -13,6 +13,10 @@ import {
   stopFailure,
   stopRequest,
 } from "@ccctl/web-ui/src/stop.js";
+// The REAL phone decode (#15/#196), so a watcher's view of the terminal frame is asserted through the
+// actual UI classifier rather than a re-implemented stand-in of it.
+import { processEventData } from "@ccctl/web-ui/src/transcript.js";
+import { connectUiClient, waitFor } from "./one-session-harness.js";
 
 // The emergency-stop flow (#77, `UI-B-012` / `CLI-B-004`) driven END TO END against the REAL wired
 // ingress (`POST /api/sessions/{id}/stop`, #76) and its REAL typed-refusal branches. The launcher is
@@ -203,7 +207,8 @@ describe("the web-ui stop control stops a session (#77 AC1)", () => {
     // so a retained terminal row would hold its slot forever and stopping eight sessions would leave
     // the server permanently `at-capacity` with nothing running in it — the emergency-stop's own
     // promise, end one and free a slot, would be the first thing it broke). The terminal STATUS is
-    // reflected to the one client that asked, in the 200 body the tests above read.
+    // reflected to the client that asked in the 200 body the tests above read, and to everyone
+    // WATCHING in the terminal frame the last describe here drives (#196).
     expect(await listSessions(server)).toEqual([]);
   });
 
@@ -351,5 +356,78 @@ describe("both paths drive the SAME server-side emergency-stop (#77 AC3)", () =>
     expect(failure.message).toContain("not allowed");
     // …and nothing is forceable off a code that does not exist.
     expect(isForceable(failure.code)).toBe(false);
+  });
+});
+
+describe("a WATCHING client learns the terminal state too, not just the initiator (#196)", () => {
+  // #76's AC4 — "the stopped session transitions to a terminal state, reflected to clients" — was true
+  // for whoever ASKED: they read it in the 200 body the first describe drives. A client merely WATCHING
+  // the session's stream got a bare `res.end()`, which is also what a dropped link looks like, so it
+  // could only learn by re-polling the session list — and even then learned the row's ABSENCE, never the
+  // status. #77's stop button is what makes two clients on one session the normal case rather than the
+  // exotic one, so this is the case, not an edge of it.
+  //
+  // This is the spec that can hold BOTH halves of a deliberately coordinated change honest, and neither
+  // package's own tests can. `session-close.test.ts` proves the server broadcasts a frame; `transcript.
+  // test.js` proves the browser decodes one — each against a fixture it also writes, so both stay green
+  // the day the two shapes drift apart. Here the REAL server's bytes are read by the REAL browser
+  // decoder, so "the watcher learns" is demonstrated rather than asserted twice in two places.
+
+  it("delivers the terminal frame to a watcher, decoded by the REAL browser decoder (AC6)", async () => {
+    const { launcher } = fakeLauncher();
+    const server = await serve({ port: 0, launcher });
+    const sessionId = await launchOne(server);
+    // A second client, watching — it never asked for a stop, so it has no response to read.
+    const watcher = await connectUiClient({ server, sessionId });
+
+    const res = await postStop(server, sessionId, stopRequest());
+    expect(res.status).toBe(200);
+
+    await waitFor(() => watcher.viewed().length > 0);
+    // Grounded in the WATCHER's OWN received bytes (never the stopper's self-report), read through the
+    // same `processEventData` the page runs. `closed` is what the server's transition produced — the
+    // same fact the initiator's 200 carried, now told to someone who did not ask.
+    expect(processEventData(watcher.viewed()[0].data)).toEqual({
+      kind: "closed",
+      status: "closed",
+      text: "Session ended.",
+    });
+  });
+
+  it("delivers it as the LAST thing on the stream — told on the way out, not into a closed pipe (AC1)", async () => {
+    const { launcher } = fakeLauncher();
+    const server = await serve({ port: 0, launcher });
+    const sessionId = await launchOne(server);
+    const watcher = await connectUiClient({ server, sessionId });
+
+    await postStop(server, sessionId, stopRequest());
+    await waitFor(() => watcher.viewed().length > 0);
+
+    // Exactly one frame, and the stream is over: the relay was reaped right behind it. A farewell
+    // broadcast after the reap would leave this at zero forever — the watcher would wait out the
+    // timeout above and learn nothing, which is the bug in its original form.
+    expect(watcher.viewed()).toHaveLength(1);
+    expect(processEventData(watcher.viewed()[0].data).kind).toBe("closed");
+    // It carried a real `Last-Event-ID` like every frame before it (#80's cursor never skips).
+    expect(watcher.viewed()[0].id).toBe("1");
+  });
+
+  it("tells the watcher of the stopped session ONLY — a sibling's watcher is untouched (AC3, #20)", async () => {
+    const { launcher } = fakeLauncher();
+    const server = await serve({ port: 0, launcher });
+    const doomedId = await launchOne(server);
+    const liveId = await launchOne(server);
+    const doomedWatcher = await connectUiClient({ server, sessionId: doomedId });
+    const bystander = await connectUiClient({ server, sessionId: liveId });
+
+    await postStop(server, doomedId, stopRequest());
+    await waitFor(() => doomedWatcher.viewed().length > 0);
+
+    // A terminal frame on the wrong stream is worse than none: the page ACTS on that word by closing its
+    // own stream and telling the operator a live session is over.
+    expect(bystander.viewed()).toEqual([]);
+    // …and the sibling is genuinely still there to be watched, so the silence is correctness, not a
+    // second session that also died.
+    expect((await listSessions(server)).map((row) => row.id)).toEqual([liveId]);
   });
 });
