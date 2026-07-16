@@ -155,6 +155,29 @@ export {
   type SignalSource,
 } from "./heap-snapshot.js";
 
+// Inspector attach + FD/handle-count diagnostics (#63): the second on-demand diagnostic slice, triggered
+// by SIGUSR1 (local auth = OS process ownership, the same choice #62 made — an HTTP endpoint would
+// front-run the deferred request-credential boundary). One poke samples the daemon's active libuv
+// FD/handle counts onto the #61 trail AND attaches the loopback-bound Node inspector for deeper
+// diagnosis. The CLI arms the signal handler at the daemon composition root; the seams are injectable
+// for deterministic tests (no real inspector port opened, no real signal delivered).
+export {
+  captureHandleReport,
+  formatHandleReport,
+  installInspectorDiagnosticsSignalHandler,
+  openInspector,
+  INSPECTOR_DIAGNOSTICS_HOST,
+  INSPECTOR_DIAGNOSTICS_SIGNAL,
+  type HandleReport,
+  type HandleReportDeps,
+  type HandleReportOutcome,
+  type HandleSampler,
+  type InspectorController,
+  type InspectorDeps,
+  type InspectorDiagnosticsSignalDeps,
+  type InspectorOutcome,
+} from "./inspector-diagnostics.js";
+
 // Re-export the browser-facing session-namespace wire types (#20 list, #31 launch) on the
 // public surface, for the SAME contract-consumer reason as the §2 session-create wire above:
 // a UI client — the web UI, and now the `ccctl` CLI's launch/attach on-ramp (#38) — asserts
