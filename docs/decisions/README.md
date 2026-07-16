@@ -23,7 +23,8 @@ standards, supersession pattern).
 
 ## Index
 
-| ADR                                                    | Title                                                                   | Status   | Council |
-| ------------------------------------------------------ | ----------------------------------------------------------------------- | -------- | ------- |
-| [adr-001](adr-001-register-response-wire-casing.md)    | Register-response wire casing: snake_case with an explicit boundary DTO | approved | D2      |
-| [adr-002](adr-002-tailscale-acl-provisioning-model.md) | Tailscale ACL provisioning: opt-in, additive, non-destructive grants    | approved | —       |
+| ADR                                                    | Title                                                                    | Status   | Council |
+| ------------------------------------------------------ | ------------------------------------------------------------------------ | -------- | ------- |
+| [adr-001](adr-001-register-response-wire-casing.md)    | Register-response wire casing: snake_case with an explicit boundary DTO  | approved | D2      |
+| [adr-002](adr-002-tailscale-acl-provisioning-model.md) | Tailscale ACL provisioning: opt-in, additive, non-destructive grants     | approved | —       |
+| [adr-003](adr-003-web-ui-shell-dom-harness.md)         | Pinning the zero-build web-ui shell: a jsdom harness plus an id contract | approved | —       |
