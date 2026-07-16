@@ -21,10 +21,11 @@
  *     transcript leg ({@link handleWorkerEvents}); each payload is relayed to the UI
  *     SSE (#13, {@link broadcastEvent}) — this is where a turn's output returns — and a
  *     `worker_status` payload ALSO feeds the session's `activity` ({@link foldWorkerStatus},
- *     #39). This is the leg carrying the RICH frame (`payload: { status, detail }`), so it
- *     is where the human-ready detail enters the model.
- *   - `PUT …/worker` `{ worker_status, worker_epoch, external_metadata }` → the status
- *     gate ({@link handleWorkerStatus}); `idle` means "ready for a turn". It MUST `200`
+ *     #39). This is the leg carrying the RICH frame
+ *     (`payload: { status, detail, sequence_num }`), so it is where the human-ready detail
+ *     enters the model.
+ *   - `PUT …/worker` `{ worker_status, worker_epoch, external_metadata, sequence_num }` → the
+ *     status gate ({@link handleWorkerStatus}); `idle` means "ready for a turn". It MUST `200`
  *     or the worker exits. The server derives the session's `activity` from it
  *     ({@link applyWorkerStatus}) — a BARE status, no detail field, so a `requires_action`
  *     re-affirmation keeps the detail §5 captured. `GET …/worker` on the SAME bare path is
@@ -34,6 +35,19 @@
  *     {@link recordHeartbeat}); `POST …/worker/events/delivery`
  *     `{ worker_epoch, updates: [{ event_id, status }] }` → the worker's per-event
  *     downstream acks ({@link handleWorkerDelivery}).
+ *
+ * **Status ORDERING (#201).** Both status legs carry an OPTIONAL `sequence_num` — the worker's
+ * per-session counter, one value per status REPORT (both legs of one transition share it), so ONE
+ * counter spans both legs and a frame's position is comparable whichever leg it took; `@ccctl/core`'s
+ * `WorkerStatusEvent` pins the emitter contract. A frame stamped strictly below the highest already
+ * applied ({@link WorkerChannelRecord.highestStatusSeq}) is refused as stale
+ * ({@link refuseStaleStatusFrame}): it moves nothing, is dropped from the §5 relay (the UI renders a
+ * `worker_status` as the LIVE current turn, so forwarding a frame the model ruled stale would publish
+ * a known-false claim), is LOGGED rather than silently discarded, and is still answered `200` — the
+ * worker did nothing wrong, and a 4xx would kill it over a benign reorder. An absent sequence applies
+ * (last-write-wins, as before #201), so an older worker build is unaffected. The mark is scoped to the
+ * current epoch and never crosses a re-register; the guard reads no clock, which is exactly why it
+ * cannot wedge a session the way #39's removed clock-derived guard could.
  *
  * **Idle-threshold nudge (#41).** From the observed `worker_status: idle` and the heartbeat — the only
  * two idle-relevant signals a worker that emits no headless "idle for X" gives — the server times how
@@ -82,12 +96,15 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   applyWorkerStatus,
   applyWorkerStatusFrame,
+  asWorkerStatusSequence,
   BRIDGE_PROTOCOL_API_VERSION,
   isInputAwaited,
   isSessionStale,
+  isStaleWorkerStatusSequence,
   isWorkerStatus,
   markSessionReady,
   recordHeartbeat,
+  workerStatusSequenceFromFrame,
   type ControlFrame,
   type ControlRequest,
   type JsonValue,
@@ -255,6 +272,24 @@ export interface WorkerChannelRecord {
   downstream: ServerResponse | null;
   /** The next `sequence_num` / SSE `id` a pushed downstream frame carries (monotonic, starts at 1). */
   nextSeq: number;
+  /**
+   * The ordering high-water mark (#201): the highest `sequence_num` of any `worker_status` frame
+   * APPLIED to this session's classification, or `null` when none has carried one yet. An upstream
+   * frame stamped BELOW it lost a race and is refused ({@link isStaleWorkerStatusSequence}); one
+   * stamped at or above it applies and advances the mark. Counts frames across BOTH status legs —
+   * the §4 gate and the §5 fold share one counter, as the worker stamps one per session.
+   *
+   * Deliberately NOT carried across a re-register (unlike {@link nextSeq}, whose downstream ids must
+   * never repeat): a new epoch is a new worker generation whose counter restarts at its own
+   * beginning, so a carried mark would refuse its every frame — a wedged session, which is the exact
+   * failure this guard exists to avoid. Living on the per-epoch record is what makes that reset
+   * structural rather than a step someone must remember; the epoch gate in {@link readWorkerBody}
+   * then guarantees every frame compared against this mark belongs to the generation that set it.
+   *
+   * In-memory only, never persisted: a restarted daemon has no worker generation to order for, and
+   * the worker re-registers into a fresh epoch anyway.
+   */
+  highestStatusSeq: number | null;
   /**
    * The armed per-session **liveness interval** (#166) writing a periodic no-op `client_event`
    * down {@link downstream} to keep it past the worker's ~45s liveness timeout; `null` when no
@@ -462,6 +497,9 @@ export function handleWorkerRegister(
     epoch,
     downstream: null,
     nextSeq: prev?.nextSeq ?? 1,
+    // NOT `prev?.highestStatusSeq` (#201): the fresh generation's status counter restarts, so
+    // inheriting the old mark would refuse its every frame. See {@link WorkerChannelRecord.highestStatusSeq}.
+    highestStatusSeq: null,
     livenessTimer: null,
     evictionTimer: null,
     idleTimer: null,
@@ -599,30 +637,112 @@ function logActivityTransition(state: WorkerChannelState, sessionId: string, pre
 }
 
 /**
+ * The ORDERING guard (#201) — `true` when this `worker_status` frame must be REFUSED as stale,
+ * i.e. it is stamped with a `sequence_num` strictly below the highest already applied to this
+ * session's classification within the current epoch. Shared by the §4 gate and the §5 fold so one
+ * rule governs both, exactly as {@link logActivityTransition} does for the transition trail.
+ *
+ * Refusing is a NON-transition: it returns `true` and the caller skips the fold, leaving the
+ * session — activity, `lastActivityAt`, the idle timer, the needs-you notification — untouched.
+ * The frame is not an ERROR, though: the worker did nothing wrong, its frame merely lost a race,
+ * so both legs still answer `200` (a 4xx would kill the worker over a benign reorder).
+ *
+ * The refusal is LOGGED, which the #201 AC requires and #39's post-mortem earned: the guard #39
+ * removed answered `200` and silently discarded the frame, so an operator whose session was
+ * wedged had no way to see why. A refused frame must be observable, never a silent drop — and
+ * because the decision reads no clock (only two worker-supplied integers), it cannot wedge a
+ * session in the first place. `level` is `warn`, not `info`: a reorder is not the steady state.
+ */
+function refuseStaleStatusFrame(
+  state: WorkerChannelState,
+  record: WorkerChannelRecord,
+  sessionId: string,
+  session: Session,
+  sequence: number | null,
+): boolean {
+  if (!isStaleWorkerStatusSequence(sequence, record.highestStatusSeq)) {
+    return false;
+  }
+  state.logger.log({
+    category: "detection",
+    level: "warn",
+    event: "stale-frame",
+    sessionId,
+    // The activity the session KEEPS: a refusal is precisely the absence of a transition.
+    activity: session.activity.kind,
+    // Both are worker-supplied monotonic integers — no credential, nothing free-form, can ride this line.
+    detail: `refused worker_status seq ${sequence} < applied ${record.highestStatusSeq}`,
+  });
+  return true;
+}
+
+/**
+ * Advance the ordering high-water mark (#201) for a frame that was APPLIED. A frame carrying no
+ * usable sequence leaves the mark alone rather than resetting it: it says nothing about order, so
+ * it must not forfeit the ordering a stamped predecessor established — otherwise one unstamped
+ * frame would re-open the session to every stale frame that follows.
+ */
+function recordStatusSequence(record: WorkerChannelRecord, sequence: number | null): void {
+  if (sequence !== null && (record.highestStatusSeq === null || sequence > record.highestStatusSeq)) {
+    record.highestStatusSeq = sequence;
+  }
+}
+
+/**
  * Fold a §5 payload into the session's classification when it is a `worker_status` frame
  * (#39). This is the leg that carries the RICH frame — `payload: { status, detail }` — so it
  * is the ONLY place the human-ready tool description enters the session model; the §4 gate
  * ({@link handleWorkerStatus}) reports a bare status with no detail field at all.
  *
  * Additive to the verbatim relay, never a substitute: the UI decodes the same frame itself to
- * render the in-place current-turn indicator (#15), so the relay stays byte-identical.
+ * render the in-place current-turn indicator (#15), so what IS relayed stays byte-identical.
+ *
+ * Returns whether the frame was REFUSED by the ordering guard (#201) — `true` tells
+ * {@link handleWorkerEvents} to drop it from the relay too, so BOTH the session model and the
+ * browser skip it. "Verbatim" governs the FIDELITY of a relayed frame, never an obligation to
+ * relay one the server has already ruled out: a `worker_status` is the only payload the UI does
+ * not append to its transcript — it renders it IN PLACE as the session's live current turn
+ * (`transcript.js`'s `{ kind: "activity" }`; `formatTranscriptEntry` is explicitly for
+ * NON-`worker_status` events). So a stale frame relayed anyway is not history preserved, it is a
+ * LIVE CLAIM the server has just adjudicated false — "Running…" rendered over a session blocked on
+ * the operator, with no later frame coming to correct it (it is blocked precisely because it is
+ * waiting). Dropping it also keeps ONE adjudicator: the browser needs no mirrored high-water mark,
+ * and cannot reach a verdict the server has rejected.
  *
  * Fail-soft, matching the batch contract: {@link applyWorkerStatusFrame} returns the session
  * unchanged for any payload that is not a well-formed `worker_status` (a transcript line, an
- * unknown status, a scalar), so a non-status entry is simply a no-op here.
+ * unknown status, a scalar), so a non-status entry is simply a no-op here — and, carrying no
+ * sequence, is never refusable, so the relay below always gets it.
  */
-function foldWorkerStatus(state: WorkerChannelState, sessionId: string, payload: unknown): void {
+function foldWorkerStatus(
+  state: WorkerChannelState,
+  record: WorkerChannelRecord,
+  sessionId: string,
+  payload: unknown,
+): boolean {
   // A relayed payload is whatever the worker sent, so it is read back as `unknown` and narrowed
   // to a plain object before the cast — the same stance `decodeControlFrame` takes over a
   // decoded line. `applyWorkerStatusFrame`'s own guard does the rest of the validation.
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-    return;
+    return false;
   }
   const session = state.sessions.get(sessionId);
   if (session === undefined) {
-    return;
+    return false;
   }
-  const next = applyWorkerStatusFrame(session, payload as ControlFrame);
+  const frame = payload as ControlFrame;
+  // The ordering guard (#201) — before the fold, so a stale frame moves nothing. Scoped to frames
+  // that ARE a well-formed `worker_status`: `workerStatusSequenceFromFrame` yields `null` for
+  // anything else, and a `null` sequence is never stale, so a transcript line still no-ops below.
+  const sequence = workerStatusSequenceFromFrame(frame);
+  if (refuseStaleStatusFrame(state, record, sessionId, session, sequence)) {
+    return true;
+  }
+  // Advance the mark for the frame we are about to apply — kept beside the guard it pairs with,
+  // rather than inside the `next !== session` branch below, so the ordering decision and its
+  // bookkeeping read as one unit and neither depends on another function's return identity.
+  recordStatusSequence(record, sequence);
+  const next = applyWorkerStatusFrame(session, frame);
   if (next !== session) {
     state.sessions.set(sessionId, next);
     // Detection trail (#61): the §5 leg observed a worker_status transition.
@@ -636,6 +756,7 @@ function foldWorkerStatus(state: WorkerChannelState, sessionId: string, payload:
     // `requires_action`. `session` is the PRIOR state, so the transition is decided against it.
     reconcileNeedsInput(state, sessionId, session, next);
   }
+  return false;
 }
 
 /**
@@ -652,7 +773,7 @@ export function handleWorkerEvents(
   state: WorkerChannelState,
   sessionId: string,
 ): void {
-  readWorkerBody(req, res, state, sessionId, "POST", (_record, body) => {
+  readWorkerBody(req, res, state, sessionId, "POST", (record, body) => {
     const events = body.events;
     if (!Array.isArray(events)) {
       writeError(res, 400, "ccctl: worker-events body `events` must be an array");
@@ -666,8 +787,12 @@ export function handleWorkerEvents(
       if (typeof entry === "object" && entry !== null && !Array.isArray(entry) && "payload" in entry) {
         const { payload } = entry as { payload: JsonValue };
         // Entries in one batch apply in order, so a batch carrying running→idle lands on idle.
-        foldWorkerStatus(state, sessionId, payload);
-        broadcastEvent(state.eventRelays, sessionId, payload);
+        // A frame the ordering guard refused (#201) is dropped from the relay too, for the reason
+        // {@link foldWorkerStatus} pins; everything else relays verbatim (#13/#15).
+        const refused = foldWorkerStatus(state, record, sessionId, payload);
+        if (!refused) {
+          broadcastEvent(state.eventRelays, sessionId, payload);
+        }
       }
     }
     writeJson(res, 200, {});
@@ -676,10 +801,11 @@ export function handleWorkerEvents(
 
 /**
  * `PUT …/worker` (§4). The status gate: `{ worker_status, worker_epoch,
- * external_metadata }`. Derives the session's `activity` from `worker_status`
- * ({@link applyWorkerStatus}) — `idle` means "ready for a turn". Fails closed 404
- * (unknown session), 409 (superseded epoch), or 400 (unknown `worker_status`,
- * drift). MUST `200` on success or the worker exits.
+ * external_metadata, sequence_num }`. Derives the session's `activity` from `worker_status`
+ * ({@link applyWorkerStatus}) — `idle` means "ready for a turn" — unless the optional
+ * `sequence_num` proves the frame stale ({@link refuseStaleStatusFrame}, #201), which is a
+ * `200` too. Fails closed 404 (unknown session), 409 (superseded epoch), or 400 (unknown
+ * `worker_status`, drift). MUST `200` on success or the worker exits.
  */
 export function handleWorkerStatus(
   req: IncomingMessage,
@@ -687,14 +813,20 @@ export function handleWorkerStatus(
   state: WorkerChannelState,
   sessionId: string,
 ): void {
-  readWorkerBody(req, res, state, sessionId, "PUT", (_record, body) => {
+  readWorkerBody(req, res, state, sessionId, "PUT", (record, body) => {
     const workerStatus = body.worker_status;
     if (!isWorkerStatus(workerStatus)) {
       writeError(res, 400, "ccctl: worker-status body carries an unknown `worker_status` (drift)");
       return;
     }
+    // The ordering signal (#201) rides this leg at the body's top level, beside the bare status it
+    // orders — the §5 leg carries the same field inside the frame's payload, beside ITS status.
+    const sequence = asWorkerStatusSequence(body.sequence_num);
     const session = state.sessions.get(sessionId);
-    if (session !== undefined) {
+    // A stale frame is refused BEFORE the apply — no transition, no reconcile — but still answers
+    // 200 below: it is not the worker's error, and a 4xx here would kill it over a benign reorder.
+    if (session !== undefined && !refuseStaleStatusFrame(state, record, sessionId, session, sequence)) {
+      recordStatusSequence(record, sequence);
       const next = applyWorkerStatus(session, workerStatus);
       state.sessions.set(sessionId, next);
       // Detection trail (#61): the §4 gate observed a worker_status transition — same derivation as §5.

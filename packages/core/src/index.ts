@@ -1097,10 +1097,39 @@ export function isWorkerStatus(value: unknown): value is WorkerStatus {
  * supplies {@link DEFAULT_REQUIRES_ACTION_DETAIL} when it is absent, so the
  * derived activity always carries a non-empty, displayable detail. Adding it as
  * an optional field keeps every existing `{ status }` payload valid.
+ *
+ * `sequence_num` is the frame's ORDERING signal (#201), which the server uses to refuse a
+ * frame that lost a race ({@link isStaleWorkerStatusSequence}). It is deliberately the same
+ * name the server→worker downstream `client_event` frames already carry: the same concept (a
+ * monotonic per-session order), the opposite direction. Also OPTIONAL — an older worker build
+ * omits it, and the server then falls back to last-write-wins rather than refuse what it
+ * cannot prove is stale.
+ *
+ * **The emitter contract** — what a worker MUST guarantee for the stamp to mean anything. It
+ * is a protocol obligation, not something the server can enforce, so it is pinned here:
+ *
+ *   1. **One value per STATUS REPORT, not per frame or per request.** A report is one logical
+ *      "the session is now X". The counter increments per report and never decreases within an
+ *      epoch.
+ *   2. **Both legs of ONE report carry the SAME value.** A single `requires_action` is reported
+ *      TWICE — the §5 frame carries the human `detail`, the §4 `PUT …/worker` body carries the
+ *      same status BARE — and the two race in the server's body reader. Stamping them equally is
+ *      what makes that race harmless: {@link isStaleWorkerStatusSequence} applies an EQUAL
+ *      sequence, so whichever loses still lands and the detail survives (via
+ *      `capturedRequiresActionDetail`). Were the legs stamped CONSECUTIVELY, a §4 that won the
+ *      race would refuse its own §5 twin and the detail would be lost for the whole time the
+ *      session sits blocked — there is no next §5 frame until the next transition.
+ *   3. **Restart the counter only by re-registering** (which mints a fresh `worker_epoch`, the
+ *      scope the server's high-water mark is bound to). Resetting it mid-epoch strands every
+ *      subsequent report below the mark, which the server cannot distinguish from a flood of
+ *      stale frames.
+ *
+ * A worker that cannot honor these MUST omit the field: the un-stamped fallback is well-defined
+ * (last-write-wins), whereas a stamp that lies is worse than no stamp at all.
  */
 export interface WorkerStatusEvent extends ControlEvent {
   subtype: "worker_status";
-  payload: { status: WorkerStatus; detail?: string };
+  payload: { status: WorkerStatus; detail?: string; sequence_num?: number };
 }
 
 /**
@@ -1124,6 +1153,65 @@ export function isWorkerStatusEvent(frame: ControlFrame): frame is WorkerStatusE
  */
 export function workerStatusFromFrame(frame: ControlFrame): WorkerStatus | null {
   return isWorkerStatusEvent(frame) ? frame.payload.status : null;
+}
+
+/**
+ * Narrow an arbitrary wire value to a `worker_status` ORDERING sequence (#201), or `null` when
+ * it carries none. Shared by both legs, which read it from different places: the §5 frame's
+ * `payload.sequence_num` ({@link workerStatusSequenceFromFrame}) and the §4 `PUT …/worker`
+ * body's top-level `sequence_num` — the field sits beside the status it orders on each.
+ *
+ * A valid sequence is a non-negative safe integer. ABSENT (`undefined` / `null`) and MALFORMED
+ * (a string, a float, `NaN`, negative, beyond `Number.MAX_SAFE_INTEGER`) collapse to the SAME
+ * `null`, because they are the same fact to the server: this frame carries no usable ordering
+ * signal, so the documented fallback — last-write-wins — applies. Collapsing malformed to
+ * "absent" rather than refusing is deliberate: a refusal must rest on positive proof that a
+ * frame is stale, and garbage is not proof. It also keeps a worker bug from wedging a session,
+ * which is the failure this whole guard exists to avoid re-introducing. Reading it back as
+ * `unknown` (not `number | undefined`) is the same defensive stance {@link isWorkerStatusEvent}
+ * takes: the static type describes the contract, a decoded line can be anything.
+ */
+export function asWorkerStatusSequence(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * The ORDERING sequence a `worker_status` frame carries (#201), or `null` when it is not a
+ * well-formed `worker_status` event or carries no usable sequence. The §5 counterpart of
+ * {@link workerStatusFromFrame} — same fail-closed guard, the other half of the frame.
+ */
+export function workerStatusSequenceFromFrame(frame: ControlFrame): number | null {
+  return isWorkerStatusEvent(frame) ? asWorkerStatusSequence(frame.payload.sequence_num) : null;
+}
+
+/**
+ * Whether an incoming `worker_status` frame is STALE and must be refused (#201): `true` only
+ * when it carries a sequence STRICTLY BELOW the highest already applied to that session. The
+ * pure ordering decision both legs share — the state it reads (the high-water mark, which is
+ * per-session and scoped to the current `worker_epoch`) and the refusal's log line live in
+ * `@ccctl/server`, so this stays a total function of its two arguments.
+ *
+ * **It reads no clock — by design, and that is the whole point.** #39's clock-derived guard was
+ * removed because one backward wall-clock step made it refuse EVERY frame until real time caught
+ * up, silently swallowing the `requires_action` the notification wave exists to deliver (the note
+ * above `capturedRequiresActionDetail` carries the post-mortem). Two worker-supplied integers
+ * cannot do that, so "no clock-derived refusal can wedge a session" holds STRUCTURALLY here
+ * rather than by care.
+ *
+ * Two cases deliberately APPLY rather than refuse, because each is the safe side of an
+ * asymmetry — an out-of-order status self-corrects on the next frame, a wedged session does not:
+ *
+ *   - **Absent** (either side `null`) — an older worker build stamps nothing, and the first
+ *     frame of an epoch has no predecessor. Refusal needs proof of staleness; absence is not
+ *     proof, so the frame lands (last-write-wins, exactly as before #201).
+ *   - **Equal** — a duplicate re-send is not OLDER, and refusing `==` would wedge any worker that
+ *     stamps a constant. This case is also load-bearing rather than merely safe: by the emitter
+ *     contract ({@link WorkerStatusEvent}) the §4 and §5 legs of ONE status report share a
+ *     sequence, so applying an equal one is precisely what lets the rich §5 frame's `detail`
+ *     survive losing the body-reader race against its own bare §4 twin.
+ */
+export function isStaleWorkerStatusSequence(sequence: number | null, highestApplied: number | null): boolean {
+  return sequence !== null && highestApplied !== null && sequence < highestApplied;
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,26 +1430,39 @@ export function sessionLiveness(
   return isSessionStale(session, now, staleAfterMs) ? "stale" : "live";
 }
 
-// --- on AC4's "monotonic by the frame's timestamp" (#39) ---
+// --- on AC4's "monotonic by the frame's timestamp" (#39, resolved by #201) ---
 //
 // The classification is per-session (every transition below is pure, and the server keys one
-// map cell per session), but it is ordered by the server's RECEIPT of a frame, not by the
-// frame's own age — because the wire carries no frame age to order by. A `worker_status`
-// rides either the §4 `PUT …/worker` body (`{ worker_status, worker_epoch,
-// external_metadata }`) or a §5 {@link ControlEvent} (`{ type, subtype, payload }`); neither
-// carries a timestamp or a sequence number, and `worker_epoch` orders REGISTRATIONS, not the
-// frames within one.
+// map cell per session) AND ordered — but by a sequence, not a timestamp.
 //
-// A guard comparing a server-read clock against `lastActivityAt` was tried and removed: reads
-// taken at apply time on a single-threaded event loop are non-decreasing by construction, so
-// it could never fire in production — while `Date.now()` is wall-clock, so one backward NTP
-// step made it refuse EVERY frame until real time caught up, silently swallowing the
-// `requires_action` that the notification wave exists to deliver.
+// #39 could not order at all: a `worker_status` rides either the §4 `PUT …/worker` body
+// (`{ worker_status, worker_epoch, external_metadata }`) or a §5 {@link ControlEvent}
+// (`{ type, subtype, payload }`), and neither carried any frame age; `worker_epoch` orders
+// REGISTRATIONS, not the frames within one. So the server had nothing to order by and
+// applications were last-write-wins in receipt order — the only order it could observe.
 //
-// So: last-write-wins in receipt order, which is the only order the server can observe.
-// Detecting a genuinely stale frame needs the emitter to stamp one (a sequence number or a
-// timestamp) — a protocol change, since the emitter is the patched worker. Tracked in #201
-// rather than approximated here.
+// #201 gives the emitter a field to stamp: an OPTIONAL `sequence_num` on the `worker_status`
+// payload ({@link WorkerStatusEvent}, whose doc pins the emitter contract) and beside the §4
+// body's bare status. It counts one value per status REPORT — both legs reporting one transition
+// share it — so ONE per-session counter spans both legs. The server refuses any frame whose
+// sequence is strictly below the highest it has applied ({@link isStaleWorkerStatusSequence});
+// the high-water mark it compares against is held per session on the server's worker-channel
+// record and scoped to the current `worker_epoch` — a re-registered worker is a NEW generation
+// whose counter restarts, so carrying a mark across epochs would refuse its every frame.
+//
+// The signal is a sequence and NOT a timestamp — which is why AC4's literal wording is met in
+// spirit, not letter — because #39 already paid for the alternative: a guard comparing a
+// server-read clock against `lastActivityAt` was tried and removed, as reads taken at apply
+// time on a single-threaded event loop are non-decreasing by construction (so it could never
+// fire in production), while `Date.now()` is wall-clock, so one backward NTP step made it
+// refuse EVERY frame until real time caught up, silently swallowing the `requires_action` that
+// the notification wave exists to deliver. A worker-supplied TIMESTAMP would merely relocate
+// that hazard onto the worker's clock, where the server cannot even diagnose it. A counter has
+// no clock in it at all.
+//
+// A frame carrying NO sequence still applies (an older worker build stamps none, and refusal
+// demands proof of staleness rather than its absence), and a refused frame is logged, never
+// silently dropped. See `packages/server/README.md` and `worker-channel.ts`'s ordering guard.
 
 /**
  * The `requires_action` detail already captured for this session, when the incoming frame
@@ -1405,9 +1506,13 @@ export function applyWorkerStatusFrame(session: Session, frame: ControlFrame, no
  *
  * Returns a NEW session with the derived {@link SessionActivity} and `lastActivityAt`
  * advanced to `now`. An absent `detail` on a `requires_action` re-affirmation keeps the one
- * already captured ({@link capturedRequiresActionDetail}). Applications are last-write-wins in
- * receipt order — see the note above on why frame-age ordering is not enforced here. Pure:
- * never mutates the input, so one session's status cannot touch another's.
+ * already captured ({@link capturedRequiresActionDetail}). Pure: never mutates the input, so
+ * one session's status cannot touch another's.
+ *
+ * Every frame reaching here APPLIES: ordering is decided upstream, at the server's ingress,
+ * where the per-epoch high-water mark lives ({@link isStaleWorkerStatusSequence}; see the note
+ * above). A frame that carries no sequence — or one no lower than the highest applied — is not
+ * refusable, so among the frames that do arrive here the last one still wins.
  */
 export function applyWorkerStatus(
   session: Session,
@@ -1593,15 +1698,21 @@ export interface RegistrationLogEvent {
 /**
  * A worker-status DETECTION event (#61): the trail that answers "is this session stalled?" — an
  * `activity` transition (running / requires_action / idle), a `worker-registered` generation attach,
- * or a `stale` heartbeat lapse. `activity` is the session's {@link SessionActivity} kind the event
- * reflects; `detail` carries the transition ("running→idle"), the worker epoch, or the stale gap.
+ * a `stale` heartbeat lapse, or a `stale-frame` ordering refusal. `activity` is the session's
+ * {@link SessionActivity} kind the event reflects; `detail` carries the transition ("running→idle"),
+ * the worker epoch, the stale gap, or the refused and applied sequences.
  */
 export interface DetectionLogEvent {
   readonly category: "detection";
   readonly level: LogLevel;
-  /** `activity` (a `worker_status` transition), `worker-registered` (a worker generation attached), `stale` (heartbeat lapsed). */
-  readonly event: "activity" | "worker-registered" | "stale";
+  /**
+   * `activity` (a `worker_status` transition), `worker-registered` (a worker generation attached),
+   * `stale` (heartbeat lapsed), `stale-frame` (an out-of-order `worker_status` refused, #201 — the
+   * ordering guard's REQUIRED trail: a refused frame is observable, never a silent drop).
+   */
+  readonly event: "activity" | "worker-registered" | "stale" | "stale-frame";
   readonly sessionId: string;
+  /** For `stale-frame`, the activity the session KEEPS — the refusal is precisely a non-transition. */
   readonly activity: SessionActivity["kind"];
   readonly detail: string;
 }

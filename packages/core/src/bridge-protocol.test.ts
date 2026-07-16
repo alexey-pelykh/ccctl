@@ -13,6 +13,8 @@ import {
   ENVIRONMENTS_BRIDGE_PATH,
   isPermissionMode,
   isWorkerStatus,
+  asWorkerStatusSequence,
+  isStaleWorkerStatusSequence,
   isWorkerStatusEvent,
   isWorkItemType,
   loggableEnvironmentRegisterRequest,
@@ -32,6 +34,7 @@ import {
   workerRegisterPath,
   workItemFromValue,
   workerStatusFromFrame,
+  workerStatusSequenceFromFrame,
   type ControlEvent,
   type ControlFrame,
   type EnvironmentRegisterRequest,
@@ -357,5 +360,62 @@ describe("worker_status frames + PUT status gate (§4/§5 per-session status)", 
     const idle = applyWorkerStatus(running, "idle", undefined, 3_000);
     expect(idle.activity).toEqual({ kind: "idle" });
     expect(idle.lastActivityAt).toBe(3_000);
+  });
+});
+
+// #201: the frame's ORDERING signal — the half of the `worker_status` contract #39 had no wire field
+// for. The pure derivations live here; the high-water mark they compare against is server state.
+describe("worker_status ordering signal (#201)", () => {
+  const unstamped: WorkerStatusEvent = {
+    type: "control_event",
+    subtype: "worker_status",
+    payload: { status: "idle" },
+  };
+
+  it("narrows a valid `sequence_num` and collapses absent AND malformed alike to null", () => {
+    // A valid sequence is a non-negative safe integer. 0 is valid — a counter may start there.
+    expect(asWorkerStatusSequence(0)).toBe(0);
+    expect(asWorkerStatusSequence(7)).toBe(7);
+    expect(asWorkerStatusSequence(Number.MAX_SAFE_INTEGER)).toBe(Number.MAX_SAFE_INTEGER);
+
+    // Absent and malformed collapse to the SAME null: each is "this frame carries no usable order",
+    // and the documented fallback for that is last-write-wins — never a refusal, since garbage is
+    // not proof of staleness. Left un-narrowed, a string would poison the comparison permanently.
+    for (const bad of [undefined, null, "3", 1.5, -1, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, {}, [3]]) {
+      expect(asWorkerStatusSequence(bad)).toBeNull();
+    }
+  });
+
+  it("reads the sequence off a §5 frame, and null from anything that is not a well-formed status frame", () => {
+    expect(workerStatusSequenceFromFrame({ ...unstamped, payload: { status: "idle", sequence_num: 4 } })).toBe(4);
+    // A well-formed status frame that simply carries no stamp (an older worker build).
+    expect(workerStatusSequenceFromFrame(unstamped)).toBeNull();
+    // Not a status frame at all — a transcript line's "sequence_num" is none of the model's business.
+    expect(
+      workerStatusSequenceFromFrame({ type: "control_event", subtype: "message", payload: { sequence_num: 4 } }),
+    ).toBeNull();
+    // Fails closed with the SAME guard as `workerStatusFromFrame`: an unknown status is not a frame.
+    expect(
+      workerStatusSequenceFromFrame({ type: "control_event", subtype: "worker_status", payload: { status: "paused" } }),
+    ).toBeNull();
+  });
+
+  it("refuses ONLY a strictly-lower sequence — the guard reads no clock, so it cannot wedge", () => {
+    // The one refusing case: this frame is provably behind one already applied.
+    expect(isStaleWorkerStatusSequence(1, 2)).toBe(true);
+    expect(isStaleWorkerStatusSequence(0, Number.MAX_SAFE_INTEGER)).toBe(true);
+
+    // Newer applies, and EQUAL applies: a duplicate re-send is not `older`, and refusing `==` would
+    // wedge any worker that stamps a constant. `==` is also load-bearing — the §4 and §5 legs of ONE
+    // status report share a sequence, so it is what lets the rich §5 frame's detail survive losing
+    // the body-reader race to its bare §4 twin.
+    expect(isStaleWorkerStatusSequence(3, 2)).toBe(false);
+    expect(isStaleWorkerStatusSequence(2, 2)).toBe(false);
+
+    // Absent on EITHER side applies: an un-stamped frame (older build), or the first frame of an
+    // epoch, which has no predecessor to be behind. Refusal demands proof; absence is not proof.
+    expect(isStaleWorkerStatusSequence(null, 5)).toBe(false);
+    expect(isStaleWorkerStatusSequence(1, null)).toBe(false);
+    expect(isStaleWorkerStatusSequence(null, null)).toBe(false);
   });
 });

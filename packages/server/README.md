@@ -38,12 +38,44 @@ enters the model — flattened to one line, control characters stripped, length 
 and every consumer (`ccctl attach`'s session list, `GET /api/sessions`, the persisted
 snapshot) inherits that rather than re-deriving it.
 
-Classification is **per-session**, and applications are **last-write-wins in the server's
-receipt order**. It is NOT ordered by frame age: neither status leg carries a timestamp or
-a sequence number (`worker_epoch` orders registrations, not the frames within one), so the
-server has no frame age to order by. Detecting a genuinely stale frame needs the emitter —
-the patched worker — to stamp one, which is a protocol change, tracked in
-[#201](https://github.com/alexey-pelykh/ccctl/issues/201).
+Classification is **per-session** and **ordered by a worker-stamped sequence**
+([#201](https://github.com/alexey-pelykh/ccctl/issues/201)). Both status legs carry an OPTIONAL
+`sequence_num`: the worker's per-session counter, one value per status REPORT — not per frame and
+not per request — so ONE counter spans both legs and a frame's position is comparable whichever leg
+it took. The server refuses any frame stamped strictly below the highest it has already applied, so
+a frame that lost a race can no longer clobber a newer classification. A refused frame moves
+nothing, is dropped from the §5 relay as well, is answered `200` (the worker did nothing wrong —
+and a 4xx would kill it over a benign reorder), and is **logged** as a `stale-frame` detection
+event: observable, never a silent drop. It is dropped from the relay rather than forwarded because
+the browser renders a `worker_status` as the session's **live current turn**, never as transcript
+history — so relaying one the model just ruled stale would publish a claim the server knows is
+false, and leave it on screen until the next transition. Dropping it keeps a single adjudicator:
+the UI cannot reach a verdict the server has rejected, and needs no mirrored high-water mark of its
+own.
+
+The **emitter contract** — what a worker must guarantee, pinned in `@ccctl/core`'s
+`WorkerStatusEvent` — is that the counter increments once per status report, that **both legs of
+one report carry the same value**, and that it restarts only by re-registering. The equal-value rule
+is load-bearing, not a nicety: one `requires_action` is reported twice (§5 with the human `detail`,
+§4 bare), the two race in the server's body reader, and an equal sequence is what lets the loser
+still land — so the detail survives. Stamped consecutively instead, a §4 that won the race would
+refuse its own §5 twin and the detail would be lost for as long as the session sits blocked. A
+worker that cannot honor the contract must omit the field: the un-stamped fallback is well-defined,
+whereas a stamp that lies is worse than no stamp at all.
+
+The signal is a **sequence, not a timestamp**, and the guard reads **no clock** — deliberately. A
+clock-derived guard was tried in #39 and removed: `Date.now()` is wall-clock, so a single backward
+NTP step (drifted RTC correction, VM snapshot restore, suspend/resume) made it refuse _every_ frame
+until real time caught up, silently swallowing the `requires_action` this whole notification wave
+exists to deliver. A worker-supplied _timestamp_ would merely relocate that hazard onto the
+worker's clock, where the server cannot even diagnose it; a counter has no clock in it at all. The
+high-water mark is per-session, held in memory, and scoped to the current `worker_epoch` — a
+re-registered worker is a new generation whose counter restarts, so the mark resets with it rather
+than refusing its every frame.
+
+A frame carrying **no** `sequence_num` still applies (last-write-wins, as before #201): an older
+worker build stamps none, and a refusal must rest on positive proof of staleness rather than its
+absence. A malformed stamp is treated the same way, for the same reason.
 
 **Two-credential boundary (hard).** The account Bearer rides §1/§2 ONLY — received
 and treated as a strict non-persisting pass-through: required, but never stored on
