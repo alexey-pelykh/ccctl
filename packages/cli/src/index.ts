@@ -61,9 +61,11 @@ import {
 import {
   createJsonLineLogger,
   DEFAULT_HOST,
+  HEAP_SNAPSHOT_SIGNAL,
   mintDeviceToken,
   requireLocalServerAuth,
   resolveBindHost,
+  resolveHeapSnapshotDir,
   type SessionLaunchOptions,
   type SessionStopOptions,
   type StopAcceptedWire,
@@ -315,15 +317,29 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       // to diagnose a stalled or leaked long-running daemon. Absent this the server falls back to the
       // no-op sink; the daemon is the composition root that turns the trail on. The `LogEvent` shape is
       // JSON-safe by construction, so no credential (account Bearer, session-ingress token) can ride it.
+      // One structured-log sink for the whole daemon: the server's diagnostic trail (#61) AND the
+      // on-demand heap-snapshot events (#62) ride the same JSON-lines stdout, so both are `… | jq`-able.
+      const logger = createJsonLineLogger();
       const server = await deps.startServer({
         host,
         port,
         launcher: deps.launcher,
-        logger: createJsonLineLogger(),
+        logger,
       });
+      // Arm the on-demand heap-snapshot trigger (#62): SIGUSR2 dumps a LIVE snapshot without a restart,
+      // reachable only by a same-uid local process (OS-enforced local auth — unreachable off-box). The
+      // disposer is intentionally not held: the handler lives for the daemon's lifetime and process exit
+      // tears it down.
+      deps.installHeapSnapshotHandler({ logger });
       // Report the address actually bound (`server.address` carries the resolved port,
       // which matters when `--port 0` selects an ephemeral one).
       console.log(`ccctl: serving on ${serverUrl(server.address.host, server.address.port)}`);
+      // One-time operator hint (plain text, printed before the JSON trail flows — like the line above):
+      // how to take a heap snapshot and where it lands. The snapshot file is written owner-only 0600
+      // because it holds process memory.
+      console.log(
+        `ccctl: heap snapshot on ${HEAP_SNAPSHOT_SIGNAL} (\`kill -s ${HEAP_SNAPSHOT_SIGNAL} ${process.pid}\`) → ${resolveHeapSnapshotDir()}`,
+      );
 
       if (kind !== undefined) {
         // Expose the bound endpoint through the chosen tunnel. If it cannot be established, tear

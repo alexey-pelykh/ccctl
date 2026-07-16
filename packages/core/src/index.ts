@@ -1524,7 +1524,8 @@ export type BridgeCredentialJsonProofs = [
 // either needs a structured TRAIL of what each
 // session did — born, advanced, went stale, closed — alongside the bridge
 // registrations, the worker-status transitions, the needs-you / idle notifications, and
-// the refusals around them. That is the five surfaces this section names.
+// the refusals around them. Those are the five AUTOMATIC surfaces this section names; #62
+// adds a sixth — the on-demand DIAGNOSTIC surface (a live, operator-triggered heap snapshot).
 //
 // This defines the CONTRACT for that trail and nothing else: the JSON-safe loggable
 // event SHAPES ({@link LogEvent}) plus the {@link Logger} sink interface and a no-op. A
@@ -1548,12 +1549,14 @@ export type BridgeCredentialJsonProofs = [
 export type LogLevel = "info" | "warn" | "error";
 
 /**
- * The five diagnostic surfaces a structured {@link LogEvent} belongs to (#61): a session's
- * LIFECYCLE, the bridge REGISTRATION legs (§1/§2/§3), worker-status DETECTION transitions,
- * NOTIFICATION dispatch (needs-you / idle), and ERROR refusals. The `category` discriminates
- * the union so a sink can route or filter by surface.
+ * The six diagnostic surfaces a structured {@link LogEvent} belongs to: the five AUTOMATIC ones
+ * the lifecycle turns on (#61) — a session's LIFECYCLE, the bridge REGISTRATION legs (§1/§2/§3),
+ * worker-status DETECTION transitions, NOTIFICATION dispatch (needs-you / idle), and ERROR
+ * refusals — plus the on-demand DIAGNOSTIC surface (#62), an operator-triggered runtime action
+ * (a live heap snapshot). The `category` discriminates the union so a sink can route or filter by
+ * surface.
  */
-export type LogEventCategory = "session" | "registration" | "detection" | "notification" | "error";
+export type LogEventCategory = "session" | "registration" | "detection" | "notification" | "error" | "diagnostic";
 
 /**
  * A session LIFECYCLE event (#61): the trail that answers "was this session leaked?" — a `created`
@@ -1635,13 +1638,39 @@ export interface ErrorLogEvent {
 }
 
 /**
- * A single structured log event — one line in the daemon's diagnostic trail (#61). The discriminated
- * union of the five {@link LogEventCategory} surfaces; every variant is a {@link JsonObject} by
+ * A DIAGNOSTIC event (#62): an operator-triggered runtime diagnostic action the daemon performed
+ * on demand — the first being an on-demand HEAP SNAPSHOT, taken live (no restart) when the daemon
+ * is signalled, for chasing a long-run memory-growth vector. Unlike the five AUTOMATIC surfaces
+ * above, a diagnostic event fires ONLY when an operator explicitly asks: `heap-snapshot` on a
+ * written snapshot, `heap-snapshot-failed` on a failed attempt. `sessionId` is always `null` — a
+ * heap snapshot is daemon-wide, concerning no one session. `detail` carries the written snapshot's
+ * PATH on success and the one-line failure reason on failure — never a credential. (The snapshot
+ * FILE holds a copy of process memory, so it is written owner-only `0600`; this log line names only
+ * its path, so — like every other variant — it carries no {@link AccountBearer} or
+ * {@link SessionIngressToken}.)
+ */
+export interface DiagnosticLogEvent {
+  readonly category: "diagnostic";
+  readonly level: LogLevel;
+  /** `heap-snapshot` (a live heap snapshot was written), `heap-snapshot-failed` (the attempt failed). */
+  readonly event: "heap-snapshot" | "heap-snapshot-failed";
+  readonly sessionId: null;
+  readonly detail: string;
+}
+
+/**
+ * A single structured log event — one line in the daemon's diagnostic trail (#61, #62). The
+ * discriminated union of the six {@link LogEventCategory} surfaces; every variant is a {@link JsonObject} by
  * construction (proven by {@link LogEventJsonProofs}), so it serializes to one JSON log line AND —
  * since no variant carries an {@link AccountBearer} field — provably cannot leak the account credential.
  */
 export type LogEvent =
-  SessionLogEvent | RegistrationLogEvent | DetectionLogEvent | NotificationLogEvent | ErrorLogEvent;
+  | SessionLogEvent
+  | RegistrationLogEvent
+  | DetectionLogEvent
+  | NotificationLogEvent
+  | ErrorLogEvent
+  | DiagnosticLogEvent;
 
 /**
  * The structured-log sink (#61): the ONE way a {@link LogEvent} leaves the domain. An injected
@@ -1677,6 +1706,7 @@ export type LogEventJsonProofs = [
   Assert<IsJson<DetectionLogEvent>>,
   Assert<IsJson<NotificationLogEvent>>,
   Assert<IsJson<ErrorLogEvent>>,
+  Assert<IsJson<DiagnosticLogEvent>>,
   Assert<IsJson<LogEvent>>,
 ];
 

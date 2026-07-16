@@ -17,9 +17,11 @@
 
 import { spawn } from "node:child_process";
 import qrcodeTerminal from "qrcode-terminal";
+import type { Logger } from "@ccctl/core";
 import {
   createFallbackSessionLauncher,
   createTmuxSessionLauncher,
+  installHeapSnapshotSignalHandler,
   startServer,
   type CcctlServer,
   type ISessionLauncher,
@@ -59,6 +61,15 @@ export interface CliDependencies {
    * so `serve` is exercised without a real tmux or a spawned worker, the same as the seams above.
    */
   readonly launcher: ISessionLauncher;
+  /**
+   * Arm the daemon's on-demand heap-snapshot trigger (#62) — install the {@link https://ccctl |
+   * HEAP_SNAPSHOT_SIGNAL} (`SIGUSR2`) handler that dumps a live snapshot without a restart, and
+   * return a disposer. {@link installHeapSnapshotSignalHandler} in production; behind a seam so
+   * `serve` is exercised WITHOUT registering a real process-global signal handler (which would leak
+   * across the test process), the same determinism discipline as the seams above. The daemon's
+   * structured-log sink is passed through so a snapshot (or a failure) rides the daemon's #61 trail.
+   */
+  readonly installHeapSnapshotHandler: (options: { readonly logger: Logger }) => () => void;
   /**
    * Render a scannable terminal QR of `text` — the QR-pair onboarding block `serve` / `tunnel`
    * print after a tunnel is up (#74) — {@link defaultRenderQr} (a zero-dependency `qrcode-terminal`)
@@ -129,6 +140,7 @@ export const defaultDependencies: CliDependencies = {
   adapters: ADAPTERS,
   runPatcher: defaultRunPatcher,
   sessionClient: defaultSessionClient,
+  installHeapSnapshotHandler: (options) => installHeapSnapshotSignalHandler(options),
   renderQr: defaultRenderQr,
   // Compose the tmux backend (#29) behind the fallback launcher composite (#31) — the documented
   // composition-root shape — driving the production `remote-control` worker-argv builder (#157) on

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { HostEndpoint } from "@ccctl/core";
+import type { HostEndpoint, Logger } from "@ccctl/core";
 import {
   LOCAL_SERVER_AUTH_ENV,
   XDG_CONFIG_HOME_ENV,
@@ -71,6 +71,8 @@ function makeDeps(options: FakeDepsOptions = {}): {
   stop: ReturnType<typeof vi.fn>;
   launcher: ISessionLauncher;
   renderQr: ReturnType<typeof vi.fn>;
+  installHeapSnapshotHandler: ReturnType<typeof vi.fn>;
+  disposeHeapSnapshotHandler: ReturnType<typeof vi.fn>;
 } {
   // A fake bind: echo the requested host, and resolve `--port 0` to a concrete ephemeral
   // port so a test can prove `server.address` (not the requested port) is what's reported.
@@ -139,8 +141,13 @@ function makeDeps(options: FakeDepsOptions = {}): {
   // marker, so an assertion can prove both WHAT was encoded (the pairing URL passed in) and that
   // the rendered block reached the terminal — without drawing a real QR.
   const renderQr = vi.fn((text: string) => `<<QR:${text}>>`);
+  // The heap-snapshot signal-arming seam (#62): a fake that records the logger it was handed and
+  // returns a spy disposer — so a test asserts `serve` arms the trigger WITHOUT installing a real
+  // process-global SIGUSR2 handler that would leak across the test process.
+  const disposeHeapSnapshotHandler = vi.fn(() => undefined);
+  const installHeapSnapshotHandler = vi.fn((_options: { readonly logger: Logger }) => disposeHeapSnapshotHandler);
   return {
-    deps: { startServer, adapters, runPatcher, sessionClient, launcher, renderQr },
+    deps: { startServer, adapters, runPatcher, sessionClient, launcher, installHeapSnapshotHandler, renderQr },
     startServer,
     establish,
     runPatcher,
@@ -151,6 +158,8 @@ function makeDeps(options: FakeDepsOptions = {}): {
     stop,
     launcher,
     renderQr,
+    installHeapSnapshotHandler,
+    disposeHeapSnapshotHandler,
   };
 }
 
@@ -297,6 +306,22 @@ describe("ccctl serve — starts the daemon (AC2)", () => {
     await buildProgram(deps).parseAsync(["serve"], { from: "user" });
     expect(startServer).toHaveBeenCalledTimes(1);
     expect(startServer.mock.calls[0][0]).toHaveProperty("launcher", launcher);
+  });
+
+  it("arms the on-demand heap-snapshot trigger (#62) with the SAME sink it gives the daemon, and prints how to trigger it", async () => {
+    const { deps, startServer, installHeapSnapshotHandler, disposeHeapSnapshotHandler } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve"], { from: "user" });
+    // Armed exactly once, and NOT torn down at serve-return — the handler lives for the daemon's lifetime.
+    expect(installHeapSnapshotHandler).toHaveBeenCalledTimes(1);
+    expect(disposeHeapSnapshotHandler).not.toHaveBeenCalled();
+    // One shared structured-log sink: the daemon trail (#61) AND heap-snapshot events (#62) ride the
+    // same object, so both land on the one JSON stdout.
+    const serverLogger = (startServer.mock.calls[0][0] as { logger: unknown }).logger;
+    const handlerLogger = (installHeapSnapshotHandler.mock.calls[0][0] as { logger: unknown }).logger;
+    expect(handlerLogger).toBe(serverLogger);
+    // The one-time operator hint names the signal and how to send it.
+    expect(loggedText()).toContain("SIGUSR2");
+    expect(loggedText()).toContain("heap snapshot");
   });
 });
 
