@@ -7,6 +7,7 @@ import {
   deviceTokenHash,
   pairedDevice,
   renameDevice,
+  revokeAllDevices,
   revokeDevice,
   touchDevice,
   type DeviceStoreSnapshot,
@@ -155,6 +156,52 @@ describe("revokeDevice (per-device revoke, #81 / W6-19)", () => {
     expect(revoked.version).toBe(DEVICE_STORE_SNAPSHOT_VERSION);
     // Still a valid snapshot that round-trips through JSON — listing it is an empty registry, not `null`.
     expect(JSON.parse(JSON.stringify(revoked))).toEqual(revoked);
+  });
+});
+
+describe("revokeAllDevices (panic kill / whole-registry revoke, #88 / W6-20)", () => {
+  const phone = pairedDevice({ id: "dev-1", name: "Alex's phone", tokenHash: HASH, now: T0 });
+  const tablet = pairedDevice({ id: "dev-2", name: "tablet", tokenHash: deviceTokenHash("beef"), now: T0 + 10 });
+  const laptop = pairedDevice({ id: "dev-3", name: "laptop", tokenHash: deviceTokenHash("cafe"), now: T0 + 20 });
+  const snapshot: DeviceStoreSnapshot = {
+    version: DEVICE_STORE_SNAPSHOT_VERSION,
+    devices: [phone, tablet, laptop],
+  };
+
+  it("empties the whole registry in one action — every device, and every token hash, is gone (AC1)", () => {
+    const revoked = revokeAllDevices(snapshot);
+    expect(revoked.devices).toEqual([]);
+    // No device's at-rest token projection survives, so a hash-and-compare verifier (present or
+    // future) finds NO match for any previously-paired device and refuses every existing token.
+    expect(revoked.devices.some((device) => device.tokenHash === HASH)).toBe(false);
+  });
+
+  it("is clearly distinct from per-device revoke — it drops ALL records, not one (AC4)", () => {
+    // Per-device revoke leaves the other two; revoke-all leaves none. Same starting registry.
+    expect(revokeDevice(snapshot, "dev-1").devices.map((device) => device.id)).toEqual(["dev-2", "dev-3"]);
+    expect(revokeAllDevices(snapshot).devices).toEqual([]);
+  });
+
+  it("preserves the snapshot version — the emptied registry is still a valid snapshot", () => {
+    const revoked = revokeAllDevices(snapshot);
+    expect(revoked.version).toBe(DEVICE_STORE_SNAPSHOT_VERSION);
+    // Round-trips through JSON: an explicitly-empty registry, never `null`.
+    expect(JSON.parse(JSON.stringify(revoked))).toEqual(revoked);
+  });
+
+  it("is pure — it never mutates the input snapshot or its devices array", () => {
+    revokeAllDevices(snapshot);
+    expect(snapshot.devices.map((device) => device.id)).toEqual(["dev-1", "dev-2", "dev-3"]);
+    // A fresh array is returned, not the input's array cleared in place.
+    expect(revokeAllDevices(snapshot).devices).not.toBe(snapshot.devices);
+  });
+
+  it("is idempotent over an already-empty registry — a double panic-kill settles to the same end state", () => {
+    const empty: DeviceStoreSnapshot = { version: DEVICE_STORE_SNAPSHOT_VERSION, devices: [] };
+    const revoked = revokeAllDevices(empty);
+    expect(revoked).toEqual(empty);
+    expect(revoked).not.toBe(empty);
+    expect(revokeAllDevices(revokeAllDevices(snapshot)).devices).toEqual([]);
   });
 });
 

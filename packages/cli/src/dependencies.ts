@@ -17,9 +17,10 @@
 
 import { spawn } from "node:child_process";
 import qrcodeTerminal from "qrcode-terminal";
-import type { Logger } from "@ccctl/core";
+import type { IDeviceStore, Logger } from "@ccctl/core";
 import {
   createFallbackSessionLauncher,
+  createFileDeviceStore,
   createTmuxSessionLauncher,
   installHeapSnapshotSignalHandler,
   installInspectorDiagnosticsSignalHandler,
@@ -53,6 +54,14 @@ export interface CliDependencies {
    * with a fake (no real socket, no running daemon), the same as the three seams above.
    */
   readonly sessionClient: SessionClient;
+  /**
+   * The paired-device store the `revoke-all` verb drives (#88) — the server-side registry a
+   * panic kill wipes to force every device to re-pair. {@link createFileDeviceStore} (the `0600`
+   * XDG-state snapshot) in production; behind a seam so the verb is exercised with an in-memory
+   * fake (no real state file touched), the same determinism discipline as the seams above. The
+   * `IDeviceStore` port, not a concrete backend, so the verb depends on the contract.
+   */
+  readonly deviceStore: IDeviceStore;
   /**
    * The session launcher the `serve` verb injects into the daemon (#157 wires production;
    * #31 shaped the port) — the {@link https://ccctl | ISessionLauncher} a `POST /api/sessions`
@@ -152,6 +161,10 @@ export const defaultDependencies: CliDependencies = {
   adapters: ADAPTERS,
   runPatcher: defaultRunPatcher,
   sessionClient: defaultSessionClient,
+  // The real paired-device store (#88): the `0600` single-file JSON snapshot at the XDG state
+  // path, the same backend the daemon selects. `revoke-all` loads it, empties it, and saves — a
+  // local state-file op that needs no running daemon, which is what makes it a robust panic kill.
+  deviceStore: createFileDeviceStore(),
   installHeapSnapshotHandler: (options) => installHeapSnapshotSignalHandler(options),
   installInspectorDiagnosticsHandler: (options) => installInspectorDiagnosticsSignalHandler(options),
   renderQr: defaultRenderQr,

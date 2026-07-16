@@ -2034,6 +2034,39 @@ export function revokeDevice(snapshot: DeviceStoreSnapshot, id: string): DeviceS
 }
 
 /**
+ * Revoke EVERY paired device at once (#88 / W6-20) — the panic kill — returning a NEW
+ * {@link DeviceStoreSnapshot} with an empty `devices` registry and the snapshot `version`
+ * preserved. This is the whole-registry analog of {@link revokeDevice}: where per-device revoke
+ * drops ONE record, this drops them ALL in a single action, so it is CLEARLY DISTINCT from
+ * per-device revoke (a whole-registry reset, not a targeted removal — AC4).
+ *
+ * Emptying the registry drops every {@link DeviceTokenHash} — the token's ONLY at-rest
+ * projection (a {@link PairedDevice} persists the hash, never the raw {@link DeviceToken}) — so a
+ * hash-and-compare verifier (the credentialed-wave ingress guard that hashes a presented token
+ * ({@link https://ccctl | @ccctl/server}'s `hashDeviceToken`) and looks it up here) finds NO
+ * match for ANY previously-paired device and refuses every existing token on its next use. There
+ * is no per-device signing secret in this design — a device token is a high-entropy CSPRNG secret
+ * stored as a one-way hash, not an HMAC-signed value — so "invalidate every token in one action"
+ * (AC1) is achieved by dropping every stored hash, not by rotating a secret: the same end state
+ * the issue's "rotate the signing secret" framing describes. Every device must then re-pair.
+ *
+ * Adapter-agnostic by construction (AC3): it transforms the device registry snapshot and names no
+ * tunnel adapter, so a revoke-all works identically whatever adapter (or none) is in use — the
+ * right shape for a panic control.
+ *
+ * Pure — never mutates the input snapshot or its records (`devices: []` is a fresh array; the
+ * input's array and records are untouched), the same non-mutating discipline {@link revokeDevice}
+ * keeps. Version-preserving. Idempotent: revoking an already-empty registry returns an equal,
+ * freshly built snapshot rather than throwing — a double panic-kill settles to the same end state
+ * as one. A revoke-all is persisted the same way any snapshot change is —
+ * {@link IDeviceStore.save} of the returned snapshot — so it needs no new store primitive
+ * ({@link https://ccctl | @ccctl/server}'s `revokeAllPairedDevices` wraps that load/save).
+ */
+export function revokeAllDevices(snapshot: DeviceStoreSnapshot): DeviceStoreSnapshot {
+  return { ...snapshot, devices: [] };
+}
+
+/**
  * The persistence seam for the paired-device registry: load the last
  * {@link DeviceStoreSnapshot} on start, save it on change. Runtime-agnostic by design — the
  * interface names no I/O primitive, so a backend is free to be a single-file JSON snapshot

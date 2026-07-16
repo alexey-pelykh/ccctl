@@ -408,6 +408,12 @@ export {
   resolveDeviceStorePath,
 } from "./device-store-file.js";
 
+// The server-side panic kill (#88): revoke EVERY paired device at once over an IDeviceStore and
+// force re-pairing. Ships runtime (an async function), so a value export. The `ccctl revoke-all`
+// verb drives it against the file device store above; a future credentialed-wave daemon route
+// reuses the same capability. Defined and unit-tested in device-revoke-all.ts.
+export { revokeAllPairedDevices } from "./device-revoke-all.js";
+
 /** Configuration for a ccctl server instance. */
 export interface ServerConfig {
   /** Loopback port the local HTTP server binds to. `0` selects an ephemeral port. */

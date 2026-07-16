@@ -55,12 +55,28 @@ registers; if the worker never does, the daemon evicts it rather than leaving a 
 behind. A launch that cannot start at all fails with a typed reason — a directory that does not
 exist, a missing terminal backend — so the message names what to fix.
 
+## Panic control
+
+One verb revokes **every** paired device at once — the panic kill:
+
+- **`ccctl revoke-all`** — revoke all paired devices in one action and force re-pairing. It empties
+  the server-side paired-device registry (the `0600` device-store snapshot from
+  [`@ccctl/server`](../server)), which drops every device's at-rest token hash — the token's only
+  stored projection — so every existing device token is refused on next use and every device must
+  re-pair (scan a fresh QR from `ccctl serve --tunnel` / `ccctl tunnel`). It reports how many devices
+  were revoked, or that nothing was paired.
+
+    Deliberately **adapter-agnostic and daemon-independent**: it is a direct device-store operation,
+    touching no tunnel adapter and needing no running daemon or network round-trip — so it works even
+    when the daemon or its tunnel is down, which is exactly when a panic control is reached. This is
+    the whole-registry counterpart to per-device revoke: `revoke-all` wipes them all, not one.
+
 ## Layout
 
 Command parsing uses [commander](https://github.com/tj/commander.js); `src/cli.ts` is the
 thin executable entry (shebang + argv parse), `src/index.ts` builds the command tree,
-`src/dependencies.ts` wires the real daemon / tunnel / patcher / session-client / launcher
-seams (injectable so the verbs are unit-testable without binding a socket or spawning a
+`src/dependencies.ts` wires the real daemon / tunnel / patcher / session-client / launcher /
+device-store seams (injectable so the verbs are unit-testable without binding a socket or spawning a
 process), `src/worker-command.ts` builds the patched worker's `remote-control` argv and
 binds the patched-binary path (`CCCTL_CLAUDE_BIN`), and `src/session-client.ts` is the real
 `fetch`-based `/api/sessions` client the launch/attach verbs drive. Depends on [`@ccctl/core`](../core),
