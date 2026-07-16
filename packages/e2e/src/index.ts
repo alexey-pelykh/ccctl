@@ -103,3 +103,4 @@ export * from "./full-flow-gate.js";
 export * from "./bearer-canary.js";
 export * from "./live-worker-oracle.js";
 export * from "./worker-idle-hold.js";
+export * from "./pty-handle-residual.js";

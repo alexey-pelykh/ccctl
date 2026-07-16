@@ -8,10 +8,16 @@ linkWorkspacePackages: true
 allowBuilds:
   esbuild: true
   # node-pty (#30, the owned-pty launcher fallback) is a native module. Its build is NOT
-  # allowed here: node-pty ships prebuilt binaries for darwin + win32 (loaded with no compile),
-  # so those platforms work out of the box, and CI + typecheck need only its shipped `.d.ts`
-  # (the backend's unit tests drive an injected fake spawner and never load the native binding).
+  # allowed here: node-pty ships prebuilt binaries for darwin + win32, so the binding LOADS with
+  # no compile, and CI + typecheck need only its shipped `.d.ts` (the backend's unit tests drive
+  # an injected fake spawner and never load the native binding).
+  # Loading is NOT spawning, and darwin does NOT work out of the box: the shipped
+  # prebuilds/darwin-*/spawn-helper is mode 644 and no node-pty script chmods it, so every spawn
+  # fails with `posix_spawnp failed` until someone runs `chmod +x` on it. Flipping this flag does
+  # NOT fix that — see packages/e2e/README.md § "What is fenced to the credentialed wave" (#68) for
+  # the per-platform levers.
   # It ships NO Linux prebuild, so a Linux operator who actually needs the pty fallback must
   # flip this to `true` (compiling node-pty from source) — the daemon-wiring item that deploys
-  # the launcher owns that call. The backend itself is functional via any injected spawner.
+  # the launcher owns that call, and owns the darwin chmod too. The backend itself is functional
+  # via any injected spawner.
   node-pty: false

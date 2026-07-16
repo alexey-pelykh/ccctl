@@ -162,7 +162,8 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   the SSE relay, and the phone's own request body. What is a **stand-in**: the `ISessionLauncher`
   backend and the launched worker — both on the far side of ports the daemon calls **out** through
   (the assertion is the daemon's launch lifecycle, not tmux), and both necessarily so, since the repo
-  ships no packaged patched worker (see below) — the real backend's surface + FD residual is #68's job.
+  ships no packaged patched worker (see below) — the real backend's surface + FD residual is the
+  **real-pty handle-residual oracle's** (#68, below).
   **Fenced / opt-in** on `CCCTL_E2E` + `CCCTL_E2E_TAILSCALE` (`resolveTunnelE2EEnv`, **reused** from
   the UC1 oracle — the infra prerequisite is the same single real tailnet), so it lives **outside** the
   credential-free CI `e2e` lane. `launch-tunnel-flow.e2e.test.ts` drives it; the pure classifier — the
@@ -241,6 +242,47 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   is watching. Hermetic (loopback, stand-in workers, no credentials), so it gates on **every** run;
   it deliberately makes **no** claim about the real tunnel, which is the fenced gate's alone.
 
+- **The real `node-pty` handle residual (#68, traces E2E-B-003)** — `pty-handle-residual.ts` is the
+  fenced, self-classifying oracle for the one thing every stand-in launcher above defers: that a
+  session launched onto the **real** owned-pty backend (#30) leaves **no residual** — no orphaned
+  child, no leaked pty file descriptor. `@ccctl/server`'s backend puts its one impure edge behind an
+  injectable `PtySpawner` and is unit-proven against an **in-memory fake pty** (its own suite says so),
+  which proves the **orchestration** — kill → escalate → reap → idempotent close — but structurally
+  **cannot** prove that orchestration's promise against the **real native binding**: "the pty fd is
+  released and the child is reaped" is a claim about the **operating system**, and a fake `kill()`
+  firing a synthetic `onExit` only ever proves the backend _believes_ it. This drives the real binding
+  through the daemon's own launch ingress (`POST /api/sessions`, the phone's own body from the **real**
+  [`@ccctl/web-ui`](../web-ui) `launchRequest`) and asks the **kernel**: `process.kill(pid, 0)` for the
+  child, `fstat(fd)` for the pty **master** descriptor the real handle exposes. **`ESRCH` is proof of
+  REAPING, not merely of exit — and that is the whole point**: a child that exited but was never reaped
+  is a **zombie**, and a zombie still answers `kill(pid, 0)`. An oracle asserting only "the child
+  stopped running" would pass a daemon that leaks one per session. Then it **self-classifies**:
+  `verified` (the kernel saw a live child + an open pty-master **character device** at launch, and —
+  after the daemon's **own** shutdown teardown — an `EBADF` fd and an `ESRCH` child), `drift` (a
+  residual was **observed**; the run **fails**, naming the check), or `inconclusive` (the binding could
+  not load or could not spawn — **runtime-skip**, never a fabricated green). **A recycled fd number is
+  not a leak**: POSIX hands out the lowest free descriptor, so each reading records the fd's
+  **identity** (`dev:rdev:ino`) and a leak is declared only when the descriptor is still open **and**
+  still points at the **same object** — a bare "is fd 12 open?" would fail a faithful daemon the moment
+  it reused the number. What is **real**: the binding, the pty, the child, the master fd, the launch
+  ingress, the pending-launch bookkeeping, the registry, the launcher's whole close/kill/reap
+  orchestration, and the daemon's real shutdown path. What is a **stand-in**: only the **worker** the
+  pty runs (`/bin/sh -c 'exec sleep 30'`) — the repo ships no packaged patched worker, and #68 needs
+  none: its ACs are about the **FD residual**, not registration (that is #66's claim, proven by its own
+  oracle), and the backend's own `WorkerCommandFactory` seam exists precisely because it "asserts
+  NOTHING about the patched-claude CLI; it owns only the pty orchestration". It is **self-guarded** in
+  the `probeStandInLiveness` (#134) posture, and here the guard is **empirical, not merely logical**: a
+  **negative control** wires the same real backend with its teardown **disabled** and asserts the same
+  probe, on the same box, **does** report `drift` — naming both the stranded child and the leaked fd.
+  Without it, a probe that always read `ESRCH`/`EBADF` because it was asking wrongly would make the
+  positive green for the worst possible reason while every unit test still passed. **Fenced / opt-in**
+  on its **own** arm — `CCCTL_E2E` + `CCCTL_E2E_PTY` (`resolvePtyE2EEnv`) — because the prerequisite is
+  neither a tailnet nor an API key but a real, **spawn-capable** node-pty (see below).
+  `pty-handle-residual.e2e.test.ts` drives it; the fence, the tri-state classifier (the Tier-A encoding
+  of #68's two ACs) **and the OS probe's own semantics** are unit-tested credential-free in
+  `pty-handle-residual.test.ts` — a live pid, a reaped pid, an open fd, a closed fd and a character
+  device are all obtainable without a pty, so what is fenced is the **binding**, not the **judgment**.
+
 ## What is fenced to the credentialed wave
 
 - The **live-worker oracle** above is wired but **fenced** — it runs only when
@@ -281,10 +323,71 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   reason named in the live-worker bullet above: the repo ships no packaged patched worker, so a real
   tmux/pty surface would open a terminal running nothing that could ever register over §2, and AC2
   ("the launched session registers") would be an unreachable `inconclusive` on every run rather than a
-  tested claim. The real backend's own surface + FD-residual behavior is #68's; the tmux (#29) and
-  owned-pty (#30) backends are unit-proven in [`@ccctl/server`](../server). When the patched-worker
-  packaging lands, the stand-in launcher is the one seam to swap — the oracle's fence, classifier and
-  ACs need no churn. Its loopback skeleton is `launch-lifecycle.test.ts`.
+  tested claim. The real backend's own surface + FD-residual behavior is the **real-pty handle-residual
+  oracle's** (#68, its own bullet below); the tmux (#29) and owned-pty (#30) backends are unit-proven
+  in [`@ccctl/server`](../server). When the patched-worker packaging lands, the stand-in launcher is
+  the one seam to swap — the oracle's fence, classifier and ACs need no churn. Its loopback skeleton is
+  `launch-lifecycle.test.ts`.
+
+- The **real-pty handle-residual oracle** (#68) carries its **own** arm — `CCCTL_E2E` +
+  `CCCTL_E2E_PTY` — rather than reusing the tunnel or live-worker ones, because its prerequisite is a
+  genuinely different piece of infrastructure: a `node-pty` native binding that both **loads** and can
+  **spawn**. Folding it into an existing arm would make a box with a tailnet claim a pty it may not
+  have, and make the absence of one look like a tunnel failure.
+
+    **A default checkout cannot spawn a pty, on any platform** — and the reason differs per platform,
+    which is what makes the arming step non-obvious enough to be worth spelling out. node-pty resolves
+    its binding in the order `build/Release` → `build/Debug` → `prebuilds/<platform>-<arch>`
+    (`lib/utils.js` § `loadNativeModule`), and its `install` script is
+    `node scripts/prebuild.js || node-gyp rebuild`, where `prebuild.js` **probes** for the prebuild
+    directory: present → `exit 0`, absent → `exit 1` (and, only under
+    `npm_config_build_from_source=true`, deletes `prebuilds/` and exits 1). It never chmods. So:
+
+    - **Linux** — node-pty ships **no Linux prebuild**, so `prebuild.js` exits 1 and `node-gyp rebuild`
+      is what would produce `build/Release`. `pnpm-workspace.yaml` sets `allowBuilds: node-pty: false`,
+      which blocks that script, so the binding cannot even **load** on CI's `ubuntu-latest` runners.
+      This is the arm `allowBuilds` governs.
+    - **darwin** — a prebuild **is** shipped, so `prebuild.js` exits 0 and `node-gyp rebuild`
+      **never runs** (the `||` short-circuits); the binding loads happily from `prebuilds/`. But the
+      shipped `prebuilds/darwin-*/spawn-helper` is mode **`644` — not executable** — and **no node-pty
+      script ever chmods it** (`prebuild.js` only probes; `post-install.js` touches `build/Release` and
+      win32's `conpty.dll` only; there is no `chmod` anywhere in the package). So every spawn fails
+      with `posix_spawnp failed`. **Flipping `allowBuilds` does not fix this** — it is neither
+      necessary nor sufficient on darwin, because the script it unblocks would not have chmodded
+      anything and exits before `node-gyp` regardless.
+
+    So the oracle **cannot** run on a default checkout, CI included — which is exactly why it must never
+    sit in the credential-free lane. To arm it, apply the lever your platform actually needs:
+
+    ```sh
+    # darwin: make the shipped prebuilt spawn-helper executable (it ships 644; nothing chmods it).
+    chmod +x node_modules/.pnpm/node-pty@*/node_modules/node-pty/prebuilds/darwin-$(uname -m | sed 's/^x86_64$/x64/')/spawn-helper
+
+    # linux: flip `allowBuilds.node-pty` to true in pnpm-workspace.yaml, then reinstall — with no
+    # prebuild to find, prebuild.js exits 1, `|| node-gyp rebuild` runs, and build/Release/pty.node
+    # is what loadNativeModule then prefers. No spawn-helper is BUILT or EXEC'd on Linux: binding.gyp
+    # gates that target on OS=="mac", and while pty.cc reads helper_path unconditionally (:352) —
+    # unixTerminal.js passes it on every unix — it is USED only under `#if defined(__APPLE__)` (:356),
+    # so on Linux the string is simply discarded and forkpty(3) (:399) runs instead. Darwin's mode-644
+    # trap therefore has no Linux counterpart. UNVERIFIED end-to-end: no Linux box was available, so
+    # the chain is read off binding.gyp, pty.cc, scripts/prebuild.js, package.json and lib/utils.js
+    # rather than run. (binding.gyp also links -lutil, which can bite on musl/Alpine.)
+    pnpm install
+
+    CCCTL_E2E=1 CCCTL_E2E_PTY=1 pnpm --filter @ccctl/e2e test:e2e
+    ```
+
+    Note that `pnpm install` **re-extracts the 644 helper**, so on darwin the `chmod` must be re-applied
+    after any reinstall.
+
+    When the arm is set but the binding still cannot spawn, the drive self-classifies `inconclusive` —
+    naming the typed failure the daemon itself reported (`backend-unavailable` / `spawn-failed`) — and
+    the spec `ctx.skip`s with that reason rather than faking a green. **That is the safe behavior, but
+    it does mean a mis-armed run reports green-with-a-skip**: if you armed the oracle deliberately, read
+    the skip reason. An `inconclusive` naming `spawn-failed` is **usually** the missing `chmod` — but
+    `spawn-failed` is the daemon's honest catch-all for a spawn throw it cannot classify structurally
+    (`session-launcher.ts`), so it names the symptom and not the cause; check the mode bit rather than
+    assume. What it never means is that the daemon is fine.
 
 ## Running
 
@@ -292,3 +395,12 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
 - `pnpm --filter @ccctl/e2e test:e2e` — end-to-end specs (`src/*.e2e.test.ts`),
   run serially. The wired skeleton is self-contained (loopback only); the
   later real specs will gate on their own env.
+
+The fenced oracles each gate on their own arm and **skip** when it is absent, so the commands above
+stay green on a bare checkout. To arm one, set its vars (turbo passes them through to `test:e2e`):
+
+| Oracle                                   | Arm                                                 | Infra prerequisite                                                       |
+| ---------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------ |
+| Live-worker (#133)                       | `CCCTL_E2E` + `CCCTL_SDK_URL` + `ANTHROPIC_API_KEY` | a patched worker + API credentials                                       |
+| UC1 / UC2 / full-flow gate (#65/#66/#67) | `CCCTL_E2E` + `CCCTL_E2E_TAILSCALE`                 | one real, authenticated tailnet                                          |
+| Real-pty handle residual (#68)           | `CCCTL_E2E` + `CCCTL_E2E_PTY`                       | a **spawn-capable** `node-pty` (see above — a default checkout has none) |
