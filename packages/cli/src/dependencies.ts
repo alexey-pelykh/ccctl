@@ -32,6 +32,7 @@ import {
 } from "@ccctl/server";
 import { ADAPTERS, type Tunnel, type TunnelKind } from "@ccctl/tunnel-adapters";
 import { defaultSessionClient, type SessionClient } from "./session-client.js";
+import { createTailscaleTunnel } from "./tailscale-acl.js";
 import { defaultWorkerCommand } from "./worker-command.js";
 
 /** The command-line name of the external patcher the `patch` verb delegates to. */
@@ -171,7 +172,16 @@ export function defaultRenderQr(text: string): string {
 /** The production seams: the real daemon, the real tunnel adapters, the real patcher delegation, the real session client, the real session launcher, and the real terminal-QR renderer. */
 export const defaultDependencies: CliDependencies = {
   startServer,
-  adapters: ADAPTERS,
+  // The registry's backends, with Tailscale's factory swapped for the ACL-aware composition (#153):
+  // #148 landed opt-in provisioning behind the adapter's injectable API seam, but the credential's
+  // source is the CLI's concern (ADR-002 § (2) fixes it as INJECTED — `@ccctl/tunnel-adapters` reads
+  // no env), so the token→client→provisioning wiring belongs HERE, at the composition root, exactly
+  // like the launcher below. `createTailscaleTunnel` resolves per establish: with BOTH
+  // CCCTL_TAILSCALE_API_TOKEN and CCCTL_TAILSCALE_ACL_GRANT configured, the tunnel brackets the
+  // grant the OPERATOR declared to the session (ccctl authors none). With either one missing it is
+  // `new TailscaleTunnel(defaultCommandRunner, null)` — identical to the registry's default, so the
+  // #139 operator-managed-ACL posture is unchanged. Cloudflare / Headscale are untouched stubs.
+  adapters: { ...ADAPTERS, tailscale: () => createTailscaleTunnel() },
   runPatcher: defaultRunPatcher,
   sessionClient: defaultSessionClient,
   // The real paired-device store (#88): the `0600` single-file JSON snapshot at the XDG state

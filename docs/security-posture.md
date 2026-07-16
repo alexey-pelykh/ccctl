@@ -180,11 +180,51 @@ is **additive and non-destructive**: it appends a single operator-declared scope
 grant on establish and removes exactly that grant on teardown, preserving every
 operator-authored rule verbatim (a write outside the adapter's own managed grant
 never happens) and rejecting a concurrent operator edit via `If-Match` rather than
-overwriting it. The API credential is **non-persisting** — supplied through the
-seam, sent only as a bearer `Authorization` header, and never stored on the
-tunnel, placed on its outputs, written to session state or a snapshot, or logged.
-Provisioning is off unless explicitly wired, so the default posture above is
-unchanged.
+overwriting it.
+
+`ccctl` provisions only when **both** halves are configured: the credential in
+**`CCCTL_TAILSCALE_API_TOKEN`** (an OAuth client's short-lived `acl`-scoped access
+token is recommended — least privilege; a raw API access token works through the
+identical bearer seam) **and** the scoped grant, as one JSON `grants[]` entry, in
+**`CCCTL_TAILSCALE_ACL_GRANT`**. With either unset or blank, no provisioning is
+constructed, the API channel is never opened, and the default operator-managed-ACL
+posture above is unchanged — so a credential exported for other purposes never
+silently starts writing tailnet policy.
+
+**`ccctl` never authors a grant; there is deliberately no default.** A grant's `src`
+is what authorizes _which peers_ may reach the daemon, and Tailscale grants are
+allow-only — a policy is the **union** of its grants — so any `src` `ccctl` invented
+could only ever _widen_ the operator's policy, never narrow it. That would defeat
+the very argument ADR-002 § Alternatives rests additive provisioning on: that the
+scoped grant admits a **narrow** `src`. It is also not a judgement `ccctl` is in a
+position to make — the tunnel's mandatory-auth gate gives it no knowledge of who
+_should_ reach the daemon (that gate checks **this node's own** `BackendState`, a
+server-side precondition; `src` is client-side authorization of peers — orthogonal
+dimensions). So the grant is the operator's, verbatim: `ccctl` validates its shape,
+brackets it to the session, and otherwise does not interpret it.
+
+The API credential is **non-persisting**: it is read from the environment and
+handed straight to the API client, which captures it and sends it only as a bearer
+`Authorization` header to `api.tailscale.com`. It is never stored on the tunnel,
+placed on its outputs, written into the policy document, written to session state
+or a snapshot, or logged. One honest boundary on that list: it lives in the
+operator's **environment**, which `ccctl serve` passes to the workers it launches —
+so a session can read it, as it can any environment variable. That is inherited
+ambient state rather than a sink `ccctl` writes to, but an `acl`-scoped tailnet
+credential is worth siting deliberately (see the [`@ccctl/cli` README](../packages/cli/README.md)).
+
+**The revert half is not yet reachable from the CLI — [#242].** The adapter removes
+its grant on tunnel teardown, but no `ccctl` verb tears a tunnel down today
+(`tailscale serve --bg` is a detached mapping that outlives `ccctl tunnel` by
+design, and `serve --tunnel`'s shutdown path closes the daemon without touching the
+tunnel), so a provisioned grant is currently appended and left in place: repeated
+establishes append duplicate copies, and a grant outlives a hand-stopped tunnel.
+This is policy **cruft, not a privilege escalation** — what is left behind is exactly
+the grant the operator declared (`ccctl` authors none), no operator-authored rule is
+touched, and nothing widens beyond it — and it is reachable only by opting in with
+both variables. It is a deliberate, recorded boundary (mirroring how [#139] deferred
+ACL provisioning itself), tracked at [#242] and documented in the
+[`@ccctl/cli` README](../packages/cli/README.md).
 
 ### Local control floor
 
@@ -247,8 +287,9 @@ The four are:
   that may travel the worker wire, it is kept out of logs and snapshots by
   omission (no log or persisted shape carries a field for it) plus a runtime
   redaction test and the end-to-end canary;
-- the **tunnel API credential** — the optional Tailscale API token, non-persisting
-  and sent only to `api.tailscale.com`, covered under
+- the **tunnel API credential** — the optional Tailscale API token
+  (`CCCTL_TAILSCALE_API_TOKEN`), operator-owned and opt-in: non-persisting and sent
+  only to `api.tailscale.com`, covered under
   [Tunnel-only exposure](#tunnel-only-exposure) above and
   [ADR-002](decisions/adr-002-tailscale-acl-provisioning-model.md).
 
@@ -401,5 +442,7 @@ still forward-looking:
 [#66]: https://github.com/alexey-pelykh/ccctl/issues/66
 [#67]: https://github.com/alexey-pelykh/ccctl/issues/67
 [#133]: https://github.com/alexey-pelykh/ccctl/issues/133
+[#139]: https://github.com/alexey-pelykh/ccctl/pull/139
+[#242]: https://github.com/alexey-pelykh/ccctl/issues/242
 [pr #104]: https://github.com/alexey-pelykh/ccctl/pull/104
 [`full-flow-gate.ts`]: ../packages/e2e/src/full-flow-gate.ts
