@@ -341,6 +341,54 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   a different finding wearing the same red; `createLeakingSoakLauncher`'s doc carries the why), which is
   also the truer model of a slow leak — everything visible works, and the count climbs anyway.
 
+- **The teardown-timing residual (#70, traces E2E-B-003)** — `teardown-timing-residual.ts` is the
+  fenced, self-classifying oracle for the gap its two siblings leave **between** them. Each of W7's
+  three residual specs traces E2E-B-003 and owns a different question: **#68 owns the per-fd question**
+  (`fstat` on the pty master, `kill(pid, 0)` on the child) — but asks it **once**, **unpressured** (a
+  full `/api/sessions` round-trip sits between its launch and its teardown), over the **whole-daemon
+  shutdown** path; **#69 owns the ref'd-libuv tally** — many lifecycles, but deliberately **paced**, and
+  structurally **fd-blind** (#63's sampler counts the resources keeping the loop alive, and a bare
+  descriptor is not one — `daemon-soak.ts`'s own module doc: "A raw fd leak is invisible HERE, and is
+  exactly what #68's oracle asks the kernel about directly"). So a handle that lingers **only when teardown is raced**
+  is unasked by the first and unseeable by the second. That intersection — **the per-fd question, asked
+  N times, under pressure** — is this oracle's, and is the whole of what it claims.
+  **The stop path is FORCED by AC1, not chosen** — and it is the genuinely timing-sensitive one. "Rapid
+  launch/teardown cycles" needs a teardown a drive can repeat against one live daemon; the server has
+  three and two are unavailable by construction (shutdown is **terminal**; the ghost-reaper is a
+  **timer**). That leaves the emergency stop (#76) — which is also, by the server's **own** docs, the
+  only `close()` caller carrying a **deadline** ("the first `close()` caller with anyone waiting on it")
+  and the one whose abandoned close leaves the owned pty latched `closed` so "every later `close()` on
+  that handle returns instantly — **cheerfully, and to a still-running child**". That sentence is a
+  handle/teardown-timing hazard the server names in its own words; this is the runtime check that the
+  class stays closed.
+  **The stop buys a sharper claim than #68's, and the drive is built on it**: #68 must **poll** for
+  convergence because shutdown's release is fire-and-forget (`void releaseLaunchedSession`); a stop is
+  **awaited** end to end, down to the pty's `await reaped`, so when its `200` lands the reaping has
+  **already** happened. The settle window is correspondingly short. It is also why this oracle needs no
+  copy of #68's computed sleep floor: a child that died by some **other** hand makes the daemon report
+  `already-exited` rather than `stopped`, so the confound arrives as an **observation** filed as a gap
+  rather than passing as a green.
+  **Two self-guards, because it asserts two absences.** The readings must **disagree** per cycle —
+  present at launch, gone after the stop (#68's guard, and its reason). And **the pressure is itself a
+  claim under test**, which #68 had no need of: a run that drove its cycles slowly, or fewer than
+  planned, or **none at all**, would verify a claim it never bought. So the plan is declared, the
+  launch→stop gap is **measured**, and the classifier **refuses to verify a run that fell short of
+  either axis** — the discipline #69 applies to its own span, applied to these axes — a zero-cycle run is
+  `inconclusive`, never `verified`. The gap ceiling exists even though the drive dispatches the stop on
+  the very next statement, and not to measure the daemon: it is a tripwire on **this oracle's own
+  honesty**, because a settling sleep introduced later would void the pressure it is named for while the
+  run stayed **green**.
+  **Fenced / opt-in on #68's arm** — `CCCTL_E2E` + `CCCTL_E2E_PTY`, **shared** deliberately (see the arm
+  table). It is **self-guarded** in the `probeStandInLiveness` (#134) posture, and here the guard is
+  **empirical**: a negative control wires the same real backend with its teardown **disabled** and
+  asserts the same probe, on the same box, **does** report `drift` — naming the stranded child, the
+  leaked fd, **and** the server's own #76 post-close re-read refusing to report a stop that did not
+  happen. `teardown-timing-residual.e2e.test.ts` drives it; the fence, the tri-state classifier (the
+  Tier-A encoding of #70's two ACs) **and the drive's own pressure mechanics** are unit-tested
+  credential-free in `teardown-timing-residual.test.ts` — a stand-in daemon answering the two ingresses
+  is twenty lines of `node:http`, and a live pid plus a real character device need no pty — so what is
+  fenced is the **binding**, not the **judgment**.
+
 ## What is fenced to the credentialed wave
 
 - The **live-worker oracle** above is wired but **fenced** — it runs only when
@@ -463,6 +511,16 @@ stay green on a bare checkout. To arm one, set its vars (turbo passes them throu
 | UC1 / UC2 / full-flow gate (#65/#66/#67) | `CCCTL_E2E` + `CCCTL_E2E_TAILSCALE`                 | one real, authenticated tailnet                                           |
 | Real-pty handle residual (#68)           | `CCCTL_E2E` + `CCCTL_E2E_PTY`                       | a **spawn-capable** `node-pty` (see above — a default checkout has none)  |
 | Long-run daemon soak (#69)               | `CCCTL_E2E` + `CCCTL_E2E_SOAK`                      | **none — only time** (see below: the arm buys the span, not the judgment) |
+| Teardown-timing residual (#70)           | `CCCTL_E2E` + `CCCTL_E2E_PTY` — **#68's arm**       | the same **spawn-capable** `node-pty`; nothing further (see below)        |
+
+The teardown-timing residual (#70) is the one row that **shares** another oracle's arm, and it is the
+same principle the rest of the table follows rather than an exception to it: an arm names a
+**prerequisite**, not a spec. Its prerequisite is not merely similar to #68's, it is **identical** — a
+real, spawn-capable `node-pty` and nothing else — so a third variable would gate nothing the second does
+not already gate, while making an operator who armed the pty oracle silently skip this one for no
+infrastructural reason. Its cycle count is an operator lever (`CCCTL_E2E_TIMING_CYCLES`, default 12);
+the gap ceiling deliberately is **not** one, because a knob that raised it would only switch off the
+guard it exists to be.
 
 The soak (#69) is the one row whose prerequisite is not infrastructure. Armed with no plan it runs a
 real but **compressed** soak in seconds, and the verdict says so rather than implying otherwise. To soak
