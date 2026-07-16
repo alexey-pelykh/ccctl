@@ -4,6 +4,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { HostEndpoint } from "@ccctl/core";
 import {
   SessionLaunchError,
   startServer,
@@ -17,6 +18,15 @@ import { defaultSessionClient } from "./session-client.js";
 
 /** A REAL directory: the daemon's launch pre-flight (#33) refuses a cwd that does not exist. */
 const LAUNCH_CWD = process.cwd();
+
+/**
+ * The daemon target for the mis-shaped-body tests, which stub `fetch` before the client ever calls
+ * it — so this address is only ever rendered into a URL the stub discards. Deliberately a literal
+ * and NOT a real {@link startTestServer} address: no wire is involved in those tests, and starting a
+ * server would imply one to the next reader while proving nothing. Port 1 so that a stub which ever
+ * stopped interposing fails loudly (connection refused) rather than quietly reaching something.
+ */
+const UNREACHED_TARGET: HostEndpoint = { host: "127.0.0.1", port: 1 };
 
 // The launch/attach verbs' UNIT tests exercise the command tree against a FAKE session client
 // (index.test.ts). These tests close the other half: the REAL `defaultSessionClient` (real
@@ -143,6 +153,36 @@ describe("defaultSessionClient.launch — real POST /api/sessions wire (UC2)", (
 
     expect(error.message).toContain("Install tmux");
   });
+
+  // Not reachable against ccctl's own ingress, whose handler always writes all three; reachable
+  // across a tunnel or proxy that interposes a body of its own — which is what the stubbed `fetch`
+  // stands in for. `sessionId` is the half of the answer #33 added on purpose — the daemon mints the
+  // id AT launch so the operator can name the session they started rather than guess which of N rows
+  // is theirs — so a 201 without it must throw rather than resolve into
+  // `ccctl: launched session undefined on …`, the one thing the id exists to prevent.
+  //
+  // Each field is dropped INDEPENDENTLY, as the stop half below (#77) derives at length: a body
+  // missing all three passes while any ONE of the checks is live, so it proves only that *some*
+  // validation exists. That caught more here than there — ALL THREE arms were unpinned when this was
+  // written (#198 found `sessionId`; `attachable` and `hint` turned out to survive deletion too). The
+  // round-trip test above asserts their VALUES, which reads as coverage but is not: a well-formed
+  // body never reaches the arm that rejects a mis-shaped one.
+  it.each([
+    ["sessionId", { attachable: true, hint: "tmux attach -t ccctl:1" }],
+    ["attachable", { sessionId: "s-1", hint: "tmux attach -t ccctl:1" }],
+    ["hint", { sessionId: "s-1", attachable: true }],
+  ])("refuses a 201 whose body is missing `%s` — an unreadable answer is not a launch", async (_field, body) => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() => Promise.resolve(new Response(JSON.stringify(body), { status: 201 }))) as typeof fetch;
+
+    try {
+      await expect(
+        defaultSessionClient.launch(UNREACHED_TARGET, { cwd: LAUNCH_CWD, permissionMode: "default" }),
+      ).rejects.toThrow(/did not return a \{ sessionId, attachable, hint \} body/);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
 });
 
 describe("defaultSessionClient.list — real GET /api/sessions wire (UC1 on-ramp)", () => {
@@ -184,6 +224,27 @@ describe("defaultSessionClient.steer — real POST /api/sessions/{id}/command wi
     });
     expect(res.status).toBe(400);
     expect(await res.text()).toContain("malformed command");
+  });
+
+  // The 202's body is the one answer this client cannot get from the real handler here (no live
+  // worker channel, per the note above), so — as for launch and stop — the mis-shaped case is driven
+  // through an interposed response. `id` is the steer's WHOLE answer: it is the correlation handle
+  // the operator matches the worker's reply against on the stream, so a 202 without one must throw
+  // rather than confirm `ccctl: the daemon accepted it (correlation undefined).` — an acceptance
+  // nothing can be matched against. One field, so #198's independent-drop point is moot here; the
+  // guard was unpinned all the same, and for the very reason the 202 has to be interposed at all —
+  // nothing in this suite reaches it.
+  it("refuses a 202 whose body is missing `id` — an unreadable answer is not a queued command", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() => Promise.resolve(new Response(JSON.stringify({}), { status: 202 }))) as typeof fetch;
+
+    try {
+      await expect(
+        defaultSessionClient.steer(UNREACHED_TARGET, "s-1", { subtype: "prompt", payload: { text: "hi" } }),
+      ).rejects.toThrow(/did not return an \{ id \} body/);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });
 
