@@ -613,8 +613,10 @@ export interface CcctlServer {
    * holds no handle to kill (`no-surface` — a UC1 attach); the operator has taken the surface over and
    * `force` was not given (`taken-over`, the AC3 envelope); the terminal may be running another
    * session's live worker (`ambiguous-surface`, which `force` deliberately does NOT override); the
-   * backend could not read the surface (`liveness-unknown`); or the teardown itself failed
-   * (`stop-failed`).
+   * backend could not reach the host that would read the surface (`liveness-unknown` — `force` does not
+   * override this one either: the kill would travel the same unreachable path); the backend reached its
+   * host and got no usable answer, and `force` was not given (`liveness-indeterminate`, #197); or the
+   * teardown itself failed (`stop-failed`).
    *
    * A REFUSED stop touches no state — the session stays exactly as it was, which is what makes a
    * refusal safe to retry. The one exception is `unknown-session` raised at the END rather than the
@@ -623,8 +625,10 @@ export interface CcctlServer {
    * be over and it is over, by another hand — but the same operator action can answer `already-exited`
    * or `unknown-session` depending on which of the two got there first.
    *
-   * `force` (default `false`) authorizes killing a session the OPERATOR has taken over, and only that
-   * — it is the explicit consent AC3 requires, and it is scoped to the session named here.
+   * `force` (default `false`) authorizes killing a session the OPERATOR has taken over (the explicit
+   * consent AC3 requires) and one whose surface a reachable backend would not report on
+   * (`surface-indeterminate`, #197 — where the channel demonstrably works, so the kill really travels
+   * and is really verified). It is scoped to the session named here, and it reaches nothing else.
    */
   stopSession(
     sessionId: string,

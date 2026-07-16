@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  LIVENESS_INDETERMINATE_CODE,
   TAKEN_OVER_CODE,
   UNKNOWN_STOP_FAILURE_CODE,
   describeStopAccepted,
@@ -20,8 +21,8 @@ import {
  * gate nothing while still going stale. Asserting this list against a module-level copy of itself
  * would be a tautology w.r.t. the drift it names, so the READING of these codes is pinned against
  * the REAL ingress by `@ccctl/e2e`'s `web-ui-stop-flow.test.ts` instead. Here the list only
- * enumerates inputs. (`TAKEN_OVER_CODE` is the one code `stop.js` DOES name — not to validate the
- * set, but because it is the only refusal this UI can act on.)
+ * enumerates inputs. (`TAKEN_OVER_CODE` and `LIVENESS_INDETERMINATE_CODE` are the codes `stop.js` DOES
+ * name — not to validate the set, but because they are exactly the refusals this UI can act on.)
  */
 const SERVER_FAILURE_CODES = [
   "unknown-session",
@@ -29,6 +30,7 @@ const SERVER_FAILURE_CODES = [
   "ambiguous-surface",
   "taken-over",
   "liveness-unknown",
+  "liveness-indeterminate",
   "malformed-request",
   "stop-failed",
 ];
@@ -142,25 +144,45 @@ describe("keepStopControlDisabled", () => {
 });
 
 describe("isForceable", () => {
-  it("is true for `taken-over` — the ONE refusal the operator can override", () => {
+  it("is true for `taken-over` — the refusal the operator overrides by being the human it protects", () => {
     // The server refuses because it cannot know whether a human is at that terminal; the operator
     // hitting stop IS that human. That is the whole of what force means.
     expect(isForceable(TAKEN_OVER_CODE)).toBe(true);
     expect(TAKEN_OVER_CODE).toBe("taken-over");
   });
 
-  it("is false for every OTHER code the server can answer — force reaches exactly one", () => {
-    for (const code of SERVER_FAILURE_CODES.filter((c) => c !== TAKEN_OVER_CODE)) {
+  it("is true for `liveness-indeterminate` — the other refusal force resolves (#197)", () => {
+    // The backend REACHED its host and the host would not say what the surface is. The server refuses
+    // for want of the operator's say-so, and the channel to the surface demonstrably works — so a forced
+    // kill really travels and the server really verifies it landed. Same shape as `taken-over`: a
+    // refusal waiting on a fact only the operator has.
+    expect(isForceable(LIVENESS_INDETERMINATE_CODE)).toBe(true);
+    expect(LIVENESS_INDETERMINATE_CODE).toBe("liveness-indeterminate");
+  });
+
+  it("is false for every OTHER code the server can answer — force reaches exactly two", () => {
+    const forceable = [TAKEN_OVER_CODE, LIVENESS_INDETERMINATE_CODE];
+    for (const code of SERVER_FAILURE_CODES.filter((c) => !forceable.includes(c))) {
       expect(isForceable(code)).toBe(false);
     }
   });
 
   it("is false for the two refusals force must never overrule, specifically", () => {
     // `ambiguous-surface`: the terminal may hold a DIFFERENT session's live worker, and nobody can
-    // consent to destroying a session they did not name (#20). `liveness-unknown`: forcing on a
-    // reading nobody could take is how a stop reports a kill that did not happen. Offering an
-    // override here would promise something the server will refuse.
+    // consent to destroying a session they did not name (#20). `liveness-unknown`: the backend could
+    // not REACH the host, so forcing sends the kill down the very channel that just failed and reports
+    // "stopped" on the word of nobody. Offering an override here would promise something the server
+    // will refuse.
     expect(isForceable("ambiguous-surface")).toBe(false);
+    expect(isForceable("liveness-unknown")).toBe(false);
+  });
+
+  it("splits the two `liveness-` codes rather than matching their shared prefix (#197)", () => {
+    // The sharpest drift this module has: the two liveness refusals read alike and behave as opposites.
+    // A tidy `code.startsWith("liveness-")` would pass every other test in this file while handing back
+    // a force button for the one refusal force cannot move — reporting a kill that never happened, which
+    // is the answer the whole stop path is built to never give.
+    expect(isForceable("liveness-indeterminate")).toBe(true);
     expect(isForceable("liveness-unknown")).toBe(false);
   });
 
@@ -186,9 +208,10 @@ describe("stopFailure", () => {
     });
   });
 
-  it("marks only a taken-over refusal forceable", () => {
+  it("marks exactly the two forceable refusals forceable", () => {
+    const forceable = [TAKEN_OVER_CODE, LIVENESS_INDETERMINATE_CODE];
     for (const code of SERVER_FAILURE_CODES) {
-      expect(stopFailure(409, { error: "…", code }).forceable).toBe(code === TAKEN_OVER_CODE);
+      expect(stopFailure(409, { error: "…", code }).forceable).toBe(forceable.includes(code));
     }
   });
 

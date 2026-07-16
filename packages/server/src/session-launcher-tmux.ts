@@ -466,15 +466,20 @@ export function createTmuxSessionLauncher(config: TmuxSessionLauncherConfig): IS
               sessionName,
             );
           } catch {
-            // tmux could not be asked at all: no server is running (rc=1), the binary is gone, the
-            // socket is unreachable. We do not know what became of this window, and `unknown` is the
-            // honest word for that — the release rule reads it as do-not-kill, which is the safe
-            // direction (`session-release.ts`). Deliberately NOT narrowed further: tmux reports these
-            // as a non-zero exit plus stderr prose, and classifying by parsing prose is exactly what
-            // this backend refuses to do everywhere else (see the `backend-unavailable` catch in
-            // `launch`). A dead tmux server has taken our window with it, so the cost of the cautious
-            // answer here is a handle held to shutdown, not a real leak.
-            return "unknown";
+            // tmux could not be ASKED at all: no server is running (rc=1), the binary is gone, the
+            // socket is unreachable. We do not know what became of this window, and `host-unreachable`
+            // is the honest word for that (#197) — the failure is the CHANNEL, not the answer. Every
+            // rule reads it as do-not-kill, force included, and a stop's post-close re-read refuses to
+            // confirm a teardown through it, which is the safe direction on both counts
+            // (`session-release.ts`). Deliberately NOT narrowed further: tmux reports these as a
+            // non-zero exit plus stderr prose, and classifying by parsing prose is exactly what this
+            // backend refuses to do everywhere else (see the `backend-unavailable` catch in `launch`).
+            // A dead tmux server has taken our window with it, so the cost of the cautious answer here
+            // is a handle held to shutdown, not a real leak.
+            //
+            // NEVER `surface-indeterminate`: that reading asserts the channel WORKS, which is the one
+            // thing this catch has just disproved — and force spends a kill on that assertion.
+            return "host-unreachable";
           }
         },
         async close(): Promise<void> {

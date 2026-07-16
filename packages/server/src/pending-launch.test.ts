@@ -478,9 +478,25 @@ describe("evictPendingLaunch", () => {
     expect(state.launchedSurfaces.get("sess-1")).toBe(launched);
   });
 
-  it("evicts the ROW but does NOT kill a surface whose liveness could not be read (#35 AC5)", async () => {
+  it("evicts the ROW but does NOT kill a surface whose host could not be reached (#35 AC5)", async () => {
     const state = makeState();
-    const { launched, closeCount } = fakeLaunched("unknown");
+    const { launched, closeCount } = fakeLaunched("host-unreachable");
+    trackPendingLaunch(state, "sess-1", OPTIONS, launched);
+
+    await evictPendingLaunch(state, "sess-1");
+
+    expect(state.sessions.has("sess-1")).toBe(false);
+    expect(closeCount()).toBe(0);
+    expect(state.launchedSurfaces.get("sess-1")).toBe(launched);
+  });
+
+  it("evicts the ROW but does NOT kill a surface reported indeterminate either (#35 AC5, #197)", async () => {
+    // The ghost-reaper is the sharpest teardown in the server — it fires ~10s after launch, which is
+    // exactly when a takeover happens. #197 made one non-answer forceable, and this pins that the reach
+    // of that change stopped at the stop path: NOBODY asked this timer to kill anything, so a reachable
+    // host is not a licence for it to. A surface it cannot read stays up.
+    const state = makeState();
+    const { launched, closeCount } = fakeLaunched("surface-indeterminate");
     trackPendingLaunch(state, "sess-1", OPTIONS, launched);
 
     await evictPendingLaunch(state, "sess-1");

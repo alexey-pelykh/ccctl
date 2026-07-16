@@ -1068,7 +1068,7 @@ describe("CcctlServer.launchSession (programmatic)", () => {
     await server.launchSession({ cwd: CWD, permissionMode: "default" });
     // The backend cannot see its own surface (tmux went away mid-shutdown). A leaked terminal is the
     // accepted cost; killing something that might be the operator's is not.
-    setLiveness("unknown");
+    setLiveness("host-unreachable");
 
     await server.close();
 

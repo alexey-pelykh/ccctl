@@ -14,8 +14,22 @@ import { SURFACE_LIVENESS_READINGS, type LaunchedSession, type SurfaceLiveness }
 // `ui-session-launch.test.ts` and `pending-launch.test.ts`; the per-backend readings that feed it are
 // covered by `session-launcher-tmux.test.ts` and `session-launcher-pty.test.ts`.
 
-/** A fake launched surface reporting a fixed (or thrown) {@link SurfaceLiveness}, recording what was done to it. */
+/**
+ * A fake launched surface reporting a fixed (or thrown) {@link SurfaceLiveness}, recording what was
+ * done to it — and, once CLOSED, honestly reporting itself `exited`.
+ *
+ * That last part is not garnish, and it is why this fake models a WELL-BEHAVED backend: a close that
+ * resolves leaves the surface gone, so the next probe must say so. Both real backends do exactly this
+ * (the pty flips its `exited` flag; tmux's window stops being listed, which is precisely why a killed
+ * window reads `exited` and never `taken-over`). A fake that kept answering `taken-over` forever would
+ * be modelling a close that did NOTHING, and `stopLaunchedSession` re-reads the surface after a close
+ * precisely to catch that — so such a fake would quietly assert the bug is fine. The tests that need a
+ * misbehaving backend build one explicitly, inline, rather than bending this one (see the `REJECTS a
+ * close() that RESOLVED over a still-live surface` family below); mirrors the same choice, for the same
+ * stated reason, in `ui-session-stop.test.ts`'s `fakeLauncher`.
+ */
 function fakeSurface(liveness: SurfaceLiveness | (() => Promise<SurfaceLiveness>)) {
+  let exited = false;
   const handle = {
     closed: 0,
     probed: 0,
@@ -23,10 +37,14 @@ function fakeSurface(liveness: SurfaceLiveness | (() => Promise<SurfaceLiveness>
       attachment: { attachable: true, hint: "tmux select-window -t @3 ; attach -t ccctl" },
       liveness: (): Promise<SurfaceLiveness> => {
         handle.probed += 1;
+        if (exited) {
+          return Promise.resolve("exited");
+        }
         return typeof liveness === "function" ? liveness() : Promise.resolve(liveness);
       },
       close: (): Promise<void> => {
         handle.closed += 1;
+        exited = true;
         return Promise.resolve();
       },
     } satisfies LaunchedSession,
@@ -50,15 +68,24 @@ describe("decideRelease", () => {
     expect(decideRelease("exited")).toBe("no-op");
   });
 
-  it("treats an `unknown` reading as do-not-kill — a leaked process beats destroying live work (AC5)", () => {
-    expect(decideRelease("unknown")).toBe("leave-running");
+  it("treats an unreachable host as do-not-kill — a leaked process beats destroying live work (AC5)", () => {
+    expect(decideRelease("host-unreachable")).toBe("leave-running");
   });
 
-  it("kills on exactly ONE of the four readings — the safety bias itself, pinned", () => {
+  it("treats an indeterminate surface as do-not-kill too — a reachable host is not a reason to kill (AC5)", () => {
+    // #197 split `unknown` in two and gave FORCE a reason to treat the halves differently: a reachable
+    // host means a kill would really travel. This table has no use for that fact — it is ccctl's OWN
+    // unprompted teardown, where nobody asked for a kill at all. The tempting drift is to let "the
+    // channel works" leak into a table whose question is not "can we?" but "were we asked?".
+    expect(decideRelease("surface-indeterminate")).toBe("leave-running");
+  });
+
+  it("kills on exactly ONE of the five readings — the safety bias itself, pinned", () => {
     // The decision map is exhaustive by TYPE, but exhaustive-by-type only proves every reading HAS a
     // disposition — not that the bias survived an edit. `tsc` would be just as happy with a table that
-    // tore down all four. This asserts the asymmetry: of the four readings, exactly one authorizes a
-    // kill, and it is the one that says the surface is still ours.
+    // tore down all five. This asserts the asymmetry: of the five readings, exactly one authorizes a
+    // kill, and it is the one that says the surface is still ours. It is also what pins #197's split as
+    // NON-widening here: growing the reading set did not grow the killing set.
     const killing = SURFACE_LIVENESS_READINGS.filter((reading) => decideRelease(reading) === "tear-down");
 
     expect(killing).toEqual(["alive-server-owned"]);
@@ -138,7 +165,7 @@ describe("releaseLaunchedSession", () => {
     expect(order).toEqual(["probe", "close"]);
   });
 
-  it("reads a probe that THREW as `unknown`, and so does not kill (AC5)", async () => {
+  it("reads a probe that THREW as `host-unreachable`, and so does not kill (AC5)", async () => {
     // A backend whose probe blew up (tmux vanished mid-shutdown, a runner rejected) knows nothing about
     // its surface — and "I cannot see it" must never be optimized into "it must be mine".
     const surface = fakeSurface(() => Promise.reject(new Error("tmux: no server running")));
@@ -149,7 +176,7 @@ describe("releaseLaunchedSession", () => {
     expect(surface.closed).toBe(0);
   });
 
-  it("reads a probe that answered OUTSIDE the pinned set as `unknown`, and so does not kill", async () => {
+  it("reads a probe that answered OUTSIDE the pinned set as `host-unreachable`, and so does not kill", async () => {
     // Fails CLOSED on the reading itself: a backend that answered a word this rule does not know (a
     // drifted build, a hand-rolled handle) must not have it read as one this rule does — least of all
     // fall through to the kill branch.
@@ -215,34 +242,56 @@ describe("decideStop", () => {
     expect(decideStop("taken-over", true)).toBe("tear-down");
   });
 
-  it("does NOT kill on an `unknown` reading, even forced — force cannot see what the probe could not", () => {
-    // The tempting reading of "force" is "kill it whatever you saw". Against the backends this server
-    // ships, that would be a no-op that LIES: the owned pty can never report `unknown` (it observes its
+  it("does NOT kill on an unreachable host, even forced — a kill cannot travel a channel that is down", () => {
+    // The tempting reading of "force" is "kill it whatever you saw". Where the HOST could not be
+    // reached, that would be a no-op that LIES: the owned pty can never report it (it observes its
     // child's exit directly), and tmux reports it only when the tmux CLI could not be reached at all —
     // where the window is already gone with its dead server, and where `close()` would travel the same
     // failed runner and swallow its own error. So a forced kill here would report a session "stopped"
-    // that was never touched, which is the one answer an emergency-stop must never give. `unknown` is
-    // also where an out-of-set answer is filed, and forcing on it would kill on a word this server has
-    // just said it does not understand.
-    expect(decideStop("unknown", true)).toBe("leave-running");
+    // that was never touched, which is the one answer an emergency-stop must never give.
+    // `host-unreachable` is also where an out-of-set answer is filed, and forcing on it would kill on a
+    // word this server has just said it does not understand.
+    expect(decideStop("host-unreachable", true)).toBe("leave-running");
+  });
+
+  // Rule: An explicit force kills a surface whose reachable backend would not report on it (#197).
+  it("KILLS an indeterminate surface when forced — the host is reachable, so the kill really travels", () => {
+    // The half of the old `unknown` that force CAN act on, and the whole point of #197. The backend
+    // reached its host and the host would not say what the surface is — so this rule does not know what
+    // the surface is, but it does know the channel to it WORKS. That is precisely the premise the
+    // refusal above lacks: `close()` will travel, and `stopLaunchedSession`'s post-close re-read will
+    // verify that it landed. Refusing here would mean force may only kill what we already knew enough
+    // not to need force for.
+    expect(decideStop("surface-indeterminate", true)).toBe("tear-down");
+  });
+
+  it("does NOT kill an indeterminate surface UNFORCED — the reachable host is not itself consent", () => {
+    // The other side of the cell above, and the one that keeps it honest: what force adds is the
+    // operator's say-so, not the channel. Unforced, an unreadable surface is untouchable no matter how
+    // healthy the host that would not describe it.
+    expect(decideStop("surface-indeterminate", false)).toBe("leave-running");
   });
 
   it("still no-ops on an already-exited surface when forced — force cannot make it more gone", () => {
     expect(decideStop("exited", true)).toBe("no-op");
   });
 
-  it("flips EXACTLY ONE cell of four — what `force` MEANS, pinned against a table that drifts", () => {
+  it("flips EXACTLY TWO cells of five — what `force` MEANS, pinned against a table that drifts", () => {
     // The two tables are exhaustive by TYPE, but exhaustive-by-type only proves every reading HAS a
-    // forced disposition — `tsc` would be equally happy with a forced table that tore down all four,
+    // forced disposition — `tsc` would be equally happy with a forced table that tore down all five,
     // which is the actual hazard here (force is the one flag in this server that can destroy a surface
-    // ccctl itself refuses to touch). This asserts the SHAPE of the override: force is not "the rule
-    // was too strict", it is "the rule's premise — that nobody asked — no longer holds", and that
-    // premise only fails for the reading that says a human has it.
+    // ccctl itself refuses to touch). This asserts the SHAPE of the override: force is not "the rule was
+    // too strict", it is "the rule was missing a fact the operator has", and it may be spent only where
+    // the kill it authorizes can actually LAND.
+    //
+    // The set GREW by one at #197, and pinning it as a literal is what makes such a growth a decision
+    // rather than a drift: `host-unreachable` must stay OUT (consent does not reconnect a socket) even
+    // though its sibling went in, and these two are one word apart.
     const flipped = SURFACE_LIVENESS_READINGS.filter(
       (reading) => decideStop(reading, true) !== decideStop(reading, false),
     );
 
-    expect(flipped).toEqual(["taken-over"]);
+    expect(flipped).toEqual(["taken-over", "surface-indeterminate"]);
   });
 });
 
@@ -278,17 +327,89 @@ describe("stopLaunchedSession", () => {
     expect(surface.closed).toBe(1);
   });
 
-  it("carries the `unknown` reading out UNDISTINGUISHED from taken-over — two refusals, two facts", async () => {
+  it("carries the `host-unreachable` reading out UNDISTINGUISHED from taken-over — two refusals, two facts", async () => {
     // `ReleaseDisposition` collapses both to `leave-running`, which is right for a teardown (nobody to
     // tell) and wrong for a request (someone is waiting to be told WHY). Reporting "you have this open
-    // at your desk" when the truth is "tmux did not answer" would fabricate a claim the operator acts
-    // on — so the reading rides out alongside the disposition.
-    const surface = fakeSurface("unknown");
+    // at your desk" when the truth is "tmux could not be reached" would fabricate a claim the operator
+    // acts on — so the reading rides out alongside the disposition.
+    const surface = fakeSurface("host-unreachable");
 
     const outcome = await stopLaunchedSession(surface.launched, true);
 
-    expect(outcome).toEqual({ disposition: "leave-running", liveness: "unknown" });
+    expect(outcome).toEqual({ disposition: "leave-running", liveness: "host-unreachable" });
     expect(surface.closed).toBe(0);
+  });
+
+  it("refuses an indeterminate surface UNFORCED, and reports WHICH reading refused (#197)", async () => {
+    const surface = fakeSurface("surface-indeterminate");
+
+    const outcome = await stopLaunchedSession(surface.launched, false);
+
+    expect(outcome).toEqual({ disposition: "leave-running", liveness: "surface-indeterminate" });
+    expect(surface.closed).toBe(0);
+  });
+
+  // Rule: A kill decided on a reading that saw nothing must be CONFIRMED, not merely un-refuted (#197).
+  //
+  //   Scenario: A coy backend's close() silently fails
+  //     Given a launched session whose backend reached its host, will not describe the surface, and
+  //       whose close() swallows its own kill error (exactly as tmux's does)
+  //     When the operator forces a stop
+  //     Then the stop REJECTS rather than reporting the session stopped
+  it("REJECTS a forced indeterminate kill nothing confirmed — a coy backend's swallowed close (#197)", async () => {
+    // THE HAZARD THE FLIP ITSELF CREATES, and the reason the confirmation rule exists. A backend can be
+    // coy AND have a close() that silently fails — the reading promises a working CHANNEL, never a
+    // working KILL. Here the surface is live throughout: the decision probe never saw it, the close did
+    // nothing, and the re-read still will not say. Fail-open would answer "stopped" over a live runaway
+    // on the strength of no observation whatsoever — the module's cardinal sin, and one this flip made
+    // newly reachable (before #197, force on this reading was refused outright).
+    //
+    // Note what this fixture CANNOT be pinned apart from: a backend whose close landed perfectly and
+    // stays coy anyway reaches this same rejection, because from out here the two are the same readings
+    // in the same order. That is the rule's honest cost, not a gap in it — it exists precisely because
+    // the difference is unobservable, and the sin it prevents is the one that is fatal to guess wrong.
+    let closes = 0;
+    const launched: LaunchedSession = {
+      attachment: { attachable: true, hint: "third-party backend" },
+      // Never changes: the backend will not describe this surface, before or after the kill.
+      liveness: (): Promise<SurfaceLiveness> => Promise.resolve("surface-indeterminate"),
+      close: (): Promise<void> => {
+        // The kill failed and the error was swallowed. From out here it looks like a clean teardown.
+        closes += 1;
+        return Promise.resolve();
+      },
+    };
+
+    await expect(stopLaunchedSession(launched, true)).rejects.toThrow("nothing has ever confirmed it is gone");
+
+    // It really did try — this is a verdict on the close's RESULT, not a refusal to attempt it.
+    expect(closes).toBe(1);
+  });
+
+  it("accepts a forced indeterminate kill the re-read CONFIRMS — #197's own transient-backend case", async () => {
+    // The case the issue actually names: a backend reporting indeterminacy "transiently, with a
+    // `close()` that works perfectly" — the flip's whole point, so pin that it works.
+    //
+    // Read the fixture honestly, though: its coyness clears the INSTANT the close lands, which is the
+    // FAVOURABLE half of "transient" and not a promise the reading makes. A backend coy because it is
+    // loaded can still be coy a millisecond later with the surface genuinely gone — and that stop is
+    // REJECTED (the test above is that path; from in here a landed close and a swallowed one are
+    // indistinguishable, which is exactly why the rule cannot be free). So this pins the boundary, not a
+    // guarantee that the intended backend is never bitten.
+    let closed = false;
+    const launched: LaunchedSession = {
+      attachment: { attachable: true, hint: "third-party backend" },
+      liveness: (): Promise<SurfaceLiveness> => Promise.resolve(closed ? "exited" : "surface-indeterminate"),
+      close: (): Promise<void> => {
+        closed = true;
+        return Promise.resolve();
+      },
+    };
+
+    await expect(stopLaunchedSession(launched, true)).resolves.toEqual({
+      disposition: "tear-down",
+      liveness: "surface-indeterminate",
+    });
   });
 
   it("probes, closes, then probes AGAIN — decide before acting, then verify what you did", async () => {
@@ -363,8 +484,8 @@ describe("stopLaunchedSession", () => {
     //
     // Without the re-read, the operator's retry after a `stop-failed` would answer "stopped" about the
     // one session that just refused to die. `FORCED_STOP_BY_LIVENESS` spends a paragraph refusing to
-    // give exactly that answer for `unknown`; a rule cannot argue that and then trust an unverified
-    // close two functions later.
+    // give exactly that answer for `host-unreachable`; a rule cannot argue that and then trust an
+    // unverified close two functions later.
     let closes = 0;
     const launched: LaunchedSession = {
       attachment: { attachable: false, hint: "owned pty" },
@@ -381,17 +502,24 @@ describe("stopLaunchedSession", () => {
     expect(closes).toBe(1);
   });
 
-  it("does NOT contradict a close() it cannot disprove — `unknown` after a close is not a failure", async () => {
-    // Given a tmux window whose kill worked and whose tmux server went down in the same instant, so the
-    // follow-up probe cannot reach the host to confirm it.
-    // The re-read fails OPEN here, unusually for this module, and deliberately: it is a check on our
-    // own work rather than the do-not-kill rule, and its two errors are not symmetrical. A false alarm
-    // sends the operator hunting a session that is already dead; only `alive-server-owned` — the one
-    // reading that PROVES the close did not work — contradicts.
+  it("does NOT contradict a close() it cannot disprove — an indeterminate re-read is not a failure", async () => {
+    // Given a backend whose kill worked and whose host, reached fine, simply would not describe the
+    // surface afterwards.
+    // The re-read fails OPEN here, unusually for this module, and deliberately: it is a check on our own
+    // work rather than the do-not-kill rule. This reading is a host DECLINING to answer down a channel
+    // that demonstrably works — which genuinely cannot contradict the close, and treating it as failure
+    // would send the operator hunting a session that is already dead.
+    //
+    // Note the DECISION probe here is `alive-server-owned`: this stop definitely saw the surface, so
+    // falling open is a choice between two stories about something we observed. That is exactly what
+    // scopes the confirmation rule (#197) away from this case and onto the forced-indeterminate kill,
+    // where nothing was observed at all. This test is the boundary — it fails if that rule ever widens
+    // into "only `exited` may ever succeed".
     let closed = false;
     const launched: LaunchedSession = {
-      attachment: { attachable: true, hint: "tmux attach -t ccctl" },
-      liveness: (): Promise<SurfaceLiveness> => Promise.resolve(closed ? "unknown" : "alive-server-owned"),
+      attachment: { attachable: true, hint: "third-party backend" },
+      liveness: (): Promise<SurfaceLiveness> =>
+        Promise.resolve(closed ? "surface-indeterminate" : "alive-server-owned"),
       close: (): Promise<void> => {
         closed = true;
         return Promise.resolve();
@@ -403,6 +531,70 @@ describe("stopLaunchedSession", () => {
       disposition: "tear-down",
       liveness: "alive-server-owned",
     });
+  });
+
+  // Rule: A stop may not report a teardown while the surface is still there to be seen.
+  //
+  //   Scenario: The operator retries a force-stop whose first attempt wedged
+  //     Given a taken-over tmux window whose first forced stop timed out and answered `stop-failed`
+  //     When the operator re-sends the same forced stop
+  //     Then the stop REJECTS rather than reporting the session stopped
+  it("REJECTS a close() whose re-read still SEES the surface, taken-over — a sighting refutes a close", async () => {
+    // A `taken-over` re-read is a positive sighting of a LIVE surface, not an ambiguity: tmux reports it
+    // only for a window still in its enumeration (`readWindowLiveness`), and a killed window is not
+    // listed — it reads `exited`. So this proves the close did not work, exactly as `alive-server-owned`
+    // does; the two differ only about WHO holds the surface, which is the decision probe's question.
+    //
+    // This is the reachable one, and it is the hazard `stopLaunchedSession` names in its own prose:
+    // tmux's `close()` latches `closed` BEFORE it awaits the kill, so once a forced stop has timed out
+    // and walked away, the operator's retry finds a handle whose `close()` returns instantly having sent
+    // NO kill at all — over the very window that just refused to die. Fail-open here would answer
+    // "stopped" about it. Modelled after the real backend rather than invented: `closes` counts the
+    // kills that were actually attempted.
+    let closes = 0;
+    const launched: LaunchedSession = {
+      attachment: { attachable: true, hint: "tmux attach -t ccctl" },
+      // The operator has it, before AND after — nothing killed this window.
+      liveness: (): Promise<SurfaceLiveness> => Promise.resolve("taken-over"),
+      close: (): Promise<void> => {
+        // The abandoned-close retry: latched `closed`, so this sends nothing and resolves cheerfully.
+        closes += 1;
+        return Promise.resolve();
+      },
+    };
+
+    await expect(stopLaunchedSession(launched, true)).rejects.toThrow("still running");
+    expect(closes).toBe(1);
+  });
+
+  // Rule: A stop may not report a teardown that nothing confirmed (#197).
+  //
+  //   Scenario: The runner breaks between the decision probe and the kill
+  //     Given a tmux window whose runner breaks after the stop decided to tear it down
+  //     When the kill is sent and the post-close re-read cannot reach the host
+  //     Then the stop REJECTS rather than reporting the session stopped
+  it("REJECTS a close() whose host cannot be reached to confirm it — two unknowns are not a success (#197)", async () => {
+    // THE BUG #197 EXISTS TO CLOSE. tmux's `close()` swallows EVERY `kill-window` error, so a kill that
+    // failed is only ever catchable by this re-read. Before the split, the re-read read `unknown` from
+    // that same broken runner and could not contradict it — so a LIVE tmux window was reported stopped,
+    // in the narrow race where the runner breaks between the decision probe and the kill.
+    //
+    // Now the reading names the runner as the thing that broke, and the verdict follows: the kill went
+    // into a channel that was down, and the confirmation came back from that same down channel.
+    // Believing the close here is believing nobody.
+    let killSent = false;
+    const launched: LaunchedSession = {
+      attachment: { attachable: true, hint: "tmux attach -t ccctl" },
+      liveness: (): Promise<SurfaceLiveness> => Promise.resolve(killSent ? "host-unreachable" : "alive-server-owned"),
+      close: (): Promise<void> => {
+        // The runner is broken; `kill-window` fails and tmux's close() swallows the error, exactly as
+        // the real backend does. From here it looks like a perfectly successful teardown.
+        killSent = true;
+        return Promise.resolve();
+      },
+    };
+
+    await expect(stopLaunchedSession(launched, true)).rejects.toThrow("could not be reached to confirm");
   });
 
   it("does not kill an already-exited surface — nothing to stop, and it says so (AC4)", async () => {
@@ -423,7 +615,22 @@ describe("stopLaunchedSession", () => {
 
     const outcome = await stopLaunchedSession(surface.launched, true);
 
-    expect(outcome).toEqual({ disposition: "leave-running", liveness: "unknown" });
+    // `host-unreachable`, not `surface-indeterminate` (#197): a throw means the ask itself did not
+    // complete, so the one thing this server may NOT infer is that the channel works — which is exactly
+    // the premise the other reading asserts, and exactly what force would spend a kill on.
+    expect(outcome).toEqual({ disposition: "leave-running", liveness: "host-unreachable" });
+    expect(surface.closed).toBe(0);
+  });
+
+  it("fails closed to `host-unreachable` on an OUT-OF-SET answer, even forced (#197)", async () => {
+    // The other fail-closed path, and the sharper one now that a non-answer can be forceable: an
+    // unintelligible word must land on the reading that assumes LEAST, or a drifted build could talk
+    // this server into a forced kill by saying something it does not understand.
+    const surface = fakeSurface(() => Promise.resolve("probably-fine" as SurfaceLiveness));
+
+    const outcome = await stopLaunchedSession(surface.launched, true);
+
+    expect(outcome).toEqual({ disposition: "leave-running", liveness: "host-unreachable" });
     expect(surface.closed).toBe(0);
   });
 });

@@ -44,15 +44,16 @@
  * `StopFailureCode` is the pinned discriminant that says WHICH refusal it is, so the operator is told
  * what to do rather than that something broke. The server owns the set and partitions it by WHO must
  * act and by whether anything CAN act: nothing to stop (`unknown-session`), this server holds no
- * handle (`no-surface`), it will not kill it and the operator CAN change that (`taken-over` — force
- * overrides), it will not and NOTHING changes that (`ambiguous-surface`, `liveness-unknown`), the
- * request is malformed (`malformed-request`), or the teardown could not be completed
- * (`stop-failed`). As in `launch.js`, this module mirrors NO copy of that set: it READS a code rather
- * than validating one ({@link stopFailureCode}), so a local copy would gate nothing while still going
- * stale. The one code it does name is {@link TAKEN_OVER_CODE} — not to validate the set, but because
- * that single code is the ONLY one whose refusal this UI can act on ({@link isForceable}). What pins
- * this module against the REAL server — rather than against a second hand-copy of itself — is the
- * stop-flow spec in `@ccctl/e2e`, which drives it against a live ingress.
+ * handle (`no-surface`), it will not kill it and the operator CAN change that (`taken-over` and
+ * `liveness-indeterminate` — force overrides), it will not and NOTHING changes that
+ * (`ambiguous-surface`, `liveness-unknown`), the request is malformed (`malformed-request`), or the
+ * teardown could not be completed (`stop-failed`). As in `launch.js`, this module mirrors NO copy of
+ * that set: it READS a code rather than validating one ({@link stopFailureCode}), so a local copy would
+ * gate nothing while still going stale. The only codes it names are {@link TAKEN_OVER_CODE} and
+ * {@link LIVENESS_INDETERMINATE_CODE} — not to validate the set, but because those are exactly the
+ * refusals this UI can act on ({@link isForceable}). What pins this module against the REAL server —
+ * rather than against a second hand-copy of itself — is the stop-flow spec in `@ccctl/e2e`, which
+ * drives it against a live ingress.
  */
 
 /** Same-origin root of the session namespace — IMPORTED from `command.js`, which owns it. */
@@ -72,13 +73,26 @@ export function sessionStopPath(sessionId) {
 }
 
 /**
- * The ONE refusal an operator can do something about from this UI (`ui-session-stop.ts`): the
- * session has been taken over — someone is driving it at a terminal — and the server will not kill
- * a session a human may be working in. It refuses because it CANNOT KNOW whether that human is
- * there; the operator hitting stop IS that human, saying they want it stopped. That is the whole of
- * what force means, and this is the only code it reaches. See {@link isForceable}.
+ * The refusal an operator can do something about from this UI (`ui-session-stop.ts`): the session has
+ * been taken over — someone is driving it at a terminal — and the server will not kill a session a
+ * human may be working in. It refuses because it CANNOT KNOW whether that human is there; the operator
+ * hitting stop IS that human, saying they want it stopped. See {@link isForceable}.
  */
 export const TAKEN_OVER_CODE = "taken-over";
+
+/**
+ * The other refusal force resolves (#197): the session's backend REACHED its host and the host would
+ * not say what the surface is. The server will not kill what it cannot see unless asked — but the
+ * channel to the surface demonstrably works, so a forced kill really travels and the server really
+ * verifies that it landed. It refuses for want of the operator's say-so, which is the same thing
+ * {@link TAKEN_OVER_CODE} is missing, and the same thing this button supplies.
+ *
+ * Not to be confused with its sibling `liveness-unknown`, which is NOT forceable and never becomes so:
+ * there the host could not be reached at all, so a kill would travel the same dead path and be reported
+ * on by nobody. Two codes, because they are two situations — one the operator can end from here, one
+ * they cannot. See {@link isForceable}.
+ */
+export const LIVENESS_INDETERMINATE_CODE = "liveness-indeterminate";
 
 /**
  * What {@link stopFailureCode} reads when the answer carries no usable code at all. Not a
@@ -181,27 +195,37 @@ export function keepStopControlDisabled({ stopped, currentSessionId, sessionId }
  * Whether a refusal is one the operator can override from here — i.e. whether to offer the "Stop
  * anyway" escalation ({@link stopRequest} with force).
  *
- * TRUE for exactly {@link TAKEN_OVER_CODE} and nothing else, which is the server's rule read
- * faithfully rather than a caution of this UI's own. Offering force anywhere else would be offering
- * a button that cannot work, and on the two refusals that most invite it that is actively harmful:
+ * TRUE for exactly {@link TAKEN_OVER_CODE} and {@link LIVENESS_INDETERMINATE_CODE} and nothing else,
+ * which is the server's rule read faithfully rather than a caution of this UI's own. Both are refusals
+ * the server makes for want of the operator's explicit say-so, and force is that say-so; every other
+ * refusal is one force does not reach, and offering it there would be offering a button that cannot
+ * work. On the two that most invite it that is actively harmful:
  *
  *   - `ambiguous-surface` — the terminal may be running a DIFFERENT session's live worker. Force is
  *     the operator consenting to destroy the session they NAMED; nobody can give that consent on
  *     another session's behalf (#20), so not even force overrides it.
- *   - `liveness-unknown` — the backend could not be read. Forcing on a reading nobody could take is
- *     how a stop reports a kill that did not happen, which is the one answer an emergency-stop must
- *     never give.
+ *   - `liveness-unknown` — the backend could not REACH the host that would read the surface. Forcing
+ *     there sends the kill down the very channel that just failed, and reports "stopped" on the word
+ *     of nobody, which is the one answer an emergency-stop must never give.
+ *
+ * That second one is why this is a two-code list rather than a `startsWith("liveness-")` test (#197):
+ * the two liveness refusals READ alike and behave as opposites — one is the operator's to end, one is
+ * beyond them and beyond force. The server draws that line in `session-release.ts` and spends two wire
+ * codes stating it; matching on the shared prefix would erase it here and hand back the button the
+ * server will refuse.
  *
  * Both are refusals force must not overrule rather than strictness worth relaxing, and the server
  * enforces that regardless — this only keeps the UI from PROMISING an override the server will
  * refuse. A code this build does not recognize is not forceable either: the honest default for an
- * unknown refusal is not to offer a destructive escalation against it.
+ * unknown refusal is not to offer a destructive escalation against it. That default is what kept this
+ * UI correct-if-conservative against a server that grew `liveness-indeterminate` before it did — it
+ * hid a real escalation, which is the safe way to be wrong.
  *
  * @param {unknown} code - a code from {@link stopFailureCode}, or any value.
  * @returns {boolean}
  */
 export function isForceable(code) {
-  return code === TAKEN_OVER_CODE;
+  return code === TAKEN_OVER_CODE || code === LIVENESS_INDETERMINATE_CODE;
 }
 
 /**
