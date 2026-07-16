@@ -25,6 +25,61 @@ Three verbs stand up the local setup:
 Composed, they are the working local setup: `patch` the worker, `serve` the daemon,
 and expose it via a `tunnel`.
 
+### Tailscale ACL provisioning (opt-in)
+
+Both tunnel paths (`serve --tunnel tailscale` and `tunnel tailscale`) expose the daemon
+over the tailnet and refuse unless the node is an authenticated tailnet member. _Which_
+authenticated devices may reach it is the tailnet's own ACL policy — operator-owned state
+`ccctl` relies on and never edits, by default.
+
+You can opt into having `ccctl` add one scoped grant to that policy while the tunnel is up
+(see [ADR-002](../../docs/decisions/adr-002-tailscale-acl-provisioning-model.md)). It is
+**additive**: your own rules are carried through untouched, and a concurrent hand-edit is
+rejected rather than overwritten. It needs **both** variables below — a credential says `ccctl`
+_may_ write policy, a grant says _what_ to write. With either missing, nothing is provisioned
+and the Tailscale API is never called.
+
+| Variable                    | Meaning                                                                                                                                                                                                                                                                                                |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `CCCTL_TAILSCALE_API_TOKEN` | Tailscale API bearer credential. An OAuth client's short-lived access token with the `acl` scope is recommended (least privilege); a raw API access token works too. Read from the environment, sent only as an `Authorization: Bearer` header to `api.tailscale.com` — never persisted, never logged. |
+| `CCCTL_TAILSCALE_ACL_GRANT` | The scoped grant to bracket to the tunnel, as one JSON Tailscale `grants[]` entry.                                                                                                                                                                                                                     |
+
+```bash
+export CCCTL_TAILSCALE_API_TOKEN='tskey-api-…'
+export CCCTL_TAILSCALE_ACL_GRANT='{"src":["you@example.com"],"dst":["tag:ccctl"],"ip":["tcp:443"]}'
+ccctl tunnel tailscale   # the grant is appended as the tunnel comes up
+```
+
+**`ccctl` does not choose who may reach your daemon — you do.** There is deliberately no default
+grant. A grant's `src` is what authorizes _which peers_ may connect, and Tailscale grants are
+allow-only: a policy is the **union** of its grants, so any `src` `ccctl` invented could only ever
+_widen_ your policy, never narrow it. Keep `src` as narrow as the job needs (a user, a `group:`, a
+tag). Set only one of the two variables and `ccctl` says so on the way up and leaves provisioning
+off — rather than half-arming it, or leaving you to infer it from a phone that cannot connect.
+
+Two things to get right about the `dst` tag, or the grant will match nothing and silently do
+nothing: your policy needs a [`tagOwners`](https://tailscale.com/kb/1068/acl-tags) entry for it
+(that declares _who may apply_ the tag — it does not apply it), **and the node must actually carry
+the tag** (`tailscale login --advertise-tags=tag:ccctl`, the admin console, or the API).
+
+> **Known limitation — `ccctl` does not revert the grant yet ([#242]).** The adapter removes the
+> grant on tunnel teardown, but **no CLI verb tears a tunnel down**: `tailscale serve --bg` is a
+> detached mapping that deliberately outlives `ccctl tunnel`, and `serve --tunnel`'s shutdown path
+> closes the daemon without touching the tunnel. So today the grant is appended and left in place.
+> Consequences while this stands: a repeated `ccctl tunnel tailscale` appends **another copy** of
+> the grant each run, and a grant **outlives** a tunnel you turn off by hand
+> (`tailscale serve … off`). What is left behind is exactly the grant _you_ declared — nothing
+> `ccctl` chose, and no rule of yours is touched — but remove stale copies from your policy by hand
+> until [#242] lands.
+
+> **The token is visible to launched workers.** `ccctl serve` passes its environment to the
+> `claude` workers it launches, so anything in it — including this token — is readable by a
+> session. That is true of your whole environment, not something `ccctl` adds, but an `acl`-scoped
+> tailnet credential is worth the thought: prefer a short-lived OAuth token, and export it only for
+> the `ccctl tunnel` invocation if you would rather workers never see it.
+
+[#242]: https://github.com/alexey-pelykh/ccctl/issues/242
+
 ## Session launch/attach
 
 Three verbs drive a **running** daemon's browser-facing session namespace (`/api/sessions`)
@@ -91,6 +146,9 @@ thin executable entry (shebang + argv parse), `src/index.ts` builds the command 
 `src/dependencies.ts` wires the real daemon / tunnel / patcher / session-client / launcher /
 device-store seams (injectable so the verbs are unit-testable without binding a socket or spawning a
 process), `src/worker-command.ts` builds the patched worker's `remote-control` argv and
-binds the patched-binary path (`CCCTL_CLAUDE_BIN`), and `src/session-client.ts` is the real
-`fetch`-based `/api/sessions` client the launch/attach verbs drive. Depends on [`@ccctl/core`](../core),
+binds the patched-binary path (`CCCTL_CLAUDE_BIN`), `src/tailscale-acl.ts` reads the opt-in Tailscale
+API credential (`CCCTL_TAILSCALE_API_TOKEN`) and the operator-declared scoped grant
+(`CCCTL_TAILSCALE_ACL_GRANT`) and composes the ACL-aware Tailscale tunnel `dependencies.ts`
+installs, and `src/session-client.ts` is the
+real `fetch`-based `/api/sessions` client the launch/attach verbs drive. Depends on [`@ccctl/core`](../core),
 [`@ccctl/server`](../server), and [`@ccctl/tunnel-adapters`](../tunnel-adapters).
