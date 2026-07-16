@@ -362,9 +362,12 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
     # darwin: make the shipped prebuilt spawn-helper executable (it ships 644; nothing chmods it).
     chmod +x node_modules/.pnpm/node-pty@*/node_modules/node-pty/prebuilds/darwin-$(uname -m | sed 's/^x86_64$/x64/')/spawn-helper
 
-    # linux: flip `allowBuilds.node-pty` to true in pnpm-workspace.yaml, then reinstall — node-gyp
-    # then produces build/Release/spawn-helper, which the linker marks executable and which takes
-    # load precedence over prebuilds/.
+    # linux: flip `allowBuilds.node-pty` to true in pnpm-workspace.yaml, then reinstall — with no
+    # prebuild to find, prebuild.js exits 1, `|| node-gyp rebuild` runs, and build/Release/pty.node
+    # is what loadNativeModule then prefers. spawn-helper is NOT part of the Linux story at all:
+    # binding.gyp gates that target on OS=="mac", and pty.cc reads helper_path only under
+    # `#if defined(__APPLE__)` — the Linux path calls forkpty(3). So darwin's mode-644 trap has no
+    # Linux counterpart. UNVERIFIED: read off binding.gyp + pty.cc, not run (no Linux box).
     pnpm install
 
     CCCTL_E2E=1 CCCTL_E2E_PTY=1 pnpm --filter @ccctl/e2e test:e2e
