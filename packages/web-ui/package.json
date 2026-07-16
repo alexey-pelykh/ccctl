@@ -25,6 +25,7 @@
     "dev": "echo \"serve this directory statically, e.g. npx serve .\""
   },
   "devDependencies": {
+    "jsdom": "^29.1.1",
     "vitest": "^4.1.9"
   }
 }
