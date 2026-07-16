@@ -322,9 +322,11 @@ describe("explicit transitions (AC: per-session, one transition never mutates an
 });
 
 // #39 AC4 (per-session half): "Classification is per-session … " — a frame applied to one
-// session never moves another's. The frame-age half of AC4 is NOT enforced here: the wire
-// carries no frame timestamp to order by, so applications are last-write-wins in the server's
-// receipt order (see the note above `capturedRequiresActionDetail` in index.ts).
+// session never moves another's. The ordering half of AC4 is not enforced HERE but one layer up:
+// #201 gives the frame a `sequence_num` and the server refuses a stale one at ingress, where the
+// per-epoch high-water mark lives. Every frame that reaches these pure transitions has already
+// cleared that guard, so among them the last still wins (see the note above
+// `capturedRequiresActionDetail` in index.ts).
 describe("per-session classification (#39 AC4: one session's frame never moves another's)", () => {
   it("applies each session's own frames independently, across both transitions", () => {
     const a = applyWorkerStatusFrame(
@@ -341,10 +343,13 @@ describe("per-session classification (#39 AC4: one session's frame never moves a
     expect(a.activity).toEqual({ kind: "running" });
   });
 
-  it("is last-write-wins in receipt order, so a later frame always lands", () => {
-    // No frame-age guard: the wire has no timestamp, and a clock-derived guard could only
-    // refuse frames it cannot prove are stale — silently dropping a `requires_action` is a
-    // far worse failure than applying an out-of-order one.
+  it("is last-write-wins among the frames that reach it, so a later frame always lands", () => {
+    // No frame-age guard lives at THIS layer, by design: these transitions are pure and hold no
+    // ordering state, and the model must never refuse on a clock — #39 proved a clock-derived
+    // guard silently drops a `requires_action`, far worse than applying an out-of-order frame.
+    // Ordering is decided at the server's ingress instead (#201), against a worker-stamped
+    // sequence. `now` going BACKWARD here (T0+50 after T0+100) is exactly that: not a staleness
+    // signal the model may act on, just an earlier timestamp.
     const running = applyWorkerStatusFrame(
       createSession("sess-1", "default", T0),
       statusFrame({ status: "running" }),

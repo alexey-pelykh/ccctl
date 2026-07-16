@@ -83,13 +83,37 @@ async function registerWorker(server: CcctlServer, sessionId: string): Promise<n
   return ((await res.json()) as { worker_epoch: number }).worker_epoch;
 }
 
-/** §4 — PUT the worker status gate. */
-function putStatus(server: CcctlServer, sessionId: string, epoch: number, status: string): Promise<Response> {
+/**
+ * §4 — PUT the worker status gate. `sequence_num` is the OPTIONAL #201 ordering stamp: omitting it
+ * (the default) is what an older worker build sends, so every pre-#201 caller below stays a
+ * faithful un-stamped frame.
+ */
+function putStatus(
+  server: CcctlServer,
+  sessionId: string,
+  epoch: number,
+  status: string,
+  sequenceNum?: unknown,
+): Promise<Response> {
   return fetch(`${base(server)}${workerChannelPath(sessionId)}`, {
     method: "PUT",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ worker_status: status, worker_epoch: epoch, external_metadata: {} }),
+    body: JSON.stringify({
+      worker_status: status,
+      worker_epoch: epoch,
+      external_metadata: {},
+      ...(sequenceNum === undefined ? {} : { sequence_num: sequenceNum }),
+    }),
   });
+}
+
+/** A §5 `worker_status` control_event payload, optionally #201-stamped. */
+function statusFrame(status: string, sequenceNum?: unknown): unknown {
+  return {
+    type: "control_event",
+    subtype: "worker_status",
+    payload: { status, ...(sequenceNum === undefined ? {} : { sequence_num: sequenceNum }) },
+  };
 }
 
 /** §5 — POST a batch of raw payloads up worker/events. */
@@ -339,6 +363,225 @@ describe("§4 worker-state restore — GET /v1/code/sessions/{id}/worker (method
     expect((await getWorkerState(server, sessionId)).status).toBe(200);
     expect((await putStatus(server, sessionId, epoch, "idle")).status).toBe(200);
     expect(server.sessions.get(sessionId)?.activity.kind).toBe("idle");
+  });
+});
+
+// --- #201: worker_status frame ordering — the emitter stamps `sequence_num`, the server refuses a
+// frame stamped below the highest it has applied. #39's AC4 ("monotonic by the frame's timestamp")
+// could not be met on a wire that carried no frame age at all; this is the signal that gives it one.
+describe("§4/§5 worker_status ordering by `sequence_num` (#201)", () => {
+  it("applies the newer frame and refuses the older one — §4 (AC2)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // seq 2 lands…
+    expect((await putStatus(server, sessionId, epoch, "requires_action", 2)).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+
+    // …then seq 1 arrives LATE. Without the guard this is last-write-wins and clobbers the session
+    // back to `running` — the stale-frame bug #201 exists to close. It answers 200 (the worker did
+    // nothing wrong) but must not move the classification.
+    expect((await putStatus(server, sessionId, epoch, "running", 1)).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+  });
+
+  it("applies the newer frame and refuses the older one — §5 (AC2)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    expect((await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 2)])).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+
+    expect((await postWorkerEvents(server, sessionId, epoch, [statusFrame("running", 1)])).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+  });
+
+  it("refuses a stale frame sitting BEHIND a newer one in the SAME §5 batch", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // Entries in one batch apply in order, so a batch would otherwise land on its LAST status —
+    // the mark advances per entry, so the guard governs within a batch exactly as it does across
+    // them. A reorder that lands inside one batch is the §5 leg's own version of the race.
+    expect(
+      (await postWorkerEvents(server, sessionId, epoch, [statusFrame("idle", 9), statusFrame("running", 4)])).status,
+    ).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("idle");
+  });
+
+  it("orders across BOTH legs from one counter — a stale §5 frame cannot undo a newer §4 one", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // The worker stamps ONE per-session counter over its status frames, whichever leg carries them,
+    // so the high-water mark a §4 frame sets governs a §5 frame too (and vice versa).
+    expect((await putStatus(server, sessionId, epoch, "requires_action", 5)).status).toBe(200);
+    expect((await postWorkerEvents(server, sessionId, epoch, [statusFrame("running", 4)])).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+
+    // …and the reverse direction: a §5 frame's mark governs the §4 gate.
+    expect((await postWorkerEvents(server, sessionId, epoch, [statusFrame("idle", 9)])).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "running", 8)).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("idle");
+  });
+
+  it("applies an UNSTAMPED frame — an older worker build is unaffected (AC1: absent ⇒ last-write-wins)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // Refusal needs positive proof of staleness; absence is not proof. So a build that stamps
+    // nothing keeps exactly its pre-#201 behavior — last-write-wins — on both legs.
+    expect((await putStatus(server, sessionId, epoch, "requires_action", 7)).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "running")).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("running");
+
+    expect((await postWorkerEvents(server, sessionId, epoch, [statusFrame("idle")])).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("idle");
+  });
+
+  it("leaves the high-water mark intact across an unstamped frame — one gap does not re-open the session", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "requires_action", 7)).status).toBe(200);
+    // An unstamped frame says nothing about ORDER, so it applies but must not forfeit the ordering
+    // seq 7 established — otherwise one un-stamped frame re-opens the session to every stale frame.
+    expect((await putStatus(server, sessionId, epoch, "running")).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "idle", 6)).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("running");
+  });
+
+  it("applies an EQUAL sequence — a duplicate re-send is not `older`", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // Refusing `==` would wedge any worker that stamps a constant; re-applying merely re-affirms.
+    expect((await putStatus(server, sessionId, epoch, "running", 3)).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "requires_action", 3)).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+  });
+
+  it("treats a MALFORMED sequence as absent rather than refusing — garbage is not proof of staleness", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "running", 4)).status).toBe(200);
+    // Each is unusable as an order, so each collapses to "no ordering signal" ⇒ the frame applies.
+    // Left un-narrowed, a string would poison the mark (`4 < "abc"` is false forever after).
+    // `NaN`/`Infinity` are absent here deliberately: `JSON.stringify` renders both as `null`, so
+    // they cannot reach a handler over the wire at all — `bridge-protocol.test.ts` covers them
+    // directly against the narrowing function, which is the only place they are reachable.
+    for (const malformed of ["abc", 1.5, -1, null, true, { seq: 9 }]) {
+      expect((await putStatus(server, sessionId, epoch, "idle", malformed)).status).toBe(200);
+      expect(server.sessions.get(sessionId)?.activity.kind).toBe("idle");
+      expect((await putStatus(server, sessionId, epoch, "running", 4)).status).toBe(200);
+      expect(server.sessions.get(sessionId)?.activity.kind).toBe("running");
+    }
+  });
+
+  it("RESETS the mark on a re-register, so a new worker generation is never wedged (AC3)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "idle", 900)).status).toBe(200);
+
+    // A re-register is a NEW worker generation whose counter restarts at its own beginning. Were the
+    // mark carried across epochs (as `nextSeq` deliberately is), every frame of the new generation
+    // would be refused as "stale" — a permanently wedged session, the exact failure AC3 forbids.
+    const fresh = await registerWorker(server, sessionId);
+    expect((await putStatus(server, sessionId, fresh, "requires_action", 1)).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+  });
+
+  it("never lets a refusal drop a `requires_action` that arrives in order (AC3: cannot wedge)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // The guard reads no clock — only two worker-supplied integers — so it has no wall-clock step to
+    // freeze on. After refusing a genuinely stale frame it must still pass the NEXT in-order one,
+    // which is precisely what #39's removed clock-derived guard could not promise.
+    expect((await putStatus(server, sessionId, epoch, "running", 10)).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "idle", 2)).status).toBe(200); // refused
+    expect((await putStatus(server, sessionId, epoch, "requires_action", 11)).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+  });
+
+  it("DROPS a refused §5 frame from the UI relay too — the browser never renders a ruled-stale turn", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    const fresh = statusFrame("requires_action", 2);
+    await postWorkerEvents(server, sessionId, epoch, [fresh]);
+    // The requires_action ALSO raises #43's server-originated "needs input" event, so two events
+    // land for the fresh frame; a relayed stale frame would be a third.
+    await waitFor(() => ui.received().length >= 2);
+
+    const stale = statusFrame("running", 1);
+    await postWorkerEvents(server, sessionId, epoch, [stale]);
+    // A transcript line behind it proves the relay is still live and ordered — so the stale frame's
+    // absence below is a real drop, not a race with a slow stream.
+    const line = { type: "control_event", subtype: "message", payload: { text: "after" } };
+    await postWorkerEvents(server, sessionId, epoch, [line]);
+    await waitFor(() => ui.received().some((event) => (event.data ?? "").includes("after")));
+
+    const payloads = ui.received().map((event) => JSON.parse(event.data ?? "null"));
+    // The browser renders a worker_status as the LIVE current turn (never transcript history), so a
+    // frame the model ruled stale must not reach it — it would read "Running…" over a session that
+    // is blocked on the operator, with no later frame coming to correct it.
+    expect(payloads).not.toContainEqual(stale);
+    // The fresh frame and the ordinary transcript line still relay verbatim: the drop is scoped to
+    // frames the guard actually refused, and never rewrites what it does forward (#13/#15).
+    expect(payloads).toContainEqual(fresh);
+    expect(payloads).toContainEqual(line);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+  });
+
+  it("preserves the §5 rich `detail` when its bare §4 twin wins the race — both legs share one seq", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // ONE `requires_action` report is emitted on BOTH legs: §5 carries the human detail, §4 is bare.
+    // Per the emitter contract they share a sequence, so whichever loses the body-reader race still
+    // applies (`==` is not stale) and the detail survives. Were they stamped CONSECUTIVELY, a §4
+    // that won would refuse its own §5 twin and the detail would be lost for the whole time the
+    // session sits blocked — there is no next §5 until the next transition.
+    expect((await putStatus(server, sessionId, epoch, "requires_action", 4)).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity).toEqual({
+      kind: "requires_action",
+      detail: DEFAULT_REQUIRES_ACTION_DETAIL, // the bare §4 leg alone knows no better…
+    });
+
+    const rich = {
+      type: "control_event",
+      subtype: "worker_status",
+      payload: { status: "requires_action", detail: "Approve the edit to src/index.ts?", sequence_num: 4 },
+    };
+    expect((await postWorkerEvents(server, sessionId, epoch, [rich])).status).toBe(200);
+    // …and the §5 twin, arriving second with the SAME seq, still lands and supplies it (#43 reads it).
+    expect(server.sessions.get(sessionId)?.activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve the edit to src/index.ts?",
+    });
+
+    // The reverse order holds too: the bare §4 twin must not degrade a detail its §5 twin captured.
+    expect((await putStatus(server, sessionId, epoch, "requires_action", 4)).status).toBe(200);
+    expect(server.sessions.get(sessionId)?.activity).toEqual({
+      kind: "requires_action",
+      detail: "Approve the edit to src/index.ts?",
+    });
   });
 });
 
@@ -1580,6 +1823,33 @@ describe("§4/§5 structured logging — detection + notification (#61)", () => 
         (event) => event.category === "notification" && event.event === "idle" && event.sessionId === sessionId,
       ),
     ).toBe(true);
+  });
+
+  it("emits a detection `stale-frame` event when the ordering guard refuses a frame (#201 AC3)", async () => {
+    const events: LogEvent[] = [];
+    const server = await startLoggingServer(events);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    expect((await putStatus(server, sessionId, epoch, "requires_action", 2)).status).toBe(200);
+    expect((await putStatus(server, sessionId, epoch, "running", 1)).status).toBe(200);
+
+    // AC3: "a refused frame is observable (metric/log), not silent". The guard #39 removed answered
+    // 200 and silently discarded the frame, so a wedged operator had no way to see why.
+    const refusals = events.filter((event) => event.category === "detection" && event.event === "stale-frame");
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toMatchObject({
+      level: "warn",
+      sessionId,
+      // The activity the session KEEPS — a refusal is precisely the absence of a transition.
+      activity: "requires_action",
+    });
+    expect(refusals[0]?.detail).toContain("seq 1");
+    // …and a refusal is NOT a transition, so it leaves no `activity` line claiming one.
+    const activityKinds = events
+      .filter((event) => event.category === "detection" && event.event === "activity")
+      .map((event) => (event.category === "detection" ? event.activity : ""));
+    expect(activityKinds).toEqual(["requires_action"]);
   });
 
   it("never emits a detection `activity` event on a same-kind frame — only real transitions are logged", async () => {
