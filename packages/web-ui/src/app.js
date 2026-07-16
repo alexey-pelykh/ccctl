@@ -53,7 +53,7 @@ import {
 import { diffSessionList, nextSelection, notificationsDegraded, sessionCursor, laterCursor } from "./sessions.js";
 import { connectionHealth } from "./connection.js";
 import { applyPairingToken, authHeader } from "./pairing.js";
-import { DEVICES_PATH, deviceLabel, isCurrentDevice, isRenderableDevice } from "./devices.js";
+import { DEVICES_PATH, deviceLabel, deviceRevokePath, isCurrentDevice, isRenderableDevice } from "./devices.js";
 import { launchRequest, launchFailure, describeLaunchAccepted } from "./launch.js";
 import { sessionStopPath, stopRequest, stopFailure, describeStopAccepted, keepStopControlDisabled } from "./stop.js";
 import {
@@ -1242,9 +1242,10 @@ function refreshSessionsNow() {
 
 /**
  * Build one device row: a `<li>` keyed by device id — the stable identity a per-device revoke
- * (W6-19, AC3) will hang off — carrying the device's label (name + last-seen, AC1). The current
- * device (AC2) is marked with a `data-current` flag (styled distinctly) plus an appended
- * "· this device" note, so it reads as the current one to sighted and screen-reader users alike.
+ * (W6-19, AC3) hangs off — carrying the device's label (name + last-seen, AC1) and a Revoke
+ * button. The current device (AC2) is marked with a `data-current` flag (styled distinctly) plus
+ * an appended "· this device" note, so it reads as the current one to sighted and screen-reader
+ * users alike.
  */
 function createDeviceRow(device) {
   const li = document.createElement("li");
@@ -1257,6 +1258,15 @@ function createDeviceRow(device) {
     note.textContent = " · this device";
     li.appendChild(note);
   }
+  // The per-device revoke affordance (W6-19, AC3): revoke THIS row's device by its stable id, then
+  // re-list. Rendered on every row so an operator can de-authorise any paired device (including the
+  // current one — e.g. a shared browser).
+  const revoke = document.createElement("button");
+  revoke.type = "button";
+  revoke.dataset.revoke = "true";
+  revoke.textContent = "Revoke";
+  revoke.addEventListener("click", () => submitRevoke(device.id));
+  li.appendChild(revoke);
   return li;
 }
 
@@ -1302,6 +1312,33 @@ async function loadDevices() {
   }
   const devices = Array.isArray(payload?.devices) ? payload.devices : [];
   applyDeviceList(devices);
+}
+
+/**
+ * Revoke one paired device (#81 / W6-19, AC3): DELETE its `/api/devices/{id}`, then re-list so the
+ * revoked device drops out and the operator sees the current registry. Like {@link loadDevices},
+ * this rides ahead of the server route — until the credentialed wave wires
+ * `DELETE /api/devices/{id}` and the token verification a revoke enforces, the request surfaces the
+ * server's refusal as the same inline error row (the accepted walking-skeleton state, exactly as
+ * `pairing.js` applies a token ahead of enforcement). A failure never throws out of the click
+ * handler. The at-rest token invalidation this drives server-side — the revoked device's token
+ * refused on next use (AC1), every other device still working (AC2) — is the `revokeDevice`
+ * primitive's job in `@ccctl/core`.
+ */
+async function submitRevoke(id) {
+  try {
+    const response = await fetch(deviceRevokePath(id), { method: "DELETE", headers: authHeader(localStorage) });
+    if (!response.ok) {
+      throw new Error(`revoke failed (${response.status})`);
+    }
+  } catch (error) {
+    const li = document.createElement("li");
+    li.dataset.error = "true";
+    li.textContent = `could not revoke device: ${error.message}`;
+    deviceListEl.replaceChildren(li);
+    return;
+  }
+  await loadDevices();
 }
 
 /**

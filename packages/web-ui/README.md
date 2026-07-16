@@ -88,13 +88,17 @@ device clearly marked**. It is a management surface distinct from the per-sessio
 flow: `src/devices.js` owns the row label / relative last-seen / current-device
 decisions, and `app.js` fetches `GET /api/devices` on load and on a manual
 **Refresh** (devices change rarely — pair / rename / revoke — so it is not
-auto-polled like the session list). Each row is keyed by **device id** — the entry
-point a per-device **revoke** (W6-19) will hang off. The route and its server-set
-`current` marker land with the credentialed wave (#84 persists the device store
-hashed + named + listable; the server-side token verification that computes
-`current` is deferred), so until then the surface renders against the mirrored
-contract — exactly as the QR-pair token application (#74) runs ahead of server-side
-enforcement.
+auto-polled like the session list). Each row is keyed by **device id** and carries a
+per-device **Revoke** button (#81 / W6-19): revoking `DELETE`s `/api/devices/{id}` and
+re-lists, so a lost phone can be de-authorised without disturbing the operator's other
+devices. The revoke route, the list route, and the server-set `current` marker (which the
+token verification a revoke enforces also computes) land with the credentialed wave (#84
+persists the device store hashed + named + listable; the server-side verification is
+deferred) — so until then the surface renders, and the Revoke button posts, against the
+mirrored contract, exactly as the QR-pair token application (#74) runs ahead of server-side
+enforcement. The core `revokeDevice` primitive (drop the device — and its at-rest token
+hash — from the store) ships in `@ccctl/core` now, so that future route is a thin
+`load → revokeDevice → save`.
 
 The UI is also a **PWA** with **Web-Push** (#51). A `manifest.webmanifest`, a
 `sw.js` service worker (registered from `app.js` on load) and a scalable

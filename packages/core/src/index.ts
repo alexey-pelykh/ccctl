@@ -2009,6 +2009,31 @@ export interface DeviceStoreSnapshot {
 }
 
 /**
+ * Revoke a single paired device (#81 / W6-19), returning a NEW {@link DeviceStoreSnapshot} with
+ * the device whose {@link PairedDevice.id} is `id` removed and EVERY other device — and the
+ * snapshot `version` — preserved unchanged. This is the invalidation primitive behind per-device
+ * revoke: dropping the record drops the {@link DeviceTokenHash} that is the token's ONLY at-rest
+ * projection (a {@link PairedDevice} persists the hash, never the raw {@link DeviceToken}), so a
+ * hash-and-compare verifier — the credentialed-wave ingress guard that hashes a presented token
+ * ({@link https://ccctl | @ccctl/server}'s `hashDeviceToken`) and looks it up here — finds no
+ * match and refuses that token on its next use (AC1), while the untouched records keep every
+ * other device working (AC2): one operator loses a lost phone, not their tablet and laptop.
+ *
+ * Pure — never mutates the input snapshot or its records, so revoking one device provably cannot
+ * touch another's (the same non-mutating discipline {@link renameDevice} / {@link touchDevice}
+ * keep; `filter` builds a fresh array and the surviving records ride through by reference,
+ * unchanged). Order-preserving. Idempotent over an absent id: revoking an id no device carries
+ * returns an equal (freshly built) snapshot rather than throwing — "revoke this device" and
+ * "this device is already gone" share the same desired end state, so a double-revoke (or one
+ * racing a concurrent one) is a no-op, never an error. A revoke is persisted the same way any
+ * snapshot change is — {@link IDeviceStore.save} of the returned snapshot — so it needs no new
+ * store primitive.
+ */
+export function revokeDevice(snapshot: DeviceStoreSnapshot, id: string): DeviceStoreSnapshot {
+  return { ...snapshot, devices: snapshot.devices.filter((device) => device.id !== id) };
+}
+
+/**
  * The persistence seam for the paired-device registry: load the last
  * {@link DeviceStoreSnapshot} on start, save it on change. Runtime-agnostic by design — the
  * interface names no I/O primitive, so a backend is free to be a single-file JSON snapshot

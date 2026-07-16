@@ -149,6 +149,11 @@
         padding: 0.25rem 0;
         border-bottom: 1px solid #eee;
       }
+      /* The per-device Revoke control (#81, AC3): a small inline action trailing each row. */
+      #device-list li button[data-revoke="true"] {
+        margin-left: 0.5rem;
+        font-size: 0.85em;
+      }
       #device-list li[data-current="true"] {
         font-weight: 700;
         color: #047857;
