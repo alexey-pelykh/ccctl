@@ -59,7 +59,7 @@ the tests stay green.
 
 ## Baseline posture
 
-The baseline is four guarantees, each detailed below:
+The baseline is five guarantees, each detailed below:
 
 1. **Localhost-bind by default** — the server binds loopback; nothing is reachable
    off-box until a tunnel is explicitly attached.
@@ -70,6 +70,10 @@ The baseline is four guarantees, each detailed below:
    certificate (mechanism now; live TLS handshake at [#67]).
 4. **Mandatory tunnel auth** — off-box access is only ever through an outbound
    tunnel whose auth is mandatory; an unauthorized device can never reach the daemon.
+5. **Local control floor** — the operator can always kill sessions / revoke every
+   device / stop the server from the local machine, even with a lost phone and every
+   device token revoked. Device-auth gates _remote_ control; it never gates the local
+   control path.
 
 ### Localhost-bind by default
 
@@ -153,6 +157,48 @@ tunnel, placed on its outputs, written to session state or a snapshot, or logged
 Provisioning is off unless explicitly wired, so the default posture above is
 unchanged.
 
+### Local control floor
+
+Device-auth (the QR-pair device tokens, and the tunnel membership above) gates
+**remote** control — a phone reaching the daemon over the tunnel. It must **never**
+gate the **local** control path: the operator sitting at the machine has to be able
+to kill sessions, revoke every device, and stop the server **even with a lost phone
+and every device token revoked**. Otherwise a panic control could lock out the very
+operator it exists for. So the floor is: **local/CLI control works without a valid
+device token, and that token-free path is local-only — never reachable over the
+tunnel.**
+
+The floor is **structural**, not a promise a future check must remember to make: the
+local controls are **out-of-band** — they never traverse the (future, deferred)
+device-auth-gated HTTP surface at all, so device-auth _cannot_ gate them by
+construction. Two controls carry it:
+
+- **Revoke every device — `ccctl revoke-all` (#88).** A direct operation on the
+  server-side device store (empty the registry, drop every at-rest token hash), with
+  **no daemon, no tunnel adapter, and no network round-trip** — so it works even when
+  the daemon or its tunnel is down, which is exactly when a panic control is reached.
+- **Stop the server — a local shutdown signal (#82).** `ccctl serve` arms `SIGTERM`
+  and `SIGINT` (`Ctrl-C`, or `kill <pid>`) for a **graceful** shutdown: the daemon
+  closes down — releasing every session it launched (a taken-over one is left running
+  for the operator, per the emergency-stop rules) — and exits. Like the diagnostic
+  signals (#62/#63), a POSIX signal's authorization is the OS's own — deliverable
+  only by a same-uid (or root) process on the **same host**, unreachable over any
+  network or tunnel — so it is "local auth" in its strongest form and adds no HTTP
+  route. A second signal while the graceful close is still in flight force-exits, and
+  a close that fails is recorded on the trail as `error`/`shutdown-failed` and still
+  exits — a failed graceful stop is still a stop. Stopping the daemon is the operator's
+  ultimate local kill: every session it owns goes down with it.
+
+Per-session **local** stop over loopback (`ccctl stop <id>` → `POST
+/api/sessions/{id}/stop`) shares the browser-facing namespace the phone drives, so it
+is reachable over the tunnel too — but the _token-free_ exemption above is scoped to
+the two out-of-band controls, which are not. **Forward-looking (the deferred
+credentialed wave).** When per-request local-server auth (#57/#58) and the
+device-token verifier land, device-token verification MUST be scoped to **remote**
+(over-the-tunnel) requests; a local request is authorized by the operator-owned
+local-server-auth secret (or, for the out-of-band controls, OS process ownership) and
+**never** by a device token. This floor is the invariant that wave must preserve.
+
 ## Credential boundary
 
 `ccctl` handles several distinct credentials, and keeping them separate is
@@ -232,7 +278,8 @@ The trail records six event categories: **session** lifecycle
 (environment-registered / session-created / work-delivered), **detection**
 (activity / worker-registered / stale), **notification** (awaiting-input / idle),
 **error** (bind-refused / boot-rejected / listen-failed / launch-failed /
-stop-failed), and the on-demand **diagnostic** category (the #62 / #63 surfaces
+stop-failed / shutdown-failed / shutdown-arm-failed), and the on-demand
+**diagnostic** category (the #62 / #63 surfaces
 below). Each event is one JSON line, routed by level — `error` / `warn` to stderr,
 everything else to stdout — so the trail is machine-parseable (`… | jq`). It is
 **off by default** in the library (a no-op logger) and turned on by the CLI daemon.

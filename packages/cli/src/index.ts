@@ -68,6 +68,7 @@ import {
   resolveBindHost,
   resolveHeapSnapshotDir,
   revokeAllPairedDevices,
+  SHUTDOWN_SIGNALS,
   type SessionLaunchOptions,
   type SessionStopOptions,
   type StopAcceptedWire,
@@ -339,6 +340,13 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       // auth, the same choice as the heap snapshot). Same one shared #61 sink; disposer not held (the
       // handler lives for the daemon's lifetime and process exit tears it down).
       deps.installInspectorDiagnosticsHandler({ logger });
+      // Arm the local-shutdown floor (#82): SIGTERM/SIGINT gracefully closes the daemon — releasing
+      // every session this server owns — and exits, an OS-signal control unreachable over the tunnel
+      // and needing no device token (the "stop the server from the local machine" half of the floor,
+      // sibling to `ccctl revoke-all`). Armed AFTER the server binds so there is a bound server to
+      // close; the disposer is intentionally not held (the handler lives for the daemon's lifetime and
+      // process exit tears it down), matching the two diagnostic handlers above.
+      deps.installShutdownHandler({ server, logger });
       // Report the address actually bound (`server.address` carries the resolved port,
       // which matters when `--port 0` selects an ephemeral one).
       console.log(`ccctl: serving on ${serverUrl(server.address.host, server.address.port)}`);
@@ -350,6 +358,12 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       );
       console.log(
         `ccctl: inspector attach + FD/handle report on ${INSPECTOR_DIAGNOSTICS_SIGNAL} (\`kill -s ${INSPECTOR_DIAGNOSTICS_SIGNAL} ${process.pid}\`) → loopback inspector URL + counts on the trail`,
+      );
+      // The local-control floor (#82): how to stop the daemon from the box — a graceful shutdown on
+      // Ctrl-C or SIGTERM that needs no device token and is unreachable over the tunnel. Paired with
+      // `ccctl revoke-all`, it is the always-available local recovery even with a lost/all-revoked phone.
+      console.log(
+        `ccctl: stop the daemon with ${SHUTDOWN_SIGNALS.join(" / ")} (Ctrl-C, or \`kill ${process.pid}\`) → graceful local shutdown, no device token needed`,
       );
 
       if (kind !== undefined) {

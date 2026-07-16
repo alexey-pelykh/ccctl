@@ -24,6 +24,7 @@ import {
   createTmuxSessionLauncher,
   installHeapSnapshotSignalHandler,
   installInspectorDiagnosticsSignalHandler,
+  installShutdownSignalHandler,
   startServer,
   type CcctlServer,
   type ISessionLauncher,
@@ -91,6 +92,18 @@ export interface CliDependencies {
    * so a report (or a failure) rides the daemon's #61 trail.
    */
   readonly installInspectorDiagnosticsHandler: (options: { readonly logger: Logger }) => () => void;
+  /**
+   * Arm the daemon's local-shutdown trigger (#82) — install the {@link https://ccctl | SHUTDOWN_SIGNALS}
+   * (`SIGTERM` + `SIGINT`) handlers that gracefully close the running daemon and exit, and return a
+   * disposer. {@link installShutdownSignalHandler} in production. This is the "stop the server from the
+   * local machine" half of the local-control floor — an OUT-OF-BAND, device-auth-independent control
+   * (an OS signal, unreachable over the tunnel), the sibling of `revoke-all`. Behind a seam so `serve`
+   * is exercised WITHOUT registering a real process-global signal handler or a real `process.exit`
+   * (either would leak across / kill the test process), the same determinism discipline as the seams
+   * above. Takes the bound {@link https://ccctl | CcctlServer} to close and the daemon's structured-log
+   * sink so a FAILED shutdown rides the daemon's #61 trail.
+   */
+  readonly installShutdownHandler: (options: { readonly server: CcctlServer; readonly logger: Logger }) => () => void;
   /**
    * Render a scannable terminal QR of `text` — the QR-pair onboarding block `serve` / `tunnel`
    * print after a tunnel is up (#74) — {@link defaultRenderQr} (a zero-dependency `qrcode-terminal`)
@@ -167,6 +180,11 @@ export const defaultDependencies: CliDependencies = {
   deviceStore: createFileDeviceStore(),
   installHeapSnapshotHandler: (options) => installHeapSnapshotSignalHandler(options),
   installInspectorDiagnosticsHandler: (options) => installInspectorDiagnosticsSignalHandler(options),
+  // Arm the local-shutdown floor (#82): SIGTERM/SIGINT gracefully closes the daemon (releasing every
+  // server-owned session) and exits — an OS-signal control, unreachable over the tunnel and needing no
+  // device token, the sibling of `revoke-all`. The real `process` and `process.exit` are wired by
+  // installShutdownSignalHandler's own defaults; the daemon passes the bound server + its #61 sink.
+  installShutdownHandler: (options) => installShutdownSignalHandler(options),
   renderQr: defaultRenderQr,
   // Compose the tmux backend (#29) behind the fallback launcher composite (#31) — the documented
   // composition-root shape — driving the production `remote-control` worker-argv builder (#157) on

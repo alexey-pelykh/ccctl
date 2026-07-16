@@ -178,6 +178,21 @@ export {
   type InspectorOutcome,
 } from "./inspector-diagnostics.js";
 
+// Local daemon shutdown on a termination signal (#82) — the "stop the server from the local machine"
+// half of the LOCAL CONTROL FLOOR (security-posture.md § "Local control floor"): an OUT-OF-BAND local
+// control that gracefully closes the daemon (releasing every server-owned session) on SIGTERM/SIGINT.
+// Because it rides an OS signal — same-uid-local, unreachable over the tunnel — and adds no HTTP route,
+// it is DEVICE-AUTH-INDEPENDENT by construction (AC1/AC2), the sibling of `ccctl revoke-all` (#88). The
+// CLI arms it at the daemon composition root; the seams are injectable for deterministic tests (no real
+// process-global handler, no real process.exit). Defined and unit-tested in shutdown-signal.ts.
+export {
+  installShutdownSignalHandler,
+  SHUTDOWN_SIGNALS,
+  type ExitFn,
+  type ShutdownableServer,
+  type ShutdownSignalDeps,
+} from "./shutdown-signal.js";
+
 // Re-export the browser-facing session-namespace wire types (#20 list, #31 launch) on the
 // public surface, for the SAME contract-consumer reason as the §2 session-create wire above:
 // a UI client — the web UI, and now the `ccctl` CLI's launch/attach on-ramp (#38) — asserts
