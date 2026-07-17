@@ -42,6 +42,19 @@
  *     green live run means the golden encodes the wire a real worker actually speaks.
  *     Fenced on CCCTL_E2E + CCCTL_SDK_URL + ANTHROPIC_API_KEY; skips-never-fakes (see
  *     `control-plane.e2e.test.ts`); and
+ *   - the fenced, self-classifying ASKUSERQUESTION PHONE-SURFACING gate (#266, #78 AC4) —
+ *     {@link driveLiveAskOracle} + {@link classifyAskSurfacing}, the AskUserQuestion sibling of the
+ *     #133 oracle (same fence, same launch seam, EXTENDED with the #78 hook). ADR-005's spike could
+ *     not reach the last hop: that a real `bypassPermissions` worker SURFACES its native
+ *     `AskUserQuestion` block as `requires_action` over §4/§5 is "a strong INFERENCE, not yet
+ *     observed ... which the #266 live-worker gate owns" (`@ccctl/core`). This drives a REAL
+ *     `bypassPermissions` worker with the #78 hook installed to invoke `AskUserQuestion`, and reads —
+ *     from the server's OWN derived activity (the needs-you) + the hook's OWN capture (the structured
+ *     options, classified through core's `requiresActionEnrichmentFromValue`) — whether the decision
+ *     surfaces, self-classifying `verified | drift | inconclusive`. Fenced on CCCTL_E2E + CCCTL_SDK_URL
+ *     + ANTHROPIC_API_KEY; skips-never-fakes; JUDGMENT proven credential-free in
+ *     `live-ask-oracle.test.ts` (see `ask-user-question-gate.e2e.test.ts`). #78 AC4 stays PENDING until
+ *     this goes `verified`; and
  *   - the hermetic IDLE-HOLD regression (#167) — {@link assertIdleHeldPastLivenessTimeout}
  *     + {@link classifyIdleHold}, the deterministic proof of the server's #166
  *     downstream-liveness fix. The captured-wire golden pins each leg's SHAPE but is
@@ -141,6 +154,7 @@ export * from "./launch-tunnel.js";
 export * from "./full-flow-gate.js";
 export * from "./bearer-canary.js";
 export * from "./live-worker-oracle.js";
+export * from "./live-ask-oracle.js";
 export * from "./worker-idle-hold.js";
 export * from "./pty-handle-residual.js";
 export * from "./daemon-soak.js";

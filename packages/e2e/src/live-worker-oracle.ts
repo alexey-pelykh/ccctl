@@ -331,6 +331,20 @@ export interface WorkerLaunchOptions {
   readonly sessionId: string;
   /** The per-session ingress token decoded from the §3 work-secret — the §4/§5 credential (NOT the account Bearer, #130). */
   readonly sessionIngressToken: string;
+  /**
+   * OPTIONAL (#266): the `--settings <file>` path wiring the #78 `AskUserQuestion` PreToolUse hook
+   * into this worker (`installAskUserQuestionHookSettings`), so a real `AskUserQuestion` tool call
+   * fires the hook and captures its structured options. Surfaced to the launch command via
+   * `CCCTL_WORKER_HOOK_SETTINGS`. Absent for the #133 wire-conformance oracle (no hook needed there).
+   */
+  readonly hookSettingsPath?: string | undefined;
+  /**
+   * OPTIONAL (#266): the permission mode the worker must run under (`bypassPermissions` for the
+   * AskUserQuestion gate — the block is OBSERVED against the stock permission engine under bypass,
+   * ADR-005). Surfaced via `CCCTL_WORKER_PERMISSION_MODE`. Absent for the #133 oracle, whose one turn
+   * needs no particular mode.
+   */
+  readonly permissionMode?: string | undefined;
 }
 
 /** A handle to a launched patched worker — `close()` tears it down at the end of the run. */
@@ -356,7 +370,9 @@ export type PatchedWorkerLauncher = (options: WorkerLaunchOptions) => Promise<Pa
  *   - `CCCTL_WORKER_CONTROL_URL` — the `http://host:port` base of the §4/§5 channel host;
  *   - `CCCTL_WORKER_SESSION_ID` — the session the worker attaches to;
  *   - `CCCTL_WORKER_INGRESS_TOKEN` — the per-session §4/§5 credential (from the work-secret);
- *   - `ANTHROPIC_API_KEY` — carried through for the worker's real inference on the one turn.
+ *   - `ANTHROPIC_API_KEY` — carried through for the worker's real inference on the one turn;
+ *   - `CCCTL_WORKER_HOOK_SETTINGS` — the `--settings` path wiring the #78 hook, when present (#266);
+ *   - `CCCTL_WORKER_PERMISSION_MODE` — the permission mode to run under, when present (#266).
  *
  * This is the credentialed-wave contract, not a claim about today's Claude Code build:
  * the repo ships no packaged patched worker yet (#71 wired the `ccctl serve` daemon, but
@@ -364,6 +380,10 @@ export type PatchedWorkerLauncher = (options: WorkerLaunchOptions) => Promise<Pa
  * this contract simply never drives the
  * channel to `idle`, and the run self-classifies `inconclusive`. Kills the child on
  * `close()` so a serial e2e run leaks no process.
+ *
+ * The two #266 vars are set only when the caller supplies them (the AskUserQuestion oracle), so the
+ * #133 wire-conformance oracle's environment is byte-identical to before — an absent optional adds no
+ * key rather than an empty one.
  */
 export function spawnPatchedWorker(options: WorkerLaunchOptions): Promise<PatchedWorkerHandle> {
   const child = spawn(options.sdkUrl, {
@@ -375,6 +395,8 @@ export function spawnPatchedWorker(options: WorkerLaunchOptions): Promise<Patche
       CCCTL_WORKER_SESSION_ID: options.sessionId,
       CCCTL_WORKER_INGRESS_TOKEN: options.sessionIngressToken,
       ANTHROPIC_API_KEY: options.apiKey,
+      ...(options.hookSettingsPath === undefined ? {} : { CCCTL_WORKER_HOOK_SETTINGS: options.hookSettingsPath }),
+      ...(options.permissionMode === undefined ? {} : { CCCTL_WORKER_PERMISSION_MODE: options.permissionMode }),
     },
   });
   child.on("error", () => {

@@ -133,6 +133,20 @@ import {
 // session-create-wire.test.ts.
 export { toSessionCreateResponseWire, type SessionCreateResponseWire } from "./session-create-wire.js";
 
+// The launch-time `AskUserQuestion` hook installer (#262, #78 Option A) on the public surface, so the
+// #266 credentialed live-worker gate (`@ccctl/e2e` § `live-ask-oracle.ts`) installs the SAME hook the
+// daemon does — the real `ask-user-question-hook.js`, whose path `installAskUserQuestionHookSettings`
+// resolves relative to THIS module, never a re-implemented copy that would resolve elsewhere and let the
+// gate confirm a fake hook. `launchSession` installs this internally for a server-LAUNCHED (prompting-mode)
+// session; the gate drives a `bypassPermissions` session over the bridge (which `launchSession` refuses),
+// so it must install + wire the hook itself and clean the install files up on teardown.
+export {
+  cleanupHookInstall,
+  installAskUserQuestionHookSettings,
+  resolveHookStateDir,
+  type HookInstall,
+} from "./hook-settings-installer.js";
+
 // The concrete structured-log sink (#61): the Node-adjacent writer half of the `@ccctl/core`
 // {@link Logger} contract. The daemon injects `createJsonLineLogger()` via {@link ServerConfig.logger}
 // to turn on the diagnostic trail; the `Logger` / `LogEvent` / `NO_OP_LOGGER` types live in `@ccctl/core`.
