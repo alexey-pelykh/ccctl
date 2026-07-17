@@ -65,20 +65,38 @@
  * long-lived POSIX process — which is all a real fd and a real reapable child require. Swapping in
  * the packaged patched worker later needs no churn to this oracle's fence, classifier, or ACs.
  *
- * **Fenced / opt-in, on its OWN arm.** The prerequisite is neither a tailnet (#65/#66/#67) nor an API
- * key (#133) but a real, SPAWN-CAPABLE `node-pty` on this box — so this carries its own arm,
- * `CCCTL_E2E` + `CCCTL_E2E_PTY` ({@link resolvePtyE2EEnv}). That the arm is genuinely separate is not
- * a style choice; it is forced by this repo's own install posture — and a default checkout cannot
- * spawn a pty on EITHER platform, for two DIFFERENT reasons. node-pty resolves its binding
- * `build/Release` → `build/Debug` → `prebuilds/<platform>-<arch>` (`lib/utils.js` §
- * `loadNativeModule`), and its `install` is `node scripts/prebuild.js || node-gyp rebuild`, where
- * `prebuild.js` PROBES for the prebuild directory (present → `exit 0`, absent → `exit 1`; only under
- * `npm_config_build_from_source=true` does it also DELETE `prebuilds/` and exit 1). It never chmods:
+ * **Fenced / opt-in, on its OWN arm — and THIS BLOCK IS THE CANONICAL ACCOUNT OF THE ARMING CHAIN.**
+ * It is the single home for *why a default checkout cannot spawn a pty*; every other site in the repo
+ * (the package README, the e2e spec's header, `pnpm-workspace.yaml`) POINTS here and restates
+ * nothing. That is mechanically enforced, not merely intended: `pty-chain-census.ts` fails the
+ * `test` lane when this chain's distinctive tokens appear anywhere else. The enforcement exists
+ * because the duplication was the DEFECT GENERATOR — #68 hardened three separate inferred-and-wrong
+ * causal claims into copies of this account, and the fix for the third was a prose convention, which
+ * is the same class of unenforced intention that produced all three (#235). If you are changing this
+ * account, change it HERE and nowhere else.
+ *
+ * The prerequisite is neither a tailnet (#65/#66/#67) nor an API key (#133) but a real,
+ * SPAWN-CAPABLE `node-pty` on this box — so this carries its own arm, `CCCTL_E2E` + `CCCTL_E2E_PTY`
+ * ({@link resolvePtyE2EEnv}). That the arm is genuinely separate is not a style choice; it is forced
+ * by this repo's own install posture — and a default checkout cannot spawn a pty on EITHER platform,
+ * for two DIFFERENT reasons. node-pty resolves its binding `build/Release` → `build/Debug` →
+ * `prebuilds/<platform>-<arch>` (`lib/utils.js` § `loadNativeModule`), and its `install` is
+ * `node scripts/prebuild.js || node-gyp rebuild`, where `prebuild.js` PROBES for the prebuild
+ * directory (present → `exit 0`, absent → `exit 1`; only under `npm_config_build_from_source=true`
+ * does it also DELETE `prebuilds/` and exit 1). It never chmods:
  *
  *   1. **Linux** — node-pty ships NO Linux prebuild, so `prebuild.js` exits 1 and `node-gyp rebuild`
  *      is what would produce `build/Release`. `pnpm-workspace.yaml`'s `allowBuilds: node-pty: false`
  *      blocks it, so the binding cannot even LOAD on the `ubuntu-latest` CI runners. This is the arm
- *      `allowBuilds` governs.
+ *      `allowBuilds` governs, and the lever a Linux operator flips.
+ *      **No `spawn-helper` is BUILT or EXEC'd on Linux, so darwin's mode-644 trap has no Linux
+ *      counterpart** — the claim that it does was one of #68's three wrong ones. `binding.gyp:96`
+ *      gates the helper target on `OS=="mac"`; `pty.cc` reads `helper_path` unconditionally (:352)
+ *      — `unixTerminal.js` passes it on every unix — but USES it only under
+ *      `#if defined(__APPLE__)` (:356), so on Linux the string is simply discarded and `forkpty(3)`
+ *      (:399) runs instead. (`binding.gyp` also links `-lutil`, which can bite on musl/Alpine.)
+ *      **UNVERIFIED end-to-end**: no Linux box was available, so this leg is read off `binding.gyp`,
+ *      `pty.cc`, `scripts/prebuild.js`, `package.json` and `lib/utils.js` rather than run.
  *   2. **darwin** — a prebuild IS shipped, so `prebuild.js` exits 0, `node-gyp` NEVER runs (the `||`
  *      short-circuits), and the binding loads fine. But the shipped
  *      `prebuilds/darwin-<arch>/spawn-helper`
@@ -89,7 +107,18 @@
  *      every spawn fails with `posix_spawnp failed`. Flipping
  *      `allowBuilds` does NOT fix this — it is neither necessary nor sufficient here, since the script
  *      it unblocks exits before `node-gyp` and would not have chmodded anything anyway. The actual
- *      lever is `chmod +x` on that prebuilt helper (the package README carries the runbook).
+ *      lever is `chmod +x` on that prebuilt helper, and `pnpm install` RE-EXTRACTS it at mode `644`,
+ *      so the chmod must be re-applied after every reinstall.
+ *      **VERIFIED end-to-end** (#235, darwin-arm64 / node-pty 1.1.0 / Node 26): with the helper at
+ *      `644` a real `pty.spawn` throws `posix_spawnp failed.`; `chmod +x` on it and the same spawn
+ *      succeeds. Both legs of this were previously read off the node-pty source rather than run —
+ *      which is the posture that produced #68's three wrong claims — so THIS darwin half is now the
+ *      run one. The Linux half (bullet 1 above) is still not.
+ *
+ * **Don't hand-apply either lever from memory — run the preflight.** `arm-pty.ts`
+ * (`pnpm --filter @ccctl/e2e arm:pty`) PROBES this box: it resolves the real helper, reads its actual
+ * mode bit, and prints the lever this platform actually needs. It is the executable half of #235's
+ * remedy — a script that reads reality cannot drift the way four hand-synced prose copies did.
  *
  * So on a default checkout — CI included — this oracle CANNOT run, which is exactly why it must never
  * be in the credential-free lane: `describe.skipIf` skips it when the arm is absent. And when the arm

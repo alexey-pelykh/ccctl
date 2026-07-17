@@ -7,17 +7,14 @@ autoInstallPeers: true
 linkWorkspacePackages: true
 allowBuilds:
   esbuild: true
-  # node-pty (#30, the owned-pty launcher fallback) is a native module. Its build is NOT
-  # allowed here: node-pty ships prebuilt binaries for darwin + win32, so the binding LOADS with
-  # no compile, and CI + typecheck need only its shipped `.d.ts` (the backend's unit tests drive
-  # an injected fake spawner and never load the native binding).
-  # Loading is NOT spawning, and darwin does NOT work out of the box: the shipped
-  # prebuilds/darwin-*/spawn-helper is mode 644 and no node-pty script chmods it, so every spawn
-  # fails with `posix_spawnp failed` until someone runs `chmod +x` on it. Flipping this flag does
-  # NOT fix that — see packages/e2e/README.md § "What is fenced to the credentialed wave" (#68) for
-  # the per-platform levers.
-  # It ships NO Linux prebuild, so a Linux operator who actually needs the pty fallback must
-  # flip this to `true` (compiling node-pty from source) — the daemon-wiring item that deploys
-  # the launcher owns that call, and owns the darwin chmod too. The backend itself is functional
-  # via any injected spawner.
+  # node-pty (#30, the owned-pty launcher fallback) is a native module whose build is NOT allowed
+  # here. CI + typecheck need only its shipped `.d.ts`, and the backend's unit tests drive an
+  # injected fake spawner, so nothing in the default lane loads the native binding.
+  #
+  # WHY this is `false`, why a default checkout cannot spawn a pty on EITHER platform, and which
+  # lever each platform actually needs: packages/e2e/src/pty-handle-residual.ts, module doc §
+  # "Fenced / opt-in, on its OWN arm" — the ONE canonical account. Don't restate it here (#235: the
+  # duplication is the defect generator; packages/e2e/src/pty-chain-census.ts fails the build if you
+  # do). To arm a box, don't hand-apply anything from memory — run the preflight, which probes:
+  #   pnpm --filter @ccctl/e2e arm:pty
   node-pty: false

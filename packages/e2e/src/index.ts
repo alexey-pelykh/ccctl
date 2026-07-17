@@ -145,3 +145,5 @@ export * from "./worker-idle-hold.js";
 export * from "./pty-handle-residual.js";
 export * from "./daemon-soak.js";
 export * from "./teardown-timing-residual.js";
+export * from "./arm-pty.js";
+export * from "./pty-chain-census.js";
