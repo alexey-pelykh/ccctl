@@ -52,6 +52,8 @@ interface FakeDepsOptions {
   readonly establish?: (local: { host: string; port: number }) => Promise<EstablishedTunnel>;
   /** Override the tunnel `teardown` (e.g. to reject, for the `--off` failure path); defaults to a clean release. */
   readonly teardown?: () => Promise<void>;
+  /** Override the daemon `close` (e.g. to reject, for #255's cleanup-must-not-mask path); defaults to a clean close. */
+  readonly close?: () => Promise<void>;
   /** Override the session-client `launch` (e.g. to reject); defaults to an attachable tmux surface. */
   readonly launch?: (target: HostEndpoint, options: SessionLaunchOptions) => Promise<LaunchAcceptedWire>;
   /** Override the session-client `list` (e.g. to reject or seed sessions); defaults to an empty list. */
@@ -91,7 +93,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
 } {
   // A fake bind: echo the requested host, and resolve `--port 0` to a concrete ephemeral
   // port so a test can prove `server.address` (not the requested port) is what's reported.
-  const close = vi.fn(() => Promise.resolve());
+  const close = vi.fn(options.close ?? (() => Promise.resolve()));
   const startServer = vi.fn((config: { host?: string; port: number }) =>
     Promise.resolve(makeServer(config.host ?? "127.0.0.1", config.port === 0 ? 55555 : config.port, close)),
   );
@@ -248,10 +250,14 @@ function makeDeps(options: FakeDepsOptions = {}): {
 const originalAuth = process.env[LOCAL_SERVER_AUTH_ENV];
 const originalXdgConfigHome = process.env[XDG_CONFIG_HOME_ENV];
 let logSpy: ReturnType<typeof vi.spyOn>;
+let errorSpy: ReturnType<typeof vi.spyOn>;
 let xdgConfigDir: string;
 
 beforeEach(async () => {
   logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  // stderr is its own channel: the verbs report to `console.log`, but a failure the CLI survives and
+  // reports ALONGSIDE the error it is about to rethrow goes to `console.error` (#255's release warning).
+  errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
   // Isolate the #57 config-file auth source: point $XDG_CONFIG_HOME at a fresh empty dir
   // so `serve`'s auth guard never finds a real ~/.config/ccctl/local-server-auth. The env
   // var stays the only auth these tests configure — a refuse-path test that deletes it must
@@ -262,6 +268,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   logSpy.mockRestore();
+  errorSpy.mockRestore();
   if (originalAuth === undefined) {
     Reflect.deleteProperty(process.env, LOCAL_SERVER_AUTH_ENV);
   } else {
@@ -278,6 +285,11 @@ afterEach(async () => {
 /** All console output this run, joined — for asserting the reported address / host. */
 function loggedText(): string {
   return logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+}
+
+/** All stderr output this run, joined — for asserting a reported-alongside failure (#255). */
+function erroredText(): string {
+  return errorSpy.mock.calls.map((call) => String(call[0])).join("\n");
 }
 
 describe("ccctl patch — delegates to the patcher (AC1)", () => {
@@ -485,6 +497,96 @@ describe("ccctl serve --tunnel — composes daemon + tunnel (AC4)", () => {
     expect(close).not.toHaveBeenCalled();
   });
 
+  // Rule (#255 AC1): the adapter records its serve mapping the moment `tailscale serve --bg` lands —
+  // BEFORE the auth gate and the host resolution — precisely so a half-up serve stays releasable. But
+  // nothing ever called the `teardown` that releasability was for: `establishAndReport` returned the
+  // instance only on SUCCESS, so a rejected establish dropped the one handle to the mapping. Atomicity
+  // is BOTH halves — the daemon comes down AND the mapping goes with it.
+  it("releases the half-up serve mapping when the establish fails — before closing the daemon", async () => {
+    const { deps, close, teardown, tunnels } = makeDeps({
+      establish: () => Promise.reject(new Error("ccctl: tailscale is not an authenticated tailnet member")),
+    });
+
+    await expect(buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" })).rejects.toThrow(
+      /not an authenticated tailnet member/,
+    );
+
+    // Exactly one tunnel was ever built, so the release necessarily landed on the instance whose
+    // establish failed — the one holding the half-up mapping.
+    expect(tunnels).toHaveLength(1);
+    expect(teardown).toHaveBeenCalledTimes(1);
+    // BEFORE the close — plain LIFO, the tunnel having been acquired last. Not a safety property (a
+    // mapping pointing at a closed port authorizes nobody, per `shutdown-signal.ts`); pinned so a later
+    // edit does not quietly reorder the unwind.
+    expect(teardown.mock.invocationCallOrder[0]).toBeLessThan(close.mock.invocationCallOrder[0]);
+  });
+
+  // Rule (#255 AC2): the operator's question is WHY the tunnel could not be established. A release that
+  // also fails is a footnote to that answer, never a replacement for it — `cli.ts` prints `error.message`
+  // and nothing else, so an AggregateError / `{ cause }` wrapper would substitute a summary for the one
+  // line that explains the failure.
+  it("surfaces the establish error verbatim when the release ALSO fails, reporting the release alongside", async () => {
+    const establishFailure = new Error("ccctl: tailscale is not an authenticated tailnet member");
+    const { deps, close } = makeDeps({
+      establish: () => Promise.reject(establishFailure),
+      teardown: () => Promise.reject(new Error("tailscale serve off exited 1")),
+    });
+
+    // The very instance, not merely a matching message: a wrapper would satisfy a message match on the
+    // establish text and still have replaced the error the operator sees.
+    await expect(buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" })).rejects.toBe(
+      establishFailure,
+    );
+
+    // Alongside, on stderr: what may still be up, why the release failed, and the verb that clears it.
+    const reported = erroredText();
+    expect(reported).toContain("could not release the half-up tailscale tunnel");
+    expect(reported).toContain("tailscale serve off exited 1");
+    expect(reported).toContain("ccctl tunnel tailscale --off");
+    // A failed release must not strand the daemon either — it still comes down.
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  // Rule: releasing is the FAILURE path's business alone. A tunnel that came up is the daemon's to hold
+  // for its lifetime (#242) — tearing it down here would un-expose the server it just exposed.
+  it("does NOT release the tunnel on the happy path (the daemon holds it for its lifetime)", async () => {
+    const { deps, teardown } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  // Rule (#255 AC2, applied to its sibling step): `close` is the OTHER cleanup step in the same unwind,
+  // so a rejected close masks the establish error exactly as a rejected teardown would. Same defect, one
+  // step later — so it gets the same treatment rather than a carefully non-masking release two lines
+  // above a silent one.
+  it("surfaces the establish error verbatim when the daemon CLOSE fails, reporting the close alongside", async () => {
+    const establishFailure = new Error("ccctl: tailscale is not an authenticated tailnet member");
+    const { deps } = makeDeps({
+      establish: () => Promise.reject(establishFailure),
+      close: () => Promise.reject(new Error("ERR_SERVER_NOT_RUNNING")),
+    });
+
+    await expect(buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" })).rejects.toBe(
+      establishFailure,
+    );
+
+    const reported = erroredText();
+    expect(reported).toContain("could not close the daemon after the tunnel failed");
+    expect(reported).toContain("ERR_SERVER_NOT_RUNNING");
+  });
+
+  // Rule: neither cleanup step may skip the other — a broken close is no reason to strand a mapping.
+  it("releases the mapping even when the daemon close ALSO fails", async () => {
+    const { deps, teardown } = makeDeps({
+      establish: () => Promise.reject(new Error("ccctl: tailscale is not an authenticated tailnet member")),
+      close: () => Promise.reject(new Error("ERR_SERVER_NOT_RUNNING")),
+    });
+    await expect(buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" })).rejects.toThrow(
+      /not an authenticated tailnet member/,
+    );
+    expect(teardown).toHaveBeenCalledTimes(1);
+  });
+
   // Rule (#242 AC1): the daemon owns the tunnel's lifetime, so it must RETAIN the tunnel and hand it to
   // the shutdown path — the whole defect was that `establishAndReport` dropped the instance the moment
   // `establish` returned, leaving nothing able to call `teardown` and so no way to revert the grant.
@@ -648,6 +750,20 @@ describe("ccctl tunnel — establishes the tunnel (AC3)", () => {
     await expect(buildProgram(deps).parseAsync(["tunnel", "cloudflare"], { from: "user" })).rejects.toThrow(
       /not implemented yet \(skeleton\)/,
     );
+  });
+
+  // Rule (#255's scope boundary): `serve --tunnel` releases a half-up establish because it is tearing its
+  // OWN daemon back down and promises atomicity. This verb exposes a server it does not own and exits by
+  // design, so it has no daemon to be atomic with and must not assume the operator wants a mapping cleared
+  // on its way out — `--off` is the verb that clears one, deliberately and explicitly (ADR-004).
+  it("does NOT release on a failed establish — fire-and-forget has no daemon to be atomic with", async () => {
+    const { deps, teardown } = makeDeps({
+      establish: () => Promise.reject(new Error("ccctl: tailscale is not an authenticated tailnet member")),
+    });
+    await expect(buildProgram(deps).parseAsync(["tunnel", "tailscale"], { from: "user" })).rejects.toThrow(
+      /not an authenticated tailnet member/,
+    );
+    expect(teardown).not.toHaveBeenCalled();
   });
 });
 
