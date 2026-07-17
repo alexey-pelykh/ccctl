@@ -48,8 +48,16 @@ import {
   inputCommand,
   approveCommand,
   redirectCommand,
+  answerCommand,
   describeCommand,
 } from "./command.js";
+import {
+  SHORTCUT_CHIPS,
+  decodeEnrichment,
+  enrichmentMatchesBlock,
+  submitsOnTap,
+  answerFromSelections,
+} from "./enrichment.js";
 import { diffSessionList, nextSelection, notificationsDegraded, sessionCursor, laterCursor } from "./sessions.js";
 import { connectionHealth } from "./connection.js";
 import { applyPairingToken, authHeader } from "./pairing.js";
@@ -86,6 +94,8 @@ import {
 const connectionEl = document.getElementById("connection");
 const statusEl = document.getElementById("status");
 const activityEl = document.getElementById("activity");
+const needsYouQuestionEl = document.getElementById("needs-you-question");
+const shortcutChipsEl = document.getElementById("shortcut-chips");
 const eventsEl = document.getElementById("events");
 const sessionListEl = document.getElementById("session-list");
 const refreshSessionsEl = document.getElementById("refresh-sessions");
@@ -210,6 +220,45 @@ const sessionCursors = new Map();
 const viewedCursors = new Map();
 
 /**
+ * The VIEWED session's current `requires_action` block sequence (#201), or null when it is not blocking
+ * (running / idle / closed) or the block carries no stamp. Learned LIVE from the session's SSE
+ * `worker_status` frames ({@link updateBlockFromActivity} ← `transcript.js` `sequenceNum`), reset on
+ * {@link selectSession}. It is the JOIN key #87 correlates {@link viewedEnrichment} against
+ * ({@link enrichmentMatchesBlock}): the tappable options render ONLY when the enrichment's `sequenceNum`
+ * equals this — so turn-N's options never decorate turn-N+1's block (AC5).
+ */
+let currentBlockSequenceNum = null;
+/**
+ * The decoded `AskUserQuestion` enrichment for the VIEWED session, or null when it carries none. Read
+ * from that session's `SessionSummaryWire.enrichment` on each poll (#264 serves it while the session
+ * blocks) and on {@link selectSession}; joined against {@link currentBlockSequenceNum} by
+ * {@link renderEnrichment}. DISPLAY data authored by a possibly-ungated worker (ADR-005) — rendered as
+ * text, never trusted as the #40 signal (that is `activity.kind`, off `sessions.js`).
+ */
+let viewedEnrichment = null;
+/**
+ * The operator's in-progress selection per question — `questionId → Set<label>` — for a multi-select or
+ * multi-question enrichment the operator assembles before submitting (AC2). A single-question
+ * single-select enrichment never populates this: it answers on the option tap ({@link submitsOnTap}).
+ * Reset whenever {@link renderEnrichment} paints a DIFFERENT enrichment (a new {@link renderedEnrichmentSeq}).
+ */
+const enrichmentSelections = new Map();
+/**
+ * The `sequenceNum` of the enrichment currently PAINTED into the decision panel, or null when the panel
+ * is hidden/empty. The paint guard: {@link renderEnrichment} rebuilds only when this changes, so the 2s
+ * poll re-rendering the SAME outstanding question neither churns the DOM nor re-announces it to the
+ * `aria-live` region (the discipline `applySessionList` takes for the picker).
+ */
+let renderedEnrichmentSeq = null;
+/**
+ * A `sequenceNum` the operator has already ANSWERED, so the panel stays hidden for the window between the
+ * submit and the worker's own `requires_action`→next transition (which the join would otherwise still
+ * match, re-showing an answered question and inviting a double-submit the server would 409). Reset when
+ * the block clears ({@link updateBlockFromActivity}) or the session changes ({@link selectSession}).
+ */
+let answeredSequenceNum = null;
+
+/**
  * Advance a per-session cursor map MONOTONICALLY — set `sessionId`'s entry to `cursor` only when it is
  * a higher non-negative integer than what is stored, so a lagging source (a 2s poll behind the live SSE,
  * or an out-of-order delivery) can never REGRESS a cursor. Shared by {@link sessionCursors} and
@@ -312,6 +361,11 @@ function renderSessionClosed(text) {
   appendClosed(text);
   statusEl.textContent = text;
   activityEl.hidden = true;
+  // The session ended — any outstanding AskUserQuestion is moot; hide the decision panel (#87) so a
+  // tappable question does not outlive the session it belonged to.
+  currentBlockSequenceNum = null;
+  viewedEnrichment = null;
+  renderEnrichment();
 }
 
 /** Update the current-turn indicator in place (latest worker_status wins). */
@@ -344,6 +398,7 @@ function handleEvent(data) {
   switch (instruction.kind) {
     case "activity":
       renderActivity(instruction.status, instruction.text);
+      updateBlockFromActivity(instruction);
       break;
     case "transcript":
       appendTranscript(instruction.subtype, instruction.summary);
@@ -355,6 +410,242 @@ function handleEvent(data) {
       appendUnparsed(instruction.raw);
       break;
   }
+}
+
+/**
+ * Fold a live `worker_status` activity frame into the AskUserQuestion decision surface (#87). A
+ * `requires_action` frame carries the block's #201 stamp ({@link currentBlockSequenceNum}) — the join key
+ * — so record it; any other status (running / idle) means the block is GONE, so drop the sequence and the
+ * "already answered" guard (a fresh block later gets a new, higher stamp). Then re-render, which shows the
+ * tappable options only when the enrichment joins the CURRENT block (AC5). A `requires_action` frame with
+ * no stamp records `null`, which the join reads as unknown and fails safe on (no options).
+ */
+function updateBlockFromActivity(instruction) {
+  if (instruction.status === "requires_action") {
+    currentBlockSequenceNum = instruction.sequenceNum;
+  } else {
+    currentBlockSequenceNum = null;
+    answeredSequenceNum = null;
+  }
+  renderEnrichment();
+}
+
+/**
+ * Render (or hide) the AskUserQuestion decision panel for the viewed session (#87). Shows the tappable
+ * options ONLY when the viewed enrichment joins the CURRENT block ({@link enrichmentMatchesBlock}, AC5)
+ * AND has not already been answered ({@link answeredSequenceNum}); otherwise the panel is hidden and the
+ * operator falls back to free-text steering (AC4) over the still-visible transcript (AC6). Paint-guarded
+ * on {@link renderedEnrichmentSeq}: a re-render for the SAME outstanding enrichment (every 2s poll) is a
+ * no-op, so the DOM and its `aria-live` announcement do not churn; a DIFFERENT (or newly-absent)
+ * enrichment rebuilds and resets the in-progress selections.
+ */
+function renderEnrichment() {
+  const enrichment = viewedEnrichment;
+  const show =
+    enrichmentMatchesBlock(enrichment, currentBlockSequenceNum) && enrichment.sequenceNum !== answeredSequenceNum;
+  if (!show) {
+    if (renderedEnrichmentSeq !== null) {
+      needsYouQuestionEl.hidden = true;
+      needsYouQuestionEl.replaceChildren();
+      enrichmentSelections.clear();
+      renderedEnrichmentSeq = null;
+    }
+    return;
+  }
+  if (renderedEnrichmentSeq === enrichment.sequenceNum) {
+    return;
+  }
+  enrichmentSelections.clear();
+  renderedEnrichmentSeq = enrichment.sequenceNum;
+  paintEnrichment(enrichment);
+}
+
+/**
+ * Build the decision panel for one outstanding enrichment: each question's heading / prompt and its
+ * options as tappable buttons (AC1), plus — for a multi-select or multi-question envelope — a "Send
+ * answer" that submits the assembled selection (AC2). A "view the transcript" note (AC6) leads, because
+ * the option labels were authored by a possibly-ungated worker (ADR-005), so the operator is pointed at
+ * the actual session below before acting. All text is rendered via `textContent` — the labels are
+ * untrusted display data (core normalized them; this never interprets them as markup).
+ */
+function paintEnrichment(enrichment) {
+  const nodes = [];
+  const note = document.createElement("p");
+  note.dataset.viewSessionNote = "true";
+  note.textContent = "The agent is asking — review the transcript below before you answer.";
+  nodes.push(note);
+  for (const question of enrichment.questions) {
+    nodes.push(buildQuestion(enrichment, question));
+  }
+  // A single-question single-select enrichment answers on the option tap ({@link submitsOnTap}); every
+  // other shape assembles a selection across taps and submits with this button, gated on a complete answer.
+  if (!submitsOnTap(enrichment)) {
+    const submit = document.createElement("button");
+    submit.type = "button";
+    submit.dataset.answerSubmit = "true";
+    submit.textContent = "Send answer";
+    submit.disabled = true;
+    submit.addEventListener("click", () => submitAnswer(enrichment));
+    nodes.push(submit);
+  }
+  needsYouQuestionEl.replaceChildren(...nodes);
+  needsYouQuestionEl.hidden = false;
+}
+
+/** Build one question block: its optional heading, its prompt, and its options as a tappable group. */
+function buildQuestion(enrichment, question) {
+  const wrap = document.createElement("div");
+  wrap.dataset.question = question.questionId;
+  if (question.header !== undefined) {
+    const heading = document.createElement("h3");
+    heading.textContent = question.header;
+    wrap.appendChild(heading);
+  }
+  const prompt = document.createElement("p");
+  prompt.dataset.questionPrompt = "true";
+  prompt.textContent = question.prompt;
+  wrap.appendChild(prompt);
+  const group = document.createElement("div");
+  group.dataset.options = "true";
+  // A multi-select question is a checkbox group; a single-select a radio group — named so a screen reader
+  // reads the selection semantics, not just "N buttons".
+  group.setAttribute("role", question.multiSelect ? "group" : "radiogroup");
+  for (const option of question.options) {
+    group.appendChild(buildOption(enrichment, question, option));
+  }
+  wrap.appendChild(group);
+  return wrap;
+}
+
+/** Build one tappable option button, carrying its label + optional description; `aria-pressed` its selection. */
+function buildOption(enrichment, question, option) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.option = "true";
+  button.dataset.questionId = question.questionId;
+  button.dataset.label = option.label;
+  button.setAttribute("aria-pressed", "false");
+  const label = document.createElement("span");
+  label.dataset.optionLabel = "true";
+  label.textContent = option.label;
+  button.appendChild(label);
+  if (option.description !== undefined) {
+    const description = document.createElement("span");
+    description.dataset.optionDescription = "true";
+    description.textContent = option.description;
+    button.appendChild(description);
+  }
+  button.addEventListener("click", () => onOptionTap(enrichment, question, option.label));
+  return button;
+}
+
+/**
+ * Handle an option tap. A single-question single-select enrichment answers IMMEDIATELY (AC1's "tapping one
+ * sends that selection"); every other shape toggles the label into the in-progress selection and repaints
+ * the pressed states + the submit's enabled gate, leaving the operator to assemble and Send (AC2).
+ */
+function onOptionTap(enrichment, question, label) {
+  if (submitsOnTap(enrichment)) {
+    submitAnswer(enrichment, { [question.questionId]: [label] });
+    return;
+  }
+  toggleSelection(question, label);
+  reflectOptionStates(question);
+  reflectAnswerSubmitState(enrichment);
+}
+
+/** Toggle a label into a question's selection: multi-select adds/removes; single-select replaces (radio). */
+function toggleSelection(question, label) {
+  let selected = enrichmentSelections.get(question.questionId);
+  if (selected === undefined) {
+    selected = new Set();
+    enrichmentSelections.set(question.questionId, selected);
+  }
+  if (question.multiSelect) {
+    if (selected.has(label)) {
+      selected.delete(label);
+    } else {
+      selected.add(label);
+    }
+  } else {
+    selected.clear();
+    selected.add(label);
+  }
+}
+
+/** The operator's selection per question as the `{ [questionId]: string[] }` shape `answerFromSelections` reads. */
+function selectionsObject() {
+  const object = {};
+  for (const [questionId, selected] of enrichmentSelections) {
+    object[questionId] = [...selected];
+  }
+  return object;
+}
+
+/** Repaint the `aria-pressed` state of one question's option buttons from the current selection. */
+function reflectOptionStates(question) {
+  const selected = enrichmentSelections.get(question.questionId) ?? new Set();
+  for (const button of needsYouQuestionEl.querySelectorAll('[data-option="true"]')) {
+    if (button.dataset.questionId === question.questionId) {
+      button.setAttribute("aria-pressed", selected.has(button.dataset.label) ? "true" : "false");
+    }
+  }
+}
+
+/** Enable the "Send answer" button only when the assembled selection is a complete, valid answer. */
+function reflectAnswerSubmitState(enrichment) {
+  const submit = needsYouQuestionEl.querySelector('[data-answer-submit="true"]');
+  if (submit !== null) {
+    submit.disabled = answerFromSelections(enrichment, selectionsObject()) === null;
+  }
+}
+
+/**
+ * Submit the operator's answer to the outstanding enrichment (#87, AC1/AC2): build the {@link AnswerEnvelope}
+ * from the selection (or the one-tap override), and — when it is a complete, valid answer — send it as the
+ * `answer` steer (#86), riding the SAME {@link steer} path every verb uses (so an offline answer is queued
+ * and a moved-on one is stale-guarded, #79/#80). Marks the sequence answered so the panel hides at once
+ * (optimistic, like the prompt input clearing on submit) rather than inviting a double-tap the server would
+ * 409. A no-op on an incomplete/invalid selection — the submit button is already gated on the same check.
+ */
+function submitAnswer(enrichment, override) {
+  const answers = answerFromSelections(enrichment, override ?? selectionsObject());
+  if (answers === null) {
+    return;
+  }
+  const command = answerCommand(enrichment.sequenceNum, answers);
+  if (command === null) {
+    return;
+  }
+  answeredSequenceNum = enrichment.sequenceNum;
+  renderEnrichment();
+  steer(command);
+}
+
+/**
+ * Paint the shortcut-phrase chips (#87 AC3): a static row of common steering replies, each of which
+ * INSERTS its phrase into the free-text steer input on tap (appending to any typed text, never replacing
+ * it) and focuses the input, so a routine "carry on" / "hold up" is a tap rather than a typed sentence —
+ * while free-text steering stays fully available beside them (AC4). The set is {@link SHORTCUT_CHIPS},
+ * the single editable list the zero-build UI treats as "configurable".
+ */
+function renderShortcutChips() {
+  const chips = SHORTCUT_CHIPS.map((phrase) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.dataset.chip = "true";
+    chip.textContent = phrase;
+    chip.addEventListener("click", () => insertShortcut(phrase));
+    return chip;
+  });
+  shortcutChipsEl.replaceChildren(...chips);
+}
+
+/** Insert a shortcut phrase into the steer input — append to any typed text (non-destructive) — and focus it. */
+function insertShortcut(phrase) {
+  const current = promptInputEl.value;
+  promptInputEl.value = current.trim() === "" ? phrase : `${current} ${phrase}`;
+  promptInputEl.focus();
 }
 
 /**
@@ -605,6 +896,12 @@ async function loadSessions() {
     // what the runaway actually did. `selectSession` clears it because a DIFFERENT session's stream
     // is about to write there; here nothing is, so there is nothing to confuse it with.
     activityEl.hidden = true;
+    // The selected session is gone: its AskUserQuestion decision surface is moot — drop the enrichment and
+    // block sequence so renderEnrichment hides the panel (a tappable question over a vanished session would
+    // answer nothing).
+    currentBlockSequenceNum = null;
+    viewedEnrichment = null;
+    renderEnrichment();
     // Nothing selected: there is nothing to stop.
     renderStopControl();
     // Drop a REFUSAL — its subject is gone, so it is stale news, and (for a forceable one) it carries a
@@ -635,6 +932,14 @@ async function loadSessions() {
     // And drain any steers the operator queued while offline (#79), firing them in order now that the
     // link is back. Fire-and-forget like the reconcile; its own sends are awaited internally to keep order.
     fireSteerQueue();
+  }
+  // Refresh the viewed session's AskUserQuestion enrichment from this poll's summary (#87): the server
+  // serves the outstanding question + options on the list while the session blocks (#264). This runs every
+  // poll (not only on selection) so a block that appears WHILE the operator is viewing an idle session gets
+  // its options; renderEnrichment joins it against the block sequence learned from the SSE (AC5).
+  if (currentSessionId !== null) {
+    viewedEnrichment = decodeEnrichment(sessions.find((session) => session.id === currentSessionId)?.enrichment);
+    renderEnrichment();
   }
 }
 
@@ -996,6 +1301,14 @@ function selectSession(sessionId) {
   activityEl.hidden = true;
   stopStatusEl.hidden = true;
   stopStatusEl.replaceChildren();
+  // A fresh session view: reset the AskUserQuestion decision surface (#87). The block sequence is
+  // re-learned from THIS session's SSE stream (null until it arrives); the enrichment is seeded from the
+  // last poll's summary for this session and refreshed each poll. renderEnrichment keeps the panel hidden
+  // until the two join, so a prior session's question never lingers over this one.
+  currentBlockSequenceNum = null;
+  answeredSequenceNum = null;
+  viewedEnrichment = decodeEnrichment(renderedSessions.find((session) => session.id === sessionId)?.enrichment);
+  renderEnrichment();
   renderStopControl();
   markSelected();
   // Viewing the session acknowledges its reconciled needs-you (#53): drop the badge and ack the
@@ -1606,6 +1919,10 @@ applyPairingToken({ location, history, storage: localStorage });
 
 // Seed the connection-health indicator (#75): "reconnecting" until the first heartbeat settles it.
 renderConnection();
+
+// Paint the static shortcut-phrase chips (#87 AC3) once — each inserts a common steering reply into the
+// free-text steer input on tap; the set is the editable SHORTCUT_CHIPS list in `enrichment.js`.
+renderShortcutChips();
 
 // Follow a tapped push (#52) to its session: the service worker cold-opened the app at `?session=<id>`,
 // so read that deep-link, scrub the param (so a reload doesn't re-pin a since-closed session), and view
