@@ -163,6 +163,68 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Await a predicate over the server's OWN state — the #173 suite's idiom (`worker-channel.test.ts`),
+ * and the honest alternative to sleeping a guess at how long a reaper takes to run.
+ *
+ * Two properties matter here, and both are why an eviction case reaches for this rather than `sleep`:
+ * it reads the registry IN-PROCESS, so polling costs no round-trip and cannot itself spend the window
+ * it is waiting on; and it returns the instant the state settles rather than at the end of a fixed
+ * budget, so a case can afford to wait far longer than it expects to.
+ */
+async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`waitFor: condition not met within ${timeoutMs}ms`);
+    }
+    await sleep(10);
+  }
+}
+
+/*
+ * The eviction windows this file arms, and the ONE rule that keeps a case from racing a timer of its
+ * own making.
+ *
+ * An armed window is a BUDGET the work inside it has to fit in, and it is spent in WALL-CLOCK on a
+ * loaded host — not in test-steps. #231 is what happens when that is forgotten: a case armed 40ms and
+ * then made three loopback round-trips before asserting both its rows were still there. Those
+ * round-trips measured up to 101.8ms under full-suite load, so the reaper the case itself armed won,
+ * and the assertion read a state the server had already correctly left. Nothing was wrong with the
+ * daemon; the timer was doing exactly its job.
+ *
+ * The neighbouring unit suite (`pending-launch.test.ts`) arms windows just as short and never flakes,
+ * which is the whole tell: its in-window work is SYNCHRONOUS and in-process, so a window cannot elapse
+ * mid-setup. Reaching for that idiom across an HTTP boundary is what broke — the same 40ms buys a few
+ * microseconds of function calls there and three loopback round-trips here.
+ *
+ * So which window a case arms is decided by ONE question: does it need anything to happen INSIDE the
+ * window?
+ *
+ *   - **No** → nothing can race it, and {@link REAP_WINDOW_MS} may stay as short as it likes. Such a
+ *     case asserts only the SETTLED post-eviction state, which is monotonic — once reaped, a ghost
+ *     stays reaped — so its setup may freely overrun the window it is racing to fire. Every "the row
+ *     exists from birth" claim was moved OUT of those cases for exactly this reason: they are made
+ *     under a long window instead, where no timer can reach them.
+ *   - **Yes** → the window is sized to that work ({@link CLAIM_WINDOW_MS}). A §2 registration must
+ *     reach the server before the reaper takes the launch it is claiming, and a cap's refusal must be
+ *     read before the reaper frees the slot — both intrinsic to their scenario rather than something a
+ *     rewrite can decouple away. These are the only cases that pay for their window in wall-clock.
+ */
+/** The window a case arms when NOTHING has to happen inside it — it asserts only the settled post-reaper state. */
+const REAP_WINDOW_MS = 40;
+/**
+ * The window a case arms when it must act INSIDE it — sized to the round-trips it makes there rather
+ * than to the smallest number that keeps the case feeling quick. #231 measured three loopback
+ * round-trips at 101.8ms under full-suite CPU contention, so ~34ms apiece is the rate to budget
+ * against on a starved host. The densest case here (`refuses to guess`) spends four to five of them
+ * inside its window, which 500ms still clears by ~3x; the single-round-trip cases it clears by ~15x.
+ * The budget is the only thing being traded.
+ */
+const CLAIM_WINDOW_MS = 500;
+/** Margin past a window, for the reaper's asynchronous terminal half to have run had it been going to. */
+const PAST_WINDOW_MS = 100;
+
 describe("POST /api/sessions (launch)", () => {
   it("launches via the injected launcher and answers 201 with the session id and surface attachment", async () => {
     const { launcher, launches } = fakeLauncher({ hint: "tmux attach -t ccctl:2", attachable: true });
@@ -464,14 +526,19 @@ describe("the maxSessions cap (#36)", () => {
 
   it("frees a slot when a session ENDS, and the next launch succeeds again", async () => {
     const { launcher } = fakeLauncher();
-    // A short registration timeout is how a session ENDS here: these launches never register, so the
+    // A registration timeout is how a session ENDS here: these launches never register, so the
     // ghost-reaper (#33) evicts them — a real end-of-session path, driven rather than simulated.
+    //
+    // {@link CLAIM_WINDOW_MS} rather than the reaper's own short window, because the refusal below has
+    // to be read while the cap is still full: this case acts INSIDE the window it arms, so it buys the
+    // budget to do it (#231). At 40ms the reaper could free the slot before the refused launch even
+    // landed, and the cap would answer 201 — the test failing for the one reason that is not a bug.
     const server = await startTestServer({
       port: 0,
       host: DEFAULT_HOST,
       launcher,
       maxSessions: 1,
-      registrationTimeoutMs: 40,
+      registrationTimeoutMs: CLAIM_WINDOW_MS,
     });
     await fillByLaunching(server, 1);
 
@@ -479,7 +546,7 @@ describe("the maxSessions cap (#36)", () => {
     expect((await postLaunch(server, { cwd: CWD, permissionMode: "default" })).status).toBe(429);
 
     // The session ends (its worker never checked in, so it is reaped) — the slot is freed.
-    await sleep(120);
+    await waitFor(() => server.sessions.size === 0);
     expect(server.sessions.size).toBe(0);
 
     // ...and the next launch succeeds again. This is the whole point of counting LIVE sessions rather
@@ -689,7 +756,7 @@ describe("the maxSessions cap (#36)", () => {
 // is evicted". The launched session is VISIBLE while it comes up, then either claimed or reaped.
 describe("the registering session, and its eviction (#33)", () => {
   it("lists the launched session as `registering` — visible from launch, before its worker checks in", async () => {
-    const { launcher } = fakeLauncher();
+    const { launcher, closeCount } = fakeLauncher();
     // A long timeout: this test is about the state BEFORE eviction, so eviction must not race it.
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher, registrationTimeoutMs: 60_000 });
 
@@ -698,63 +765,139 @@ describe("the registering session, and its eviction (#33)", () => {
 
     // It is in the list immediately, and it is honestly marked as not-yet-live.
     expect(await listSessions(server)).toEqual([expect.objectContaining({ id: sessionId, status: "registering" })]);
+    // And its terminal is untouched — the reaper has nothing to say yet, and will not for 60s. Asserted
+    // HERE, under a window that cannot fire, rather than inside an eviction case racing its own 40ms.
+    expect(closeCount()).toBe(0);
+  });
+
+  // The two-launch half of the same born-and-untouched claim, and the birth half of the independence
+  // one below. It lives under a long window for the same reason as the case above: a "they are BOTH
+  // still here" assertion is exactly what a 40ms window reaps out from under you (#231).
+  it("gives each launch its OWN registering row — two launches, two rows, neither disturbing the other", async () => {
+    const { launcher, closeCount } = fakeLauncher();
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher, registrationTimeoutMs: 60_000 });
+
+    const first = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+    const second = await postLaunch(server, { cwd: OTHER_CWD, permissionMode: "default" });
+    const { sessionId: firstId } = (await first.json()) as { sessionId: string };
+    const { sessionId: secondId } = (await second.json()) as { sessionId: string };
+
+    // Two launches, two ids, two rows — the second launch neither replaced nor disturbed the first.
+    expect(firstId).not.toBe(secondId);
+    expect(await listSessions(server)).toEqual([
+      expect.objectContaining({ id: firstId, status: "registering" }),
+      expect.objectContaining({ id: secondId, status: "registering" }),
+    ]);
+    expect(closeCount()).toBe(0);
   });
 
   // Gherkin: "The launched process never registers" → when the registration timeout elapses, the
   // registering session is evicted, and the session list no longer shows it.
   it("evicts the registering session once the registration timeout elapses — and CLOSES its terminal", async () => {
-    const TIMEOUT_MS = 40;
     const { launcher, closeCount } = fakeLauncher();
     const server = await startTestServer({
       port: 0,
       host: DEFAULT_HOST,
       launcher,
-      registrationTimeoutMs: TIMEOUT_MS,
+      registrationTimeoutMs: REAP_WINDOW_MS,
     });
 
+    // The launch goes up and its worker never registers. There is deliberately no "…and it is there
+    // first" assertion to lose here — that claim is made above, under a window nothing can reach.
     await postLaunch(server, { cwd: CWD, permissionMode: "default" });
-    // It is there, registering — the worker just never registers.
-    expect(await listSessions(server)).toHaveLength(1);
-    expect(closeCount()).toBe(0);
 
-    await sleep(TIMEOUT_MS * 4);
+    // Await BOTH halves of the eviction, because they do not land together: the row is dropped
+    // synchronously while the terminal is closed only after the surface has been probed (#35), so a
+    // wait that settled on the row alone would race the very close it is about to assert.
+    await waitFor(() => server.sessions.size === 0 && closeCount() === 1);
 
-    // "the session list no longer shows it" — the ghost is gone…
+    // "the session list no longer shows it" — the ghost is gone from the operator's OWN view…
     expect(await listSessions(server)).toEqual([]);
     // …and, critically, so is the process it left running: the terminal was reaped, not orphaned.
     expect(closeCount()).toBe(1);
   });
 
-  it("evicts EACH stuck launch independently — one ghost's eviction does not disturb another launch", async () => {
-    const TIMEOUT_MS = 40;
+  // This is the case #231 was filed against: what it used to assert mid-window ("both are still here")
+  // is now made above under a long window rather than merely handed a bigger budget here, so the birth
+  // claim and the reaping claim no longer share a clock. Letting setup overrun the window costs it
+  // nothing — each eviction is armed at its own launch, so whatever order the two fire in, the state
+  // they settle into is the same one.
+  //
+  // What it establishes is that EVERY ghost is reaped rather than only the first the reaper reaches.
+  // Note what it cannot: that the two were reaped INDEPENDENTLY. A reaper that dragged the whole
+  // registry down with one eviction settles into this very same state, so the sibling below — where
+  // one of the two is live, and a cascade would therefore be visible — is what carries that property.
+  it("evicts EVERY stuck launch — not just the first ghost the reaper reaches", async () => {
     const { launcher, closeCount } = fakeLauncher();
     const server = await startTestServer({
       port: 0,
       host: DEFAULT_HOST,
       launcher,
-      registrationTimeoutMs: TIMEOUT_MS,
+      registrationTimeoutMs: REAP_WINDOW_MS,
     });
 
     await postLaunch(server, { cwd: CWD, permissionMode: "default" });
     await postLaunch(server, { cwd: OTHER_CWD, permissionMode: "default" });
-    expect(await listSessions(server)).toHaveLength(2);
 
-    await sleep(TIMEOUT_MS * 4);
+    // Two rows gone AND two terminals closed: neither eviction stopped short at one.
+    await waitFor(() => server.sessions.size === 0 && closeCount() === 2);
 
     expect(await listSessions(server)).toEqual([]);
     expect(closeCount()).toBe(2);
   });
 
+  // The independence half — and it needs one of the two launches to be LIVE, because a pair of ghosts
+  // cannot see the property at all. Two stuck launches settle into the same zero-rows/two-closes state
+  // whether the reaper works per-launch or reaps everything it can find at the first timeout, so the
+  // sibling above would pass either way. A LIVE session is what makes a reaper that reaches too far
+  // visible: it is the one row that is supposed to still be there, and the one terminal that has a
+  // worker sitting in it.
+  it("a ghost's eviction does not disturb a LIVE launch — only the ghost's row and terminal go", async () => {
+    const { launcher, closeCount } = fakeLauncher();
+    // A registration has to land inside the window for one of the pair to BE live, so this case buys
+    // the budget to make it (#231) — unlike its all-ghosts sibling above, which needs nothing in-window.
+    const server = await startTestServer({
+      port: 0,
+      host: DEFAULT_HOST,
+      launcher,
+      registrationTimeoutMs: CLAIM_WINDOW_MS,
+    });
+
+    // Two launches in DIFFERENT directories, so each is unambiguously its own — one worker checks in,
+    // the other never does.
+    const ghost = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+    const live = await postLaunch(server, { cwd: OTHER_CWD, permissionMode: "default" });
+    const { sessionId: ghostId } = (await ghost.json()) as { sessionId: string };
+    const { sessionId: liveId } = (await live.json()) as { sessionId: string };
+    expect((await registerWorker(server, OTHER_CWD, "default")).status).toBe(201);
+
+    // The ghost is reaped on its own schedule — BOTH halves of it, for the same reason the all-ghosts
+    // sibling awaits both: the row goes synchronously while the terminal is closed only after the
+    // surface has been probed (#35), so a wait that settled on the row alone would race the ghost's
+    // OWN close and leave the sleep below silently carrying it…
+    await waitFor(() => !server.sessions.has(ghostId) && closeCount() === 1);
+    // …which leaves that sleep one job: room for the reaper's terminal half to have reached ACROSS to
+    // the live session, had it been going to, rather than the assertions below passing merely because
+    // it had not run yet…
+    await sleep(PAST_WINDOW_MS);
+
+    // …while the live session is untouched: its row survives, and EXACTLY one terminal was closed —
+    // the ghost's. A reaper that reached across to another session's ROW would empty this list; one
+    // that reached across to its TERMINAL would make this count 2. Both are the same catastrophe —
+    // a live worker's window closed out from under it — and this is the case that can see it.
+    expect(await listSessions(server)).toEqual([expect.objectContaining({ id: liveId, status: "connecting" })]);
+    expect(closeCount()).toBe(1);
+  });
+
   // The converse of the eviction AC, and the reason the claim exists at all: a session that DID
   // register must NEVER be evicted — that would close a LIVE session's terminal out from under it.
   it("a worker's registration CLAIMS its pending launch — same id, one row, and no eviction", async () => {
-    const TIMEOUT_MS = 40;
     const { launcher, closeCount } = fakeLauncher();
     const server = await startTestServer({
       port: 0,
       host: DEFAULT_HOST,
       launcher,
-      registrationTimeoutMs: TIMEOUT_MS,
+      registrationTimeoutMs: CLAIM_WINDOW_MS,
     });
 
     const launched = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
@@ -770,8 +913,10 @@ describe("the registering session, and its eviction (#33)", () => {
     expect(afterRegister).toEqual([expect.objectContaining({ id: sessionId, status: "connecting" })]);
 
     // Past the timeout the claimed session is STILL there — the eviction timer was disarmed, so the
-    // live session's terminal was never closed.
-    await sleep(TIMEOUT_MS * 4);
+    // live session's terminal was never closed. A NEGATIVE, so there is nothing to await into: the
+    // wait has to outlast the window itself, which is what makes this the one shape that pays for its
+    // window in wall-clock rather than decoupling away from it.
+    await sleep(CLAIM_WINDOW_MS + PAST_WINDOW_MS);
 
     expect(await listSessions(server)).toEqual([expect.objectContaining({ id: sessionId, status: "connecting" })]);
     expect(closeCount()).toBe(0);
@@ -781,13 +926,12 @@ describe("the registering session, and its eviction (#33)", () => {
   // even if the server compared raw strings. This is the same scenario with the one difference that
   // makes it real: an operator's cwd whose spelling is not the one the worker will report back.
   it("claims a launch made through a SYMLINKED cwd — the worker reports its RESOLVED `getcwd(3)`", async () => {
-    const TIMEOUT_MS = 40;
     const { launcher, launches, closeCount } = fakeLauncher();
     const server = await startTestServer({
       port: 0,
       host: DEFAULT_HOST,
       launcher,
-      registrationTimeoutMs: TIMEOUT_MS,
+      registrationTimeoutMs: CLAIM_WINDOW_MS,
     });
     expect(RESOLVED_CWD).not.toBe(LINKED_CWD); // the fixture is only meaningful if the spellings differ
 
@@ -803,7 +947,7 @@ describe("the registering session, and its eviction (#33)", () => {
     const registered = await registerWorker(server, RESOLVED_CWD, "default");
     expect(await registered.json()).toEqual({ session_id: sessionId });
 
-    await sleep(TIMEOUT_MS * 4);
+    await sleep(CLAIM_WINDOW_MS + PAST_WINDOW_MS);
 
     expect(await listSessions(server)).toEqual([expect.objectContaining({ id: sessionId, status: "connecting" })]);
     expect(closeCount()).toBe(0); // the live session's terminal was never closed
@@ -814,13 +958,12 @@ describe("the registering session, and its eviction (#33)", () => {
   // other conversation (#20). What it must still do is disarm a timer per registration, or a live
   // worker gets reaped as a ghost.
   it("refuses to guess between two launches sharing a cwd+mode — fresh ids, and no live terminal reaped", async () => {
-    const TIMEOUT_MS = 40;
     const { launcher, closeCount } = fakeLauncher();
     const server = await startTestServer({
       port: 0,
       host: DEFAULT_HOST,
       launcher,
-      registrationTimeoutMs: TIMEOUT_MS,
+      registrationTimeoutMs: CLAIM_WINDOW_MS,
     });
 
     const first = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
@@ -848,7 +991,7 @@ describe("the registering session, and its eviction (#33)", () => {
 
     // And the safety property both registrations bought: each consumed one pending launch, so no
     // eviction timer survives to close a terminal a live worker is sitting in.
-    await sleep(TIMEOUT_MS * 4);
+    await sleep(CLAIM_WINDOW_MS + PAST_WINDOW_MS);
 
     expect(await listSessions(server)).toHaveLength(2);
     expect(closeCount()).toBe(0);
@@ -858,13 +1001,12 @@ describe("the registering session, and its eviction (#33)", () => {
   // up. The claim consumes a record but cannot know WHICH launch registered — so neither terminal can
   // be proven dead, and a per-launch eviction would close the live worker's terminal half the time.
   it("evicts the stale row of a half-registered ambiguous pair WITHOUT closing either terminal", async () => {
-    const TIMEOUT_MS = 40;
     const { launcher, closeCount } = fakeLauncher();
     const server = await startTestServer({
       port: 0,
       host: DEFAULT_HOST,
       launcher,
-      registrationTimeoutMs: TIMEOUT_MS,
+      registrationTimeoutMs: CLAIM_WINDOW_MS,
     });
 
     await postLaunch(server, { cwd: CWD, permissionMode: "default" });
@@ -875,7 +1017,7 @@ describe("the registering session, and its eviction (#33)", () => {
     const registered = await registerWorker(server, CWD, "default");
     const { session_id: liveId } = (await registered.json()) as { session_id: string };
 
-    await sleep(TIMEOUT_MS * 4);
+    await sleep(CLAIM_WINDOW_MS + PAST_WINDOW_MS);
 
     // AC3 holds on the LIST — every stale `registering` row is gone, leaving only the live session…
     expect(await listSessions(server)).toEqual([expect.objectContaining({ id: liveId, status: "connecting" })]);
