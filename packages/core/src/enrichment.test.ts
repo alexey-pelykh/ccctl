@@ -17,6 +17,7 @@ import {
   requiresActionEnrichmentFromFrame,
   requiresActionEnrichmentFromValue,
   sessionActivityFromFrame,
+  validateAnswerAgainstEnrichment,
   type ControlFrame,
 } from "./index.js";
 
@@ -537,5 +538,112 @@ describe("multiSelect absence follows the source schema default (#261: not our g
     expect(
       requiresActionEnrichmentFromValue(wirePayload({ questions: [wireQuestion({ multiSelect: null })] })),
     ).toBeNull();
+  });
+});
+
+describe("validateAnswerAgainstEnrichment (#86: the stateful gate — fresh, single-use, bounded selection)", () => {
+  // The validator's precondition is a well-formed enrichment + envelope (each the product of a shape
+  // guard). These fixtures assert that — throwing on the `null` the fixture is written never to produce —
+  // so every case below holds a non-null value without a forbidden non-null assertion.
+  function parseEnrichment(payload: unknown) {
+    const parsed = requiresActionEnrichmentFromValue(payload);
+    if (parsed === null) {
+      throw new Error("test fixture: enrichment payload must be well-formed");
+    }
+    return parsed;
+  }
+  function envelope(value: unknown) {
+    const parsed = answerEnvelopeFromValue(value);
+    if (parsed === null) {
+      throw new Error("test fixture: answer envelope must be well-formed");
+    }
+    return parsed;
+  }
+  // A real parsed enrichment, off the ADR-005 wire fixture: sequence_num 7, one single-select question
+  // q0 offering Postgres / SQLite.
+  const enrichment = parseEnrichment(wirePayload());
+
+  it("accepts a well-formed single-select answer to the outstanding decision", () => {
+    expect(validateAnswerAgainstEnrichment(enrichment, envelope({ answers: { q0: ["Postgres"] } }), 7)).toEqual({
+      ok: true,
+    });
+  });
+
+  it("accepts a multi-select answer carrying ALL chosen labels (AC: multi-select round-trips)", () => {
+    const multi = parseEnrichment(
+      wirePayload({
+        sequence_num: 3,
+        questions: [
+          wireQuestion({
+            multiSelect: true,
+            options: [{ label: "Alpha" }, { label: "Beta" }, { label: "Gamma" }],
+          }),
+        ],
+      }),
+    );
+    expect(validateAnswerAgainstEnrichment(multi, envelope({ answers: { q0: ["Alpha", "Gamma"] } }), 3)).toEqual({
+      ok: true,
+    });
+  });
+
+  it("REFUSES a stale-turn tap — the sequence_num no longer matches the outstanding block (#86 anti-phantom)", () => {
+    // The phone rendered turn-7's options; turn-8's block is now outstanding. The tap is for the wrong decision.
+    expect(validateAnswerAgainstEnrichment(enrichment, envelope({ answers: { q0: ["Postgres"] } }), 8)).toEqual({
+      ok: false,
+      reason: "stale-decision",
+    });
+  });
+
+  it("REFUSES an answer that carries NO decision-id (absent sequence_num) — fail-closed toward safety", () => {
+    expect(validateAnswerAgainstEnrichment(enrichment, envelope({ answers: { q0: ["Postgres"] } }), null)).toEqual({
+      ok: false,
+      reason: "stale-decision",
+    });
+  });
+
+  it("checks freshness BEFORE labels — a stale answer whose labels happen to overlap is STILL stale, not accepted", () => {
+    // Postgres IS an offered label; the answer is refused purely because it is for a superseded decision,
+    // so the verdict cannot depend on an accidental label overlap between two turns.
+    expect(validateAnswerAgainstEnrichment(enrichment, envelope({ answers: { q0: ["Postgres"] } }), 6)).toEqual({
+      ok: false,
+      reason: "stale-decision",
+    });
+  });
+
+  it("REFUSES an id the outstanding decision does not ask (unknown-question)", () => {
+    // q1 is a well-formed id (passes the shape guard) but this enrichment has only q0.
+    expect(validateAnswerAgainstEnrichment(enrichment, envelope({ answers: { q1: ["Postgres"] } }), 7)).toEqual({
+      ok: false,
+      reason: "unknown-question",
+    });
+  });
+
+  it("REFUSES a label the worker never offered — a fresh answer is still not free-form (unoffered-label)", () => {
+    expect(validateAnswerAgainstEnrichment(enrichment, envelope({ answers: { q0: ["MySQL"] } }), 7)).toEqual({
+      ok: false,
+      reason: "unoffered-label",
+    });
+  });
+
+  it("REFUSES a single-select answered with more than one label (cardinality)", () => {
+    expect(
+      validateAnswerAgainstEnrichment(enrichment, envelope({ answers: { q0: ["Postgres", "SQLite"] } }), 7),
+    ).toEqual({ ok: false, reason: "cardinality" });
+  });
+
+  it("REFUSES a selection that repeats a label — a choice is a set (cardinality)", () => {
+    const multi = parseEnrichment(wirePayload({ sequence_num: 5, questions: [wireQuestion({ multiSelect: true })] }));
+    expect(validateAnswerAgainstEnrichment(multi, envelope({ answers: { q0: ["Postgres", "Postgres"] } }), 5)).toEqual({
+      ok: false,
+      reason: "cardinality",
+    });
+  });
+
+  it("validates EVERY answered question, refusing on the first that fails", () => {
+    const two = parseEnrichment(wirePayload({ sequence_num: 9, questions: [wireQuestion(), wireQuestion()] }));
+    // q0 is fine; q1 selects an unoffered label — the whole answer is refused.
+    expect(validateAnswerAgainstEnrichment(two, envelope({ answers: { q0: ["Postgres"], q1: ["MySQL"] } }), 9)).toEqual(
+      { ok: false, reason: "unoffered-label" },
+    );
   });
 });
