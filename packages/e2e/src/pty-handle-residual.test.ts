@@ -4,15 +4,21 @@
 import { describe, expect, it } from "vitest";
 import { closeSync, openSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import {
   classifyPtyHandleResidual,
   describePtyFence,
+  ESCALATION_CONTROL_WINDOW_MS,
+  ESCALATION_WINDOW_MS,
   LEAK_CONTROL_REAP_TIMEOUT_MS,
+  loadedNodePtyModules,
   PTY_RESIDUAL_CHECK,
   readHandleState,
   REAP_CONVERGENCE_TIMEOUT_MS,
   resolvePtyE2EEnv,
+  SIGHUP_IGNORING_WORKER_ARGS,
   WORKER_ARGS,
+  WORKER_LIFETIME_MS,
   WORKER_SLEEP_SECONDS,
   type HandleReading,
   type PtyResidualCapture,
@@ -45,15 +51,22 @@ const GONE: HandleReading = {
   fdErrno: "EBADF",
 };
 
+/** An arbitrary origin on the elapsed clock — the fixtures' spawn instant. */
+const SPAWNED_AT = 1_000;
+
+/** A healthy drive's after-teardown reading: milliseconds later, a whole worker-lifetime clear of the limit. */
+const SETTLED_AT = SPAWNED_AT + 42;
+
 /** A complete, healthy capture — every leg observed, the two readings DISAGREEING as they must. */
 function healthyCapture(overrides: Partial<PtyResidualCapture> = {}): PtyResidualCapture {
   return {
-    spawned: { pid: 4242, fd: 12 },
+    spawned: { pid: 4242, fd: 12, spawnedAt: SPAWNED_AT },
     launchStatus: 201,
     sessionId: "session-abc",
     listedStatus: "registering",
     atLaunch: LIVE,
     afterTeardown: GONE,
+    afterTeardownAt: SETTLED_AT,
     teardownDriven: true,
     ...overrides,
   };
@@ -99,28 +112,56 @@ describe("resolvePtyE2EEnv (#68) — the real-pty oracle's own fence", () => {
   });
 });
 
-describe("the worker sleep ⟷ convergence-window coupling (#68) — the invariant that fails as a GREEN", () => {
-  it("keeps the stand-in worker alive strictly past the drive's own tail", () => {
-    // THE guard on the subtlest trap in this oracle. If the `sleep` expired before the
-    // after-teardown reading, node-pty would reap the child — and close its master fd — on the
-    // child's OWN exit, and the drive would read a clean `verified` while crediting the daemon with
-    // a teardown it never performed. A LEAKING daemon would pass. The failure is invisible because
-    // it fails GREEN, so the floor is computed from the window rather than written down and hoped
-    // for — and this pins that it is really cleared, so raising one constant without the other
-    // fails HERE, loudly, instead of silently downgrading the oracle to a rubber stamp.
+describe("the worker sleep ⟷ convergence-window coupling (#68) — the MARGIN the #237 detection backstops", () => {
+  it("keeps the stand-in worker alive past the drive's own tail — the margin a healthy run passes on", () => {
+    // The trap: a `sleep` that expired before the after-teardown reading would be reaped — and its
+    // master fd closed — by node-pty on the child's OWN exit, and the drive would read a clean
+    // `verified` while crediting the daemon with a teardown it never performed. A LEAKING daemon
+    // would pass, and would pass as a GREEN.
+    //
+    // What this pins is the MARGIN, and #237 is explicit that the margin is not the guard: under the
+    // derivation the assertion is `3X > X`, so it fires only if WORKER_SLEEP_HEADROOM drops to <= 1.
+    // That is worth keeping — it is what makes a healthy run's sleep outlast its drive by 3x, and it
+    // fails loudly if someone raises the convergence window without carrying the sleep — but the
+    // DETECTION is `PTY_RESIDUAL_CHECK.workerOutlived` below, which measures the span that actually
+    // elapsed instead of trusting that it stayed inside this bound.
     expect(WORKER_SLEEP_SECONDS * 1_000).toBeGreaterThan(REAP_CONVERGENCE_TIMEOUT_MS);
   });
 
-  it("bakes the derived duration into the argv the launcher actually runs", () => {
-    // The derivation is worthless if the argv still carries a stale literal.
+  it("bakes the derived duration into BOTH argvs the launchers actually run", () => {
+    // The derivation is worthless if an argv still carries a stale literal.
     expect(WORKER_ARGS).toEqual(["-c", `exec sleep ${WORKER_SLEEP_SECONDS}`]);
+    expect(SIGHUP_IGNORING_WORKER_ARGS).toEqual(["-c", `trap '' HUP; exec sleep ${WORKER_SLEEP_SECONDS}`]);
     expect(WORKER_SLEEP_SECONDS).toBe(30);
+  });
+
+  it("derives the attribution limit from the sleep the worker really runs, not a second literal", () => {
+    // The threshold the #237 detection turns on must move with the sleep it is about; a hand-synced
+    // pair is exactly the thing that fails as a green.
+    expect(WORKER_LIFETIME_MS).toBe(WORKER_SLEEP_SECONDS * 1_000);
   });
 
   it("keeps the negative control's window BELOW the sleep — the safe direction for an override", () => {
     // A caller may only ever shorten the window (the control does, deliberately). A longer one would
     // reopen the hole from outside the module, which the derivation cannot prevent.
-    expect(LEAK_CONTROL_REAP_TIMEOUT_MS).toBeLessThan(WORKER_SLEEP_SECONDS * 1_000);
+    expect(LEAK_CONTROL_REAP_TIMEOUT_MS).toBeLessThan(WORKER_LIFETIME_MS);
+  });
+});
+
+describe("the escalation windows (#237) — the pair that makes the SIGKILL attribution honest", () => {
+  it("lets the POSITIVE's escalation fire well inside the drive's own tail", () => {
+    // A window at or past the convergence window would let the drive give up before the escalation
+    // it is named for had fired — the run would report a residual the backend was about to clear,
+    // which is a false RED rather than a false green, but a lie either way.
+    expect(ESCALATION_WINDOW_MS).toBeLessThan(REAP_CONVERGENCE_TIMEOUT_MS);
+  });
+
+  it("keeps the CONTROL's escalation provably UNREACHABLE inside its drive", () => {
+    // THE control's whole load-bearing property. If the escalation could fire before the control's
+    // reading, the stranded child would be reaped, the control would go green, and it would stop
+    // proving that the polite signal does not end this worker — taking the positive's attribution
+    // with it, silently.
+    expect(ESCALATION_CONTROL_WINDOW_MS).toBeGreaterThan(LEAK_CONTROL_REAP_TIMEOUT_MS);
   });
 });
 
@@ -305,6 +346,116 @@ describe("classifyPtyHandleResidual (#68) — the self-guard: the positive can n
   });
 });
 
+describe("classifyPtyHandleResidual (#237) — the ATTRIBUTION limit: a clean reading it may not credit", () => {
+  it("is INCONCLUSIVE when the reading landed at or past the stand-in's own lifetime", () => {
+    // THE #237 detection. The reviewer built this run empirically: drive the identical LEAKING daemon
+    // and change ONLY the worker's lifetime so it expires mid-drive, and the verdict flips from
+    // `drift` to `verified` — node-pty reaps the child on its OWN exit and closes the master fd, so a
+    // leaking daemon and a faithful one produce the same readings. `verified` there is fabricated.
+    const report = classifyPtyHandleResidual(healthyCapture({ afterTeardownAt: SPAWNED_AT + WORKER_LIFETIME_MS }));
+    expect(report.verdict).toBe("inconclusive");
+    expect(report.violations).toEqual([]);
+    expect(report.reason).toContain(PTY_RESIDUAL_CHECK.workerOutlived);
+    expect(report.reason).toContain("unattributable");
+  });
+
+  it("VERIFIES the very same readings one millisecond inside that lifetime — the limit is the span, not the readings", () => {
+    // The discriminator: nothing about WHAT was read changed. The whole difference is whether the run
+    // is entitled to credit it to the daemon.
+    const report = classifyPtyHandleResidual(healthyCapture({ afterTeardownAt: SPAWNED_AT + WORKER_LIFETIME_MS - 1 }));
+    expect(report.verdict).toBe("verified");
+  });
+
+  it("is INCONCLUSIVE when the after-teardown reading carries NO timestamp — an unmeasured span is not a short one", () => {
+    // The dodge this closes: if an unstamped reading skipped the check rather than failing it, a
+    // future edit that quietly stopped stamping would retire the detection as a GREEN — the exact
+    // failure mode #237 exists to end. So the cheaper path must be the one that cannot verify.
+    const report = classifyPtyHandleResidual(healthyCapture({ afterTeardownAt: undefined }));
+    expect(report.verdict).toBe("inconclusive");
+    expect(report.reason).toContain(PTY_RESIDUAL_CHECK.workerOutlived);
+  });
+
+  it("DRIFTS rather than going inconclusive when a slow drive ALSO observed a residual", () => {
+    // Ordering is load-bearing, and this is the case that proves it: a leak actually seen is a leak
+    // whenever it was seen. Downgrading it to "inconclusive" because the drive ran long would let a
+    // leaking daemon launder a real finding into a shrug.
+    const report = classifyPtyHandleResidual(
+      healthyCapture({
+        afterTeardown: { ...GONE, childPresent: true, childErrno: undefined },
+        afterTeardownAt: SPAWNED_AT + WORKER_LIFETIME_MS * 2,
+      }),
+    );
+    expect(report.verdict).toBe("drift");
+    expect(report.violations.join(" ")).toContain(PTY_RESIDUAL_CHECK.childReaped);
+  });
+
+  it("reports the span it earned on the PASS too — the verdict never lies about the axis it turned on", () => {
+    const report = classifyPtyHandleResidual(healthyCapture());
+    expect(report.verdict).toBe("verified");
+    expect(report.reason).toContain(
+      `${SETTLED_AT - SPAWNED_AT}ms into the stand-in's ${WORKER_LIFETIME_MS}ms lifetime`,
+    );
+  });
+});
+
+describe("the lazy-binding gate (#237) — importing @ccctl/server must NOT load the native binding", () => {
+  // THE gate. `defaultPtySpawner` does its `await import("node-pty")` INSIDE the closure, and
+  // everything rests on it: `describe.skipIf` skips a suite's EXECUTION but never its collection-time
+  // imports, so hoisting that import to module scope would break the credential-free CI lane at
+  // collection, as a module-resolution error naming nothing. This package's barrel widened the
+  // exposure by pulling the chain into the `test` lane's import graph too. Nothing caught it before.
+  //
+  // This file already imports `@ccctl/server` transitively (via ./pty-handle-residual.js), so by the
+  // time these run the barrel is loaded and the cache reading below is the invariant itself.
+
+  it("holds NO node-pty module in the require cache after @ccctl/server is loaded", async () => {
+    const require = createRequire(import.meta.url);
+    // Explicit and redundant (this file's own imports already loaded the barrel) — but it is the
+    // invariant's own words, so a reader need not trace the import graph to see what is claimed.
+    await import("@ccctl/server");
+    expect(
+      loadedNodePtyModules(Object.keys(require.cache)),
+      // The gate exists to turn a baffling collection-time module error on some other box into a
+      // sentence, so its OWN failure has to be the sentence.
+      'importing `@ccctl/server` loaded node-pty. `defaultPtySpawner`\'s `await import("node-pty")` ' +
+        "must stay INSIDE the closure (session-launcher-pty.ts): hoisted to module scope it loads the " +
+        "native binding on every import of the package, and `describe.skipIf` skips a suite's execution " +
+        "but NOT its collection-time imports — so this lands on the credential-free CI lane, at " +
+        "collection, on every box that cannot build the binding. Keep the import lazy.",
+    ).toEqual([]);
+  });
+
+  it("would SEE the binding if it were loaded — the probe's own self-guard, over the REAL path shapes", () => {
+    // The half that keeps the gate above from passing because the filter is broken rather than
+    // because the cache is clean. An absence-assertion whose probe cannot see a presence is the
+    // vacuous green this whole package is built to refuse — and here it would be silent, because a
+    // filter matching nothing reads exactly like an invariant that holds.
+    //
+    // The fixtures are the cache keys a real `import("node-pty")` actually produces (observed on
+    // darwin-arm64 / node-pty 1.1.0 / Node 26), plus the native addon, which is required through the
+    // same cache and is the thing that must never load on an unarmed box.
+    const loaded = loadedNodePtyModules([
+      "/repo/node_modules/.pnpm/node-pty@1.1.0/node_modules/node-pty/lib/index.js",
+      "/repo/node_modules/.pnpm/node-pty@1.1.0/node_modules/node-pty/lib/unixTerminal.js",
+      "/repo/node_modules/.pnpm/node-pty@1.1.0/node_modules/node-pty/build/Release/pty.node",
+    ]);
+    expect(loaded).toHaveLength(3);
+  });
+
+  it("does not read an unrelated path as a load — the pnpm store segment, and a lookalike directory", () => {
+    // `node-pty@1.1.0` is a store segment, not the package dir; `node-pty-notes` is somebody's
+    // checkout path. Neither is the binding, and a gate that failed on either would be noise the next
+    // reader learns to ignore.
+    expect(
+      loadedNodePtyModules([
+        "/repo/node_modules/.pnpm/node-pty@1.1.0/node_modules/vitest/dist/index.js",
+        "/home/dev/node-pty-notes/scratch.js",
+        "/repo/packages/e2e/src/pty-handle-residual.ts",
+      ]),
+    ).toEqual([]);
+  });
+});
+
 describe("classifyPtyHandleResidual (#68) — inconclusive: skips, never fakes", () => {
   it("is INCONCLUSIVE when the real backend never brought a pty up, and names the daemon's own reason", () => {
     // The default-checkout outcome: node-pty cannot load, or loads but cannot spawn — for the two
@@ -331,7 +482,12 @@ describe("classifyPtyHandleResidual (#68) — inconclusive: skips, never fakes",
 
   it("is INCONCLUSIVE when the handle exposes no master fd — a ConPTY is not a POSIX pty", () => {
     const report = classifyPtyHandleResidual(
-      healthyCapture({ spawned: { pid: 4242, fd: undefined }, atLaunch: undefined, afterTeardown: undefined }),
+      healthyCapture({
+        spawned: { pid: 4242, fd: undefined, spawnedAt: SPAWNED_AT },
+        atLaunch: undefined,
+        afterTeardown: undefined,
+        afterTeardownAt: undefined,
+      }),
     );
     expect(report.verdict).toBe("inconclusive");
     expect(report.reason).toContain(PTY_RESIDUAL_CHECK.masterFd);

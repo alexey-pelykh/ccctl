@@ -17,8 +17,11 @@ import { launchRequest } from "@ccctl/web-ui/src/launch.js";
 import {
   createLeakingPtyLauncher,
   createObservedPtyLauncher,
+  createSighupIgnoringPtyLauncher,
   describePtyFence,
   drivePtyHandleResidual,
+  ESCALATION_CONTROL_WINDOW_MS,
+  ESCALATION_WINDOW_MS,
   LEAK_CONTROL_REAP_TIMEOUT_MS,
   PTY_REGISTRATION_TIMEOUT_MS,
   PTY_RESIDUAL_CHECK,
@@ -196,6 +199,122 @@ describe.skipIf(!fence.ready)(`ccctl e2e: the REAL node-pty handle residual (#68
         }
       } finally {
         // This launcher leaks ON PURPOSE — kill the child it stranded, whatever the verdict was.
+        reap();
+      }
+    });
+  });
+
+  describe("Rule: a child that IGNORES the polite signal is still reaped — the backend escalates to SIGKILL", () => {
+    // The other half of `close()` (#237). The rule above drives a `sleep`, which dies on the polite
+    // signal, so it only ever exercises the COOPERATIVE path — leaving the escalation proven solely by
+    // #30's unit suite, against a fake whose `kill()` fires a synthetic `onExit`. That is the very
+    // argument this oracle rejects for the polite path ("a claim about the OPERATING SYSTEM, and only a
+    // real pty can be asked"), so the escalation carried the gap the happy path no longer does. These
+    // two ask the kernel instead, with a stand-in that really ignores a real signal.
+
+    it("VERIFIES that the escalation reaps a child the polite signal could not (AC2)", async (ctx) => {
+      // The REAL backend again — the only differences from the positive above are the stand-in's argv
+      // (it traps the polite signal) and a short escalation window. Nothing about the orchestration is
+      // faked: this is `createPtySessionLauncher` on the real `defaultPtySpawner`, and the SIGKILL is
+      // the backend's own, fired by its own timer.
+      const { launcher, observed, reap, armed } = createSighupIgnoringPtyLauncher(ESCALATION_WINDOW_MS);
+      const server = await startServer({ port: 0, launcher, registrationTimeoutMs: PTY_REGISTRATION_TIMEOUT_MS });
+      started.push(server);
+      const cwd = await freshCanonicalCwd();
+
+      try {
+        const report = await drivePtyHandleResidual({
+          server,
+          observed,
+          cwd,
+          buildLaunchRequest: (dir) =>
+            launchRequest({ cwd: dir, project: PTY_PROJECT, initialPrompt: PTY_INITIAL_PROMPT }),
+          teardown: () => server.close(),
+        });
+
+        // A stand-in that never armed is one the polite signal COULD have ended, so a green below would
+        // mean nothing (see SIGHUP_IGNORING_WORKER_ARMED_COMMAND — this is the startup race). Not a
+        // failure: the question was never askable, which is a skip in this package's vocabulary.
+        if (!armed()) {
+          ctx.skip("the SIGHUP-ignoring stand-in never armed — the escalation cannot be asked about here");
+          return;
+        }
+
+        switch (report.verdict) {
+          case "verified":
+            // The kernel confirmed the child gone (ESRCH — reaped, not a zombie) and the master fd
+            // released, for a child that the control below proves the polite signal does NOT end. So
+            // the escalation is the only thing that can have done it, and it did it against the real
+            // binding rather than a fake's synthetic `onExit`.
+            expect(report.violations).toEqual([]);
+            break;
+          case "drift":
+            // The escalation did not land: the trapping child outlived the whole teardown. That is the
+            // orphan-with-an-open-pty-fd AC2 forbids, and the one `session-launcher-pty.ts` § `close`
+            // names as the case where "every layer above this fails together".
+            expect.fail(`SIGKILL escalation DRIFT: ${report.violations.join("; ")} — ${report.reason}`);
+            break;
+          case "inconclusive":
+            ctx.skip(`escalation run inconclusive — ${report.reason}`);
+            break;
+        }
+      } finally {
+        // This stand-in ignores the polite signal, so SIGKILL is the only thing that can clean up after
+        // a run that failed before the backend's own escalation fired.
+        reap();
+      }
+    });
+
+    it("DETECTS that the polite signal alone does NOT end it — the control that licenses the attribution", async (ctx) => {
+      // Without this, the run above is titled after the escalation while proving nothing about it. A
+      // stand-in that quietly stopped trapping — a `trap` typo, a shell that reset the disposition, a
+      // node-pty that grew a process-group kill — would make it green via the POLITE path, and the
+      // suite would report a passing escalation test that never escalated.
+      //
+      // So: the same real backend, the same trapping stand-in, with the escalation pushed out of
+      // reach. Nothing but the polite signal can fire inside this drive — and the child must therefore
+      // still be there.
+      const { launcher, observed, reap, armed } = createSighupIgnoringPtyLauncher(ESCALATION_CONTROL_WINDOW_MS);
+      const server = await startServer({ port: 0, launcher, registrationTimeoutMs: PTY_REGISTRATION_TIMEOUT_MS });
+      started.push(server);
+      const cwd = await freshCanonicalCwd();
+
+      try {
+        const report = await drivePtyHandleResidual({
+          server,
+          observed,
+          cwd,
+          buildLaunchRequest: (dir) =>
+            launchRequest({ cwd: dir, project: PTY_PROJECT, initialPrompt: PTY_INITIAL_PROMPT }),
+          teardown: () => server.close(),
+          // The escalation cannot fire inside this window — that is the point. Waiting the full
+          // convergence window would only be slower to reach a verdict already readable.
+          reapTimeoutMs: LEAK_CONTROL_REAP_TIMEOUT_MS,
+        });
+
+        if (!armed()) {
+          ctx.skip("the SIGHUP-ignoring stand-in never armed — nothing to control for");
+          return;
+        }
+
+        switch (report.verdict) {
+          case "drift":
+            // The stand-in really is deaf to the polite signal: it survived it, holding its pty master
+            // fd open. Which is what makes the run above a statement about the escalation.
+            expect(report.violations.join(" ")).toContain(PTY_RESIDUAL_CHECK.childReaped);
+            break;
+          case "verified":
+            expect.fail(
+              "the stand-in died WITHOUT the escalation — the polite signal ended it, so the run above " +
+                "proves nothing about the SIGKILL path it is named for",
+            );
+            break;
+          case "inconclusive":
+            ctx.skip(`escalation control inconclusive — ${report.reason}`);
+            break;
+        }
+      } finally {
+        // Stranded BY CONSTRUCTION — the escalation was armed past this drive on purpose.
         reap();
       }
     });
