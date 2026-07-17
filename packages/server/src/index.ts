@@ -72,6 +72,7 @@ import {
   matchWorkerRoute,
   type WorkerChannelRecord,
 } from "./worker-channel.js";
+import { type HookInstall } from "./hook-settings-installer.js";
 import {
   closeEventStreams,
   createSessionEventRelays,
@@ -684,6 +685,15 @@ interface ServerState {
    * the enrichment is DISPLAY data, so it can never set or clear the #40 needs-you signal.
    */
   readonly requiresActionEnrichments: Map<string, RequiresActionEnrichment>;
+  /**
+   * A launch's `AskUserQuestion` hook install record (#262, #78 Option A), keyed by ccctl session id.
+   * Populated by {@link launchTrackedSession} right after a launch succeeds; consumed exactly once by
+   * `worker-channel.ts` § `reconcileHookHandoff` at the moment it observes THIS session's transition
+   * into `requires_action`; cleaned up on session close ({@link closeSession}) whether or not it was
+   * ever consumed. See {@link WorkerChannelState.hookInstalls} for why this is a SEPARATE map from
+   * {@link requiresActionEnrichments} above.
+   */
+  readonly hookInstalls: Map<string, HookInstall>;
   /** The injected session launcher (#31), or `undefined` when this server was configured without one. */
   readonly launcher: ISessionLauncher | undefined;
   /**
@@ -945,6 +955,7 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     workerChannels: new Map<string, WorkerChannelRecord>(),
     eventRelays: createSessionEventRelays(),
     requiresActionEnrichments: new Map<string, RequiresActionEnrichment>(),
+    hookInstalls: new Map<string, HookInstall>(),
     launcher: config.launcher,
     launchedSurfaces: new Map<string, LaunchedSession>(),
     maxSessions: config.maxSessions ?? DEFAULT_MAX_SESSIONS,

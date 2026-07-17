@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { startServer, type CcctlServer, type SurfaceLiveness } from "@ccctl/server";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { startServer, XDG_STATE_HOME_ENV, type CcctlServer, type SurfaceLiveness } from "@ccctl/server";
 import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "@ccctl/server/src/session-launcher.js";
 import { buildProgram } from "@ccctl/cli";
 import { launchRequest } from "@ccctl/web-ui/src/launch.js";
@@ -91,6 +94,31 @@ function fakeLauncher({
   };
   return { launcher, launches };
 }
+
+/**
+ * A disposable directory THIS FILE's `AskUserQuestion` hook installs are routed to, via
+ * `XDG_STATE_HOME` (#262) — mirrors `ui-session-launch.test.ts`'s own fixture. Every launch driven
+ * below runs through the REAL, wired `launchSession`, which installs a REAL hook (synchronous,
+ * best-effort, never mocked out); without this override every run of this suite would write
+ * settings/handoff files under the developer's own `~/.local/state/ccctl/hooks`.
+ */
+let hookStateRoot = "";
+let previousXdgStateHome: string | undefined;
+
+beforeAll(() => {
+  hookStateRoot = mkdtempSync(join(tmpdir(), "ccctl-hook-state-"));
+  previousXdgStateHome = process.env[XDG_STATE_HOME_ENV];
+  process.env[XDG_STATE_HOME_ENV] = hookStateRoot;
+});
+
+afterAll(() => {
+  if (previousXdgStateHome === undefined) {
+    Reflect.deleteProperty(process.env, XDG_STATE_HOME_ENV);
+  } else {
+    process.env[XDG_STATE_HOME_ENV] = previousXdgStateHome;
+  }
+  rmSync(hookStateRoot, { recursive: true, force: true });
+});
 
 const started: CcctlServer[] = [];
 

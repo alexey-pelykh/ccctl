@@ -65,6 +65,7 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { isNonPromptingPermissionMode, isPermissionMode } from "@ccctl/core";
+import { cleanupHookInstall, installAskUserQuestionHookSettings, type HookInstall } from "./hook-settings-installer.js";
 import { readJsonBody, writeJson } from "./http-response.js";
 import {
   clearPendingLaunches,
@@ -201,6 +202,18 @@ export interface SessionLaunchState extends PendingLaunchState {
    * decrement would permanently shrink the cap for the life of the process.
    */
   readonly launchReservations: Set<symbol>;
+  /**
+   * A launch's `AskUserQuestion` hook install record (#262, #78 Option A) — BOTH the settings
+   * path and the handoff path a hook writes its capture to — keyed by the ccctl session id.
+   * Populated HERE, right after the id is minted on a successful launch. The handoff path is
+   * consumed exactly once by `worker-channel.ts` § `reconcileHookHandoff` at the moment it
+   * observes THIS session's transition into `requires_action`; BOTH files are removed on session
+   * close (`session-close.ts`, via {@link cleanupHookInstall}) so neither survives its session,
+   * consumed or not. NOT the same map as {@link ServerState.requiresActionEnrichments} (#264) —
+   * that one holds a PARSED, validated enrichment already correlated to a block; this one holds
+   * raw file paths, for a block that may not even exist yet.
+   */
+  readonly hookInstalls: Map<string, HookInstall>;
 }
 
 /**
@@ -462,13 +475,47 @@ export async function launchSession(state: SessionLaunchState, options: SessionL
   // burst) because a zero-delay fake resolves in a microtask and hides the race completely.
   const reservation = Symbol("ccctl.launch-reservation");
   state.launchReservations.add(reservation);
+  // Install the `AskUserQuestion` hook settings for THIS launch attempt (#262, #78 Option A) —
+  // synchronous (see `hook-settings-installer.ts`), so it costs no `await` inside the atomic
+  // check-and-take window above. Keyed by a FRESH token, never the eventual session id: that id
+  // is minted only on a successful launch (below), specifically so a FAILED launch touches no
+  // session-registry state — the hook install must not create an exception to that rule. A
+  // failure to install (disk full, permission denied) degrades to a launch with no hook wired
+  // rather than failing the whole launch: the hook is enrichment, never the block itself.
+  let hookInstall: HookInstall | undefined;
   try {
-    const launched = await state.launcher.launch(resolved);
+    hookInstall = installAskUserQuestionHookSettings(randomUUID());
+  } catch (error) {
+    state.logger.log({
+      category: "error",
+      level: "warn",
+      event: "launch-failed",
+      sessionId: null,
+      detail: `ask-user-question hook settings install failed, launching without it: ${String(error)}`,
+    });
+  }
+  try {
+    const withSettings: SessionLaunchOptions =
+      hookInstall === undefined ? resolved : { ...resolved, settingsPath: hookInstall.settingsPath };
+    const launched = await state.launcher.launch(withSettings);
     // The surface is up. From here the session EXISTS — visible as `registering` until its worker
     // registers (claim) or the timeout reaps it (evict). Both halves live in `pending-launch.ts`.
     const sessionId = randomUUID();
     trackPendingLaunch(state, sessionId, resolved, launched);
+    if (hookInstall !== undefined) {
+      // Register the handoff path under the NOW-KNOWN session id, so `worker-channel.ts` can find
+      // it purely from the id it already keys everything else on — no cross-reference to the
+      // install token needed anywhere past this line.
+      state.hookInstalls.set(sessionId, hookInstall);
+    }
     return { sessionId, launched };
+  } catch (error) {
+    // A launch that FAILS touches no session-registry state (the "no half-registered ghost"
+    // invariant, unchanged below) — and must equally leave no orphaned hook-install files behind.
+    if (hookInstall !== undefined) {
+      cleanupHookInstall(hookInstall);
+    }
+    throw error;
   } finally {
     // Release in a `finally`, so the slot is handed over on success and given back on failure. The
     // handover is seamless: `trackPendingLaunch` has already written the `registering` row by the time

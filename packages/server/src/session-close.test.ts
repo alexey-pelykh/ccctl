@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   createSession,
@@ -13,6 +16,7 @@ import {
   type Session,
 } from "@ccctl/core";
 import { createSessionEventRelays, relayFor } from "./event-stream.js";
+import type { HookInstall } from "./hook-settings-installer.js";
 import { closeSession, SESSION_CLOSED_EVENT_TYPE, type SessionCloseState } from "./session-close.js";
 
 // The terminal-transition seam (#76) in ISOLATION — the one place a session ENDS, whichever of the two
@@ -25,6 +29,7 @@ function makeState(logger: Logger = NO_OP_LOGGER): SessionCloseState {
     sessions: new Map<string, Session>(),
     eventRelays: createSessionEventRelays(),
     requiresActionEnrichments: new Map<string, RequiresActionEnrichment>(),
+    hookInstalls: new Map<string, HookInstall>(),
     logger,
   };
 }
@@ -132,6 +137,43 @@ describe("closeSession", () => {
 
     expect(state.sessions.has("sess-1")).toBe(false);
     expect(state.requiresActionEnrichments.has("sess-1")).toBe(false);
+  });
+
+  it("cleans up a session's AskUserQuestion hook install — settings + handoff files removed, consumed or not (#262)", () => {
+    // A session may close with its hook install NEVER consumed: no `AskUserQuestion` was ever asked, or
+    // one was asked but the session ended before `worker-channel.ts` § `reconcileHookHandoff` ever ran.
+    // Either way, this seam — not the consumer — is what must not let those files outlive the session,
+    // exactly mirroring the enrichment reap above for a SEPARATE, file-based piece of per-session state.
+    const scratch = mkdtempSync(join(tmpdir(), "ccctl-hook-close-"));
+    try {
+      const settingsPath = join(scratch, "install.settings.json");
+      const handoffPath = join(scratch, "install.handoff.json");
+      writeFileSync(settingsPath, "{}");
+      writeFileSync(handoffPath, "{}");
+      const state = makeState();
+      state.sessions.set("sess-1", markSessionReady(createSession("sess-1", "default")));
+      state.hookInstalls.set("sess-1", { settingsPath, handoffPath });
+
+      closeSession(state, "sess-1");
+
+      expect(state.hookInstalls.has("sess-1")).toBe(false);
+      expect(existsSync(settingsPath)).toBe(false);
+      expect(existsSync(handoffPath)).toBe(false);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("is a no-op for a session with no hook install — closing never throws when nothing was ever wired (#262)", () => {
+    // The ordinary case: most sessions never call `AskUserQuestion`, so `hookInstalls` holds no entry
+    // for them at all. Every OTHER test in this file already exercises this path implicitly (none of
+    // them populate `hookInstalls`); this test states it as its own claim rather than leaving it
+    // merely implied by the others not crashing.
+    const state = makeState();
+    state.sessions.set("sess-1", markSessionReady(createSession("sess-1", "default")));
+
+    expect(() => closeSession(state, "sess-1")).not.toThrow();
+    expect(state.hookInstalls.size).toBe(0);
   });
 
   it("does not clobber an `errored` session to `closed` — the diagnosis outlives the stop (AC4)", () => {

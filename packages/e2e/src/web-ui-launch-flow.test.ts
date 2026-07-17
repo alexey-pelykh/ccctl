@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { startServer, type CcctlServer } from "@ccctl/server";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { startServer, XDG_STATE_HOME_ENV, type CcctlServer } from "@ccctl/server";
 import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "@ccctl/server/src/session-launcher.js";
 import { describeLaunchAccepted, launchFailure, launchRequest } from "@ccctl/web-ui/src/launch.js";
 import { notificationsDegraded, sessionLabel } from "@ccctl/web-ui/src/sessions.js";
@@ -44,6 +45,32 @@ function fakeLauncher({ attachable = true, hint = "tmux attach -t ccctl:1" } = {
   };
   return { launcher, launches };
 }
+
+/**
+ * A disposable directory THIS FILE's `AskUserQuestion` hook installs are routed to, via
+ * `XDG_STATE_HOME` (#262) — mirrors `ui-session-launch.test.ts`'s own fixture. Every `postLaunch()`
+ * call below drives a REAL `POST /api/sessions` through the REAL, wired `launchSession`, which
+ * installs a REAL hook (synchronous, best-effort, never mocked out); without this override every run
+ * of this suite would write settings/handoff files under the developer's own
+ * `~/.local/state/ccctl/hooks`.
+ */
+let hookStateRoot = "";
+let previousXdgStateHome: string | undefined;
+
+beforeAll(() => {
+  hookStateRoot = mkdtempSync(join(tmpdir(), "ccctl-hook-state-"));
+  previousXdgStateHome = process.env[XDG_STATE_HOME_ENV];
+  process.env[XDG_STATE_HOME_ENV] = hookStateRoot;
+});
+
+afterAll(() => {
+  if (previousXdgStateHome === undefined) {
+    Reflect.deleteProperty(process.env, XDG_STATE_HOME_ENV);
+  } else {
+    process.env[XDG_STATE_HOME_ENV] = previousXdgStateHome;
+  }
+  rmSync(hookStateRoot, { recursive: true, force: true });
+});
 
 const started: CcctlServer[] = [];
 
@@ -91,7 +118,15 @@ describe("the New session control's launch body (#37 AC1)", () => {
     // The server's own parse accepted every field, trimmed, and passed them to the launcher — so the
     // browser's optional prompt + working directory/project really do reach the launch.
     expect(launches).toEqual([
-      { cwd: process.cwd(), permissionMode: "default", project: "checkout", initialPrompt: "ship it" },
+      {
+        cwd: process.cwd(),
+        permissionMode: "default",
+        project: "checkout",
+        initialPrompt: "ship it",
+        // The `AskUserQuestion` hook install (#262) wires a REAL, per-launch settings file under
+        // `hookStateRoot` above — a real path, not a fixture, so only its type is pinned here.
+        settingsPath: expect.any(String) as unknown as string,
+      },
     ]);
   });
 
@@ -112,7 +147,11 @@ describe("the New session control's launch body (#37 AC1)", () => {
 
     await postLaunch(server, launchRequest({ cwd: process.cwd(), project: "   ", initialPrompt: "" }));
 
-    expect(launches[0]).toEqual({ cwd: process.cwd(), permissionMode: "default" });
+    expect(launches[0]).toEqual({
+      cwd: process.cwd(),
+      permissionMode: "default",
+      settingsPath: expect.any(String) as unknown as string,
+    });
   });
 });
 

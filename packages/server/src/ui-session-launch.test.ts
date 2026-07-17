@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { SESSIONS_PATH } from "@ccctl/core";
 import { DEFAULT_HOST, DEFAULT_MAX_SESSIONS, startServer, type CcctlServer, type ServerConfig } from "./index.js";
+import { XDG_STATE_HOME_ENV } from "./session-store-file.js";
 import {
   isLaunchFailureCode,
   LAUNCH_FAILURE_CODES,
@@ -53,6 +54,34 @@ beforeAll(() => {
 
 afterAll(() => {
   rmSync(fixtureRoot, { recursive: true, force: true });
+});
+
+/**
+ * A disposable directory THIS FILE's `AskUserQuestion` hook installs are routed to, via
+ * `XDG_STATE_HOME` (#262). Every launch exercised in this file installs a REAL hook
+ * (`ui-session-launch.ts` § `launchSession` — synchronous, best-effort, never mocked out), so
+ * without this override every run of this suite would write settings/handoff files under the
+ * developer's own `~/.local/state/ccctl/hooks` — this keeps that state hermetic to the test run,
+ * mirroring `fixtureRoot` above. `installAskUserQuestionHookSettings`'s own `resolveHookStateDir()`
+ * default re-reads `process.env` on every call (it is a default PARAMETER expression, evaluated per
+ * invocation), so stubbing the env var once here is enough for every launch in the file to honor it.
+ */
+let hookStateRoot = "";
+let previousXdgStateHome: string | undefined;
+
+beforeAll(() => {
+  hookStateRoot = mkdtempSync(join(tmpdir(), "ccctl-hook-state-"));
+  previousXdgStateHome = process.env[XDG_STATE_HOME_ENV];
+  process.env[XDG_STATE_HOME_ENV] = hookStateRoot;
+});
+
+afterAll(() => {
+  if (previousXdgStateHome === undefined) {
+    Reflect.deleteProperty(process.env, XDG_STATE_HOME_ENV);
+  } else {
+    process.env[XDG_STATE_HOME_ENV] = previousXdgStateHome;
+  }
+  rmSync(hookStateRoot, { recursive: true, force: true });
 });
 
 /**
@@ -260,8 +289,15 @@ describe("POST /api/sessions (launch)", () => {
     // RESOLVED (#33). That is not incidental normalization: the worker in that terminal reports its own
     // `getcwd(3)` when it registers, and that report is matched against the cwd this launch recorded —
     // so rooting the terminal at the operator's spelling instead would break the correlation and let
-    // the eviction timer reap a live session.
-    expect(launches[0]).toEqual({ cwd: RESOLVED_CWD, permissionMode: "plan", project: "atlas", initialPrompt: "go" });
+    // the eviction timer reap a live session. `settingsPath` (#262) rides every real launch too — its
+    // own shape is pinned by the dedicated wiring tests below, so it is only asserted PRESENT here.
+    expect(launches[0]).toEqual({
+      cwd: RESOLVED_CWD,
+      permissionMode: "plan",
+      project: "atlas",
+      initialPrompt: "go",
+      settingsPath: expect.any(String) as unknown as string,
+    });
   });
 
   it("omits project and initialPrompt when the body does not carry them", async () => {
@@ -272,7 +308,11 @@ describe("POST /api/sessions (launch)", () => {
     // so this test uses a launchable mode; its point is that the OPTIONALS are omitted when absent.
     await postLaunch(server, { cwd: CWD, permissionMode: "plan" });
 
-    expect(launches[0]).toEqual({ cwd: CWD, permissionMode: "plan" });
+    expect(launches[0]).toEqual({
+      cwd: CWD,
+      permissionMode: "plan",
+      settingsPath: expect.any(String) as unknown as string,
+    });
     expect(launches[0]).not.toHaveProperty("project");
     expect(launches[0]).not.toHaveProperty("initialPrompt");
   });
@@ -339,6 +379,48 @@ describe("POST /api/sessions (launch)", () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ sessions: [] });
+  });
+});
+
+// The `AskUserQuestion` hook install (#262, #78 Option A): every launch wires a `--settings <path>`
+// (via `SessionLaunchOptions.settingsPath`) at a REAL, install-produced settings file — and a launch
+// whose install fails degrades to one with no hook wired, rather than failing outright.
+describe("AskUserQuestion hook install wiring (#262, #78 Option A)", () => {
+  it("wires a real, install-produced settingsPath into the launch options", async () => {
+    const { launcher, launches } = fakeLauncher();
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
+
+    const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+
+    expect(res.status).toBe(201);
+    const { settingsPath } = launches[0] as { settingsPath?: string };
+    expect(typeof settingsPath).toBe("string");
+    // Not a fabricated string: the REAL installer ran and actually wrote a settings file there —
+    // proof of WIRING, not merely that some value landed in the field.
+    expect(existsSync(settingsPath as string)).toBe(true);
+  });
+
+  it("degrades gracefully when the hook install fails — the launch still succeeds, with no settingsPath", async () => {
+    const { launcher, launches } = fakeLauncher();
+    const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
+
+    // Force `installAskUserQuestionHookSettings` to throw, deterministically, on the real filesystem:
+    // point `XDG_STATE_HOME` at a path that is itself a FILE, so the hook state directory can never be
+    // created under it (`mkdirSync` throws `ENOTDIR`) — no injected/fake seam needed.
+    const blocker = join(hookStateRoot, "blocks-hook-state-mkdir");
+    writeFileSync(blocker, "");
+    const previous = process.env[XDG_STATE_HOME_ENV];
+    process.env[XDG_STATE_HOME_ENV] = blocker;
+    try {
+      const res = await postLaunch(server, { cwd: CWD, permissionMode: "default" });
+      // The hook install failing must never fail the launch itself — it is enrichment, never the block.
+      expect(res.status).toBe(201);
+    } finally {
+      process.env[XDG_STATE_HOME_ENV] = previous;
+    }
+
+    expect(launches).toHaveLength(1);
+    expect(launches[0]).not.toHaveProperty("settingsPath");
   });
 });
 

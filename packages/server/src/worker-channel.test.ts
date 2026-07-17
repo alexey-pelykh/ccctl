@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { request as httpRequest, type IncomingMessage } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   DEFAULT_HEARTBEAT_STALE_AFTER_MS,
   DEFAULT_REQUIRES_ACTION_DETAIL,
@@ -17,6 +20,8 @@ import {
   type PermissionMode,
 } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
+import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions, SurfaceLiveness } from "./session-launcher.js";
+import { XDG_STATE_HOME_ENV } from "./session-store-file.js";
 import {
   DEFAULT_SESSION_EVICTION_GRACE_MS,
   DEFAULT_SESSION_IDLE_THRESHOLD_MS,
@@ -2162,5 +2167,245 @@ describe("§5 AskUserQuestion enrichment transport — buffer / serve / drop + t
     expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
     const [summary] = await sessionSummaries(server);
     expect(summary.enrichment).toBeUndefined();
+  });
+});
+
+// --- #262 / #78 Option A: PreToolUse hook handoff correlation ---
+
+describe("§4/§5 AskUserQuestion hook-handoff correlation (#262, #78 Option A)", () => {
+  // `hookInstalls` is populated ONLY by a REAL launch through `ui-session-launch.ts` § `launchSession`
+  // — never a bare §2 registration, which every OTHER section in this file uses to create its sessions.
+  // A session this server did not LAUNCH structurally cannot have hook wiring (the `--settings` flag is
+  // baked into its OWN launch argv), so these tests launch via the programmatic `server.launchSession`
+  // with a fake launcher, then CLAIM (§2) and REGISTER (§4) exactly as a real worker would, before
+  // driving the same status/event traffic every other section in this file uses.
+
+  let hookStateRoot = "";
+  let previousXdgStateHome: string | undefined;
+
+  beforeAll(() => {
+    hookStateRoot = mkdtempSync(join(tmpdir(), "ccctl-hook-correlate-"));
+    previousXdgStateHome = process.env[XDG_STATE_HOME_ENV];
+    process.env[XDG_STATE_HOME_ENV] = hookStateRoot;
+  });
+
+  afterAll(() => {
+    if (previousXdgStateHome === undefined) {
+      Reflect.deleteProperty(process.env, XDG_STATE_HOME_ENV);
+    } else {
+      process.env[XDG_STATE_HOME_ENV] = previousXdgStateHome;
+    }
+    rmSync(hookStateRoot, { recursive: true, force: true });
+  });
+
+  /** A recording fake launcher — remembers every `SessionLaunchOptions` it is called with. */
+  function fakeLauncher(): { launcher: ISessionLauncher; launches: SessionLaunchOptions[] } {
+    const launches: SessionLaunchOptions[] = [];
+    return {
+      launcher: {
+        launch: (options: SessionLaunchOptions): Promise<LaunchedSession> => {
+          launches.push(options);
+          return Promise.resolve({
+            attachment: { attachable: true, hint: "tmux attach -t ccctl:1" },
+            liveness: (): Promise<SurfaceLiveness> => Promise.resolve("alive-server-owned"),
+            close: (): Promise<void> => Promise.resolve(),
+          });
+        },
+      },
+      launches,
+    };
+  }
+
+  /** A server wired with the recording fake launcher — the launcher every test in this block needs. */
+  async function startHookTestServer(): Promise<{ server: CcctlServer; launches: SessionLaunchOptions[] }> {
+    const { launcher, launches } = fakeLauncher();
+    const server = await startServer({ port: 0, host: DEFAULT_HOST, launcher });
+    started.push(server);
+    return { server, launches };
+  }
+
+  /** §2 — claim a pending launch at the exact cwd it was launched at (the correlation key, #33). */
+  function claimLaunch(server: CcctlServer, cwd: string, permissionMode = "default"): Promise<Response> {
+    return fetch(`${base(server)}${SESSIONS_PATH}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${ACCOUNT_BEARER}` },
+      body: JSON.stringify({
+        session_context: { model: "claude-opus-4-8", cwd },
+        source: "ui",
+        permission_mode: permissionMode,
+      }),
+    });
+  }
+
+  /**
+   * Launch a session WITH a real hook install (routed to `hookStateRoot`), claim it, and open its §4
+   * channel — the full lifecycle a real worker drives, short of the hook script itself ever running.
+   * Returns the session id, its worker epoch, and the handoff path its hook install would write to.
+   */
+  async function launchWithHook(
+    server: CcctlServer,
+    launches: SessionLaunchOptions[],
+  ): Promise<{ sessionId: string; epoch: number; handoffPath: string }> {
+    const cwd = process.cwd();
+    const { sessionId } = await server.launchSession({ cwd, permissionMode: "default" });
+    const settingsPath = launches.at(-1)?.settingsPath;
+    if (settingsPath === undefined) {
+      throw new Error("expected the launch to carry a settingsPath — the hook install must have failed");
+    }
+    const claimed = await claimLaunch(server, cwd);
+    expect(claimed.status).toBe(201);
+    expect(await claimed.json()).toEqual({ session_id: sessionId });
+    const epoch = await registerWorker(server, sessionId);
+    // `installAskUserQuestionHookSettings` mints both paths off the SAME token — the handoff path is
+    // the settings path's exact sibling, differing only in suffix (`hook-settings-installer.ts`).
+    const handoffPath = settingsPath.replace(/\.settings\.json$/, ".handoff.json");
+    return { sessionId, epoch, handoffPath };
+  }
+
+  it("stamps a hook-captured payload with the transition's OWN sequence_num, via the #264 pipeline", async () => {
+    const { server, launches } = await startHookTestServer();
+    const { sessionId, epoch, handoffPath } = await launchWithHook(server, launches);
+    writeFileSync(handoffPath, JSON.stringify({ questions: [APPROVE_QUESTION] }));
+
+    const res = await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 11)]);
+
+    expect(res.status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
+    const [summary] = await sessionSummaries(server);
+    expect(summary.enrichment).toEqual(approveEnrichment(11));
+    // Consumed: the handoff file must not survive being read.
+    expect(existsSync(handoffPath)).toBe(false);
+  });
+
+  it("correlates via the §4 bare status gate too (PUT worker), not just §5", async () => {
+    const { server, launches } = await startHookTestServer();
+    const { sessionId, epoch, handoffPath } = await launchWithHook(server, launches);
+    writeFileSync(handoffPath, JSON.stringify({ questions: [APPROVE_QUESTION] }));
+
+    const res = await putStatus(server, sessionId, epoch, "requires_action", 3);
+
+    expect(res.status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
+    const [summary] = await sessionSummaries(server);
+    expect(summary.enrichment).toEqual(approveEnrichment(3));
+  });
+
+  it("consumes the handoff file ONCE — a later transition with no fresh hook write gets no enrichment", async () => {
+    const { server, launches } = await startHookTestServer();
+    const { sessionId, epoch, handoffPath } = await launchWithHook(server, launches);
+    writeFileSync(handoffPath, JSON.stringify({ questions: [APPROVE_QUESTION] }));
+
+    expect((await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 1)])).status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
+
+    // Leave, then re-enter requires_action — no NEW hook write this time.
+    expect((await postWorkerEvents(server, sessionId, epoch, [statusFrame("running", 2)])).status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+    expect((await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 3)])).status).toBe(200);
+
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+  });
+
+  it("is a no-op when the hook never fired — no handoff file, no enrichment, no crash", async () => {
+    const { server, launches } = await startHookTestServer();
+    const { sessionId, epoch } = await launchWithHook(server, launches);
+    // No write to handoffPath at all — the ordinary case for a launch with no AskUserQuestion call.
+
+    const res = await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 1)]);
+
+    expect(res.status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+  });
+
+  it("never correlates for a session this server did not launch — no hookInstalls entry exists at all", async () => {
+    const server = await startTestServer(); // this file's own no-launcher helper — a plain UC1 attach.
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    const res = await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 1)]);
+
+    expect(res.status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+  });
+
+  it("refuses an oversized handoff file — no enrichment, and the file is still consumed", async () => {
+    const { server, launches } = await startHookTestServer();
+    const { sessionId, epoch, handoffPath } = await launchWithHook(server, launches);
+    // Past the pre-parse size cap (1 MiB) — a single oversized "question" string.
+    writeFileSync(handoffPath, JSON.stringify({ questions: ["x".repeat(2 * 1024 * 1024)] }));
+
+    const res = await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 1)]);
+
+    expect(res.status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+    expect(existsSync(handoffPath)).toBe(false);
+  });
+
+  it("refuses a symlink at the handoff path escaping the hook state directory — no arbitrary-file-read leak", async () => {
+    const { server, launches } = await startHookTestServer();
+    const { sessionId, epoch, handoffPath } = await launchWithHook(server, launches);
+    // A file OUTSIDE the hook state directory a planted symlink would redirect the read through —
+    // exactly the arbitrary-file-read-and-leak primitive `consumeHookHandoffQuestions`'s realpath
+    // guard exists to close.
+    const secret = join(hookStateRoot, "..", "outside-secret.json");
+    writeFileSync(secret, JSON.stringify({ questions: ["leaked!"] }));
+    symlinkSync(secret, handoffPath);
+
+    try {
+      const res = await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 1)]);
+
+      expect(res.status).toBe(200);
+      expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+    } finally {
+      rmSync(secret, { force: true });
+    }
+  });
+
+  it("refuses malformed JSON in the handoff file — no enrichment, no throw, and it is still consumed", async () => {
+    const { server, launches } = await startHookTestServer();
+    const { sessionId, epoch, handoffPath } = await launchWithHook(server, launches);
+    writeFileSync(handoffPath, "{not valid json");
+
+    const res = await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 1)]);
+
+    expect(res.status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+    expect(existsSync(handoffPath)).toBe(false);
+  });
+
+  it("extends the #60/#61 leak canary to this NEW payload path: a bearer-shaped string inside a captured question rides the enrichment verbatim, but NEVER into a produced log line", async () => {
+    // `bearer-canary.ts` proves the ACCOUNT Bearer can never reach a log line or the persisted
+    // snapshot; the compile-time half of that guarantee (`BridgeCredentialJsonProofs`,
+    // `packages/core/src/index.ts` ~L2185) already forbids a credential from typing into a
+    // `RequiresActionEnrichment` at all. This test is the RUNTIME extension #262's own AC calls for:
+    // the hook-handoff path is a NEW way worker-supplied text reaches a broadcast frame, so a
+    // bearer-SHAPED string planted in a captured question must be provably incapable of riding this
+    // NEW path into anything this pipeline logs — while still confirming the (expected, harmless)
+    // verbatim pass-through into the enrichment itself, since worker display text is never validated
+    // for MEANING, only for shape/length/cardinality (#261).
+    const events: LogEvent[] = [];
+    const { launcher, launches } = fakeLauncher();
+    const server = await startServer({
+      port: 0,
+      host: DEFAULT_HOST,
+      launcher,
+      logger: { log: (event) => events.push(event) },
+    });
+    started.push(server);
+    const { sessionId, epoch, handoffPath } = await launchWithHook(server, launches);
+    const bearerShaped = "oauth-account-secret-hook-payload-canary";
+    writeFileSync(
+      handoffPath,
+      JSON.stringify({ questions: [{ ...APPROVE_QUESTION, question: `leak me: ${bearerShaped}` }] }),
+    );
+
+    const res = await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 1)]);
+
+    expect(res.status).toBe(200);
+    // Pass-through half: the enrichment DOES carry the planted text verbatim — not itself a finding.
+    const [summary] = await sessionSummaries(server);
+    expect(summary.enrichment?.questions[0]?.prompt).toBe(`leak me: ${bearerShaped}`);
+    // Leak-canary half: nothing this pipeline logged along the way carries it.
+    expect(JSON.stringify(events)).not.toContain(bearerShaped);
   });
 });
