@@ -1286,10 +1286,16 @@ const CONTROL_CHARACTERS = /\p{Cc}/gu;
  *  2. Control characters become spaces — a newline forges a session row in a line-oriented list,
  *     and the ESC opening an ANSI/CSI escape repaints or clears the operator's terminal. A space
  *     (not deletion) keeps `a\nb` reading as `a b` rather than `ab`.
- *  3. Whitespace runs collapse, and the result is clamped to
- *     {@link MAX_REQUIRES_ACTION_DETAIL_LENGTH} code points.
+ *  3. Whitespace runs collapse, and the result is clamped to `maxLength` code points — defaulting
+ *     to {@link MAX_REQUIRES_ACTION_DETAIL_LENGTH}, the bound for the `requires_action` detail this
+ *     was written for. The enrichment class (#261) shares this trust boundary and passes its own
+ *     {@link MAX_ENRICHMENT_TEXT_LENGTH}, so the constant naming each surface's bound is the one
+ *     that actually clamps it, rather than a label on a literal spelled elsewhere.
  */
-function displayableDetail(detail: string | undefined): string | undefined {
+function displayableDetail(
+  detail: string | undefined,
+  maxLength: number = MAX_REQUIRES_ACTION_DETAIL_LENGTH,
+): string | undefined {
   if (typeof detail !== "string") {
     return undefined;
   }
@@ -1300,9 +1306,7 @@ function displayableDetail(detail: string | undefined): string | undefined {
   // Clamp by CODE POINT: `String.slice` counts UTF-16 code units, so it would cut a surrogate
   // pair in half and leave a lone surrogate as the last character of the label.
   const points = Array.from(flattened);
-  return points.length > MAX_REQUIRES_ACTION_DETAIL_LENGTH
-    ? `${points.slice(0, MAX_REQUIRES_ACTION_DETAIL_LENGTH - 1).join("")}…`
-    : flattened;
+  return points.length > maxLength ? `${points.slice(0, maxLength - 1).join("")}…` : flattened;
 }
 
 /**
@@ -1569,6 +1573,469 @@ export function markSessionClosed(session: Session): Session {
   return { ...session, status: "closed" };
 }
 
+// ---------------------------------------------------------------------------
+// AskUserQuestion enrichment — the INFORMATIONAL class (#78 Option A, #261)
+//
+// #78 wants the operator's phone to raise an `AskUserQuestion` with its options TAPPABLE,
+// even while Claude Code runs in a non-prompting permission mode. ADR-005 (the #263 spike)
+// settled how: `AskUserQuestion` is an INTERACTION tool, not a permission decision, so
+// `bypassPermissions` — which suppresses permission PROMPTS — does not touch it. The worker
+// blocks NATIVELY, and reports that block as `worker_status: requires_action` — the sole #40
+// source. So the structured question + options are NOT the signal: they are DISPLAY DATA
+// decorating a block that already exists, and they ride here, in a SEPARATE class.
+//
+// **The #40 separation is STRUCTURAL, not prose.** Every path that can move a session's
+// activity is keyed on `subtype === "worker_status"`: {@link isWorkerStatusEvent} is the single
+// guard, and {@link applyWorkerStatusFrame} — which the server's `foldWorkerStatus` delegates
+// the fold to — returns the SAME session object for anything else. An `input_request` is a
+// non-`worker_status` {@link ControlEvent}, so it CANNOT set or clear {@link isInputAwaited}:
+// not because this comment says so, but because no code path leads from this subtype to
+// {@link sessionActivityFromStatus}. `session-model.test.ts` ratifies both halves — the #40
+// block it must not disturb, and an enrichment frame's no-op beside the hook cases it mirrors.
+//
+// **Fail-safe direction: toward BLOCKING.** Enrichment is subordinate. A missing, malformed, or
+// dropped enrichment leaves the `requires_action` block intact and the operator still prompted —
+// degraded to the generic {@link DEFAULT_REQUIRES_ACTION_DETAIL}, never unblocked. That is why
+// every guard here fails CLOSED to `null` (drop the decoration) rather than substituting a guess:
+// losing the decoration costs display fidelity, losing the block costs correctness. It is also why
+// the enrichment is DROPPED, never repaired — a half-parsed question set is exactly the "phantom
+// decision" #86 guards against. ("Fails closed to `null`" describes these guards over a JSON-DECODED
+// value, which is the only thing on the wire; they are not hardened against an adversarial in-process
+// object — a throwing getter propagates — because a caller who can hand one of those in is already
+// inside the process.)
+//
+// **The text is UNTRUSTED.** ADR-005's decision 3 (SD-1) keeps the worker as the emitter, but a
+// `bypassPermissions` worker is itself ungated — it AUTHORS these labels. So question/option text
+// enters the model through the same trust boundary the human `detail` does
+// ({@link MAX_ENRICHMENT_TEXT_LENGTH}), and is subordinate DISPLAY data with no active content.
+// ---------------------------------------------------------------------------
+
+/**
+ * Hard ceiling on any enrichment display string, in CODE POINTS —
+ * {@link EnrichmentQuestion.prompt} / `header`, {@link EnrichmentOption.label} / `description`, and
+ * an {@link AnswerEnvelope} label. DERIVED from {@link MAX_REQUIRES_ACTION_DETAIL_LENGTH}, not
+ * re-spelled: same worker-supplied text, same untrusted origin, same "this is a label, not a
+ * document" argument, so the two cannot silently drift apart. It carries its own NAME so an
+ * enrichment consumer has a referent that says what it bounds, rather than reaching for a constant
+ * named after the `requires_action` detail; the derivation means the value itself is one knob, and
+ * `enrichment.test.ts` pins the equality.
+ */
+export const MAX_ENRICHMENT_TEXT_LENGTH = MAX_REQUIRES_ACTION_DETAIL_LENGTH;
+
+/**
+ * Hard ceiling on the number of {@link EnrichmentQuestion}s one enrichment may carry, and on the
+ * number of keys an {@link AnswerEnvelope} may answer.
+ *
+ * The text cap alone bounds each STRING while leaving the AGGREGATE unbounded, and the argument for
+ * the text cap applies with more force here: the worker authoring this payload is itself ungated
+ * (ADR-005 SD-1), #264 BUFFERS the enrichment per session, and #87 re-serves it to a phone — so
+ * 5,000 questions of 200 code points each is the same "not a label" failure, three orders of
+ * magnitude larger, held in server memory. Bounding cardinality in the contract rather than trusting
+ * the source tool's own limits is the same stance the text cap takes; 16 is far above any real
+ * `AskUserQuestion` (ADR-005 observed one) while keeping the payload a payload.
+ */
+export const MAX_ENRICHMENT_QUESTIONS = 16;
+
+/**
+ * Hard ceiling on the number of {@link EnrichmentOption}s one question may offer, and on the number
+ * of labels one {@link AnswerEnvelope} selection may carry (a multi-select cannot choose more
+ * options than a question may offer). Same argument as {@link MAX_ENRICHMENT_QUESTIONS}; 32 is far
+ * above any real question while keeping a tappable list tappable.
+ */
+export const MAX_ENRICHMENT_OPTIONS = 32;
+
+/**
+ * One tappable choice offered by an {@link EnrichmentQuestion}.
+ *
+ * `label` is the choice's display text AND its ANSWER TOKEN: {@link AnswerEnvelope} keys a
+ * selection by label (#86 — "carries the selected label(s)"), so it is required and must survive
+ * normalization non-empty; an option with no label is untappable and fails the whole enrichment
+ * closed. `description` is the optional sub-text the observed payload carries — display only.
+ *
+ * **Round-trip constraint (load-bearing for #86/#262).** The label here is the NORMALIZED form
+ * (see {@link MAX_ENRICHMENT_TEXT_LENGTH}); it is what the operator sees, what they tap, and what
+ * {@link AnswerEnvelope} carries back. For a well-formed label — a short plain string, which is
+ * what the agent actually authors — normalization is the IDENTITY, so the round-trip is exact. An
+ * emitter mapping an answer back to its original option must therefore match on the normalized form.
+ *
+ * Normalization is also many-to-one, which is a sharper hazard than it first looks: `"Yes  please"`
+ * and `"Yes\tplease"` are DISTINCT on the wire and both normalize to `"Yes please"`, as do any two
+ * labels sharing their first 199 code points (both clamp to the same prefix + `…`). Since the label
+ * IS the answer token, a collision does not fail to match — it matches AMBIGUOUSLY, and an emitter
+ * resolving it by taking the first match silently answers a different option than the operator
+ * tapped. That is the #86 phantom-decision shape, arriving by a different road, so
+ * {@link EnrichmentQuestion} refuses a question whose normalized labels collide rather than serving
+ * an unanswerable choice.
+ *
+ * Modelled from the payload ADR-005 observed on the wire: `options: [{ label, description }]`. The
+ * `value` the #261 AC named is absent from that observed shape — an inference from ADR-005 rather
+ * than something it states, though a direct read of the source tool's schema during #261 confirmed
+ * there is no such field.
+ *
+ * That same read surfaced one field ADR-005 did NOT observe and this type therefore does not model:
+ * an option may carry a `preview` — an HTML fragment (`previewFormat: "html"`). Dropping it is the
+ * correct direction for this class, which is display data with NO active content by contract, but
+ * an option whose meaning lives in its preview reaches the phone as label + description only. #87
+ * inherits that limit; re-modelling it would mean carrying markup, which this contract forbids.
+ */
+export interface EnrichmentOption {
+  /** Display text and answer token — required, normalized, non-empty. */
+  readonly label: string;
+  /** Optional display sub-text explaining the choice. */
+  readonly description?: string;
+}
+
+/**
+ * One question the agent asked, with the choices it offered.
+ *
+ * `questionId` is the {@link AnswerEnvelope} key. The wire carries NO id — ADR-005's observed
+ * payload is `{ question, header, options, multiSelect }` — so it is DERIVED here, positionally
+ * and deterministically ({@link enrichmentQuestionId}), from the question's index within its
+ * frame. That keeps the emitter's job to "forward `tool_input.questions` verbatim, stamp
+ * `sequence_num`" with no id to invent and no second source of truth to drift. Ids need only be
+ * unique WITHIN a frame; correlating across turns is `sequenceNum`'s job (#87 — "join on
+ * `sequence_num`; discard a mismatch"), not an id's.
+ *
+ * `prompt` is the question text (the wire's `question`; named `prompt` here so it does not
+ * stutter as `question.question`). `header` is the observed short heading — optional, display
+ * only, and the thing #87 leans on to dissolve a wall of text.
+ *
+ * `multiSelect` says whether several options may be chosen. An ABSENT one resolves to `false`
+ * (single-select) — not a guess, but the default the source tool's own schema declares
+ * (`multiSelect: v.boolean().default(false)`), so absence is schema-LEGAL input rather than drift.
+ * Failing closed on it would drop the whole enrichment for a perfectly legal `AskUserQuestion`
+ * whose emitter forwarded the raw, unparsed `tool_input` (where a default is not yet applied) — a
+ * blocked operator with no options on their phone, for a payload that was never malformed. A
+ * PRESENT one that is not a boolean IS drift, and still fails the enrichment closed: absence is a
+ * specified default, whereas `"false"` is a statement this layer cannot honor.
+ */
+export interface EnrichmentQuestion {
+  /** Positional, frame-scoped key ({@link enrichmentQuestionId}); the {@link AnswerEnvelope} key. */
+  readonly questionId: string;
+  /** The question text (the wire's `question`) — required, normalized, non-empty. */
+  readonly prompt: string;
+  /** Optional short heading above the question. */
+  readonly header?: string;
+  /** The offered choices — at least one; a question with none is untappable. */
+  readonly options: readonly EnrichmentOption[];
+  /** Whether several options may be selected — an absent wire value resolves to `false` (see the type doc). */
+  readonly multiSelect: boolean;
+}
+
+/**
+ * The enrichment decorating ONE `requires_action` block: the questions the agent asked, plus the
+ * `sequenceNum` that ties them to the `worker_status` frame reporting the block.
+ *
+ * `sequenceNum` is the #201 ordering stamp, and here it is REQUIRED — a departure from
+ * {@link WorkerStatusEvent}, where it is optional and an absent one degrades to last-write-wins.
+ * The reason is that the two fields do different jobs: there it ORDERS a status the server will
+ * apply regardless; here it CORRELATES a decoration to the block it decorates. An uncorrelatable
+ * enrichment is not a degraded enrichment, it is a hazard — #87 must "join on `sequence_num`,
+ * discard a mismatch", and #86's anti-phantom-decision guard exists precisely because rendering
+ * turn-N's options against turn-N+1's block lets a tap answer the wrong prompt. With nothing to
+ * join on there is no way to tell the two apart, so it fails closed and the block stands bare.
+ */
+export interface RequiresActionEnrichment {
+  /** The #201 stamp of the `worker_status` frame this decorates — required (see the type doc). */
+  readonly sequenceNum: number;
+  /** The questions asked — at least one; an empty set decorates nothing. */
+  readonly questions: readonly EnrichmentQuestion[];
+}
+
+/**
+ * The operator's answer: for each {@link EnrichmentQuestion.questionId}, the
+ * {@link EnrichmentOption.label}s they chose.
+ *
+ * **The array shape is UNIFORM — never `string | string[]`.** A single-select answer is an array
+ * of length 1, not a bare string. A union would push a `typeof === "string"` check into every
+ * consumer (#86's round-trip, #87's renderer, the worker-side mapping), and the one that forgets
+ * it does not fail loudly — it iterates a string CHARACTER BY CHARACTER and answers with "Y",
+ * "e", "s". One shape, checked once, at this boundary.
+ *
+ * Selection-only, by construction: the value side is a list of labels the worker itself offered,
+ * never free-form text (#86 — "a bounded option-selection … never free-form text the worker
+ * executes"). This type carries no nonce and no TTL: those are #86's, and they are STATE, which
+ * this pure contract layer deliberately holds none of.
+ *
+ * The `answers` map {@link answerEnvelopeFromValue} builds has a NULL PROTOTYPE (that is what keeps
+ * a `__proto__` key from reaching an inherited setter). It is JSON-serializable, spreadable, and
+ * readable through `Object.entries` / `Object.hasOwn` / `in` as usual; what it does NOT inherit is
+ * `Object.prototype`, so `answers.hasOwnProperty(…)` throws rather than answering, and string
+ * coercion has no `toString` to reach. Consumers should use `Object.hasOwn`.
+ */
+export interface AnswerEnvelope {
+  /** Chosen labels per question id. Uniform arrays; single-select is length-1. */
+  readonly answers: Readonly<Record<string, readonly string[]>>;
+}
+
+/**
+ * The `input_request` frame: a {@link ControlEvent} whose `subtype` is pinned to
+ * `"input_request"` and whose payload carries the enrichment. Modelled as a refinement of
+ * {@link ControlEvent} — not a new frame kind — so it rides the existing NDJSON codec unchanged,
+ * exactly as {@link WorkerStatusEvent} does.
+ *
+ * The payload is the shape ADR-005 observed on `tool_input`, so the emitter forwards it rather
+ * than transcribes it, plus the `sequence_num` it stamps. Snake_case for `sequence_num` because
+ * it IS the wire field — the same name, meaning, and per-session counter {@link WorkerStatusEvent}
+ * carries (#201); `multiSelect` stays camelCase because that is the casing the observed
+ * `AskUserQuestion` payload uses, and re-casing it would give the emitter a transcription step to
+ * get wrong. The domain reads both through {@link requiresActionEnrichmentFromFrame}.
+ *
+ * `payload` is typed loosely on purpose: every field is validated at the boundary, over `unknown`,
+ * because a decoded line can be anything. The static type states the CONTRACT an emitter should
+ * honor; {@link requiresActionEnrichmentFromValue} is what actually decides.
+ */
+export interface InputRequestEvent extends ControlEvent {
+  subtype: "input_request";
+  payload: { sequence_num: number; questions: readonly unknown[] };
+}
+
+/**
+ * The frame-scoped, positional {@link EnrichmentQuestion.questionId} for the question at `index`.
+ * Pinned in ONE place so the deriver and any consumer reconstructing an id cannot drift.
+ */
+export function enrichmentQuestionId(index: number): string {
+  return `q${index}`;
+}
+
+/**
+ * The grammar {@link enrichmentQuestionId} mints: `q` followed by a decimal index. Pinned beside
+ * the minter so the two cannot drift.
+ */
+const ENRICHMENT_QUESTION_ID = /^q(?:0|[1-9][0-9]*)$/;
+
+/**
+ * Whether `value` is an id {@link enrichmentQuestionId} could have minted. The shape half of
+ * validating an {@link AnswerEnvelope} key: core DERIVES every `questionId`, so a key matching no
+ * id core can mint is malformed by construction — a whitelist, which needs no list of hostile keys
+ * to stay ahead of.
+ *
+ * This is the SHAPE check only, and it is the whole of what this layer can honestly do: whether a
+ * well-formed id names a question actually outstanding is STATE, and #86 validates it against the
+ * enrichment #264 buffered.
+ */
+export function isEnrichmentQuestionId(value: unknown): boolean {
+  return typeof value === "string" && ENRICHMENT_QUESTION_ID.test(value);
+}
+
+/**
+ * Narrow a {@link ControlFrame} to an {@link InputRequestEvent} by DISCRIMINANT ONLY — the frame
+ * says it is an `input_request`. Mirrors {@link isWorkerStatusEvent}'s stance one step less
+ * deeply: that guard also validates its `status`, because a `worker_status` whose status is
+ * unreadable must not reach the fold at all, whereas an enrichment's payload is validated whole
+ * by {@link requiresActionEnrichmentFromValue}, which is the only thing that can produce one.
+ */
+export function isInputRequestEvent(frame: ControlFrame): frame is InputRequestEvent {
+  return frame.type === "control_event" && frame.subtype === "input_request";
+}
+
+/**
+ * Normalize an enrichment display string, or `undefined` when it says nothing usable (absent,
+ * non-string, or empty once normalized). The trust boundary for every string in this section: it
+ * shares {@link displayableDetail} with the human `detail` rather than re-deriving it, so a
+ * bidi override, an ANSI escape, a forged newline, or a 512 KB "label" is neutralized here once
+ * and every consumer downstream inherits the guarantee.
+ */
+function enrichmentText(value: unknown): string | undefined {
+  return displayableDetail(typeof value === "string" ? value : undefined, MAX_ENRICHMENT_TEXT_LENGTH);
+}
+
+/**
+ * Parse one already-decoded option, or `null` if it is not a well-formed one. Fail-closed over a
+ * value off the wire: a non-object, or a `label` that is absent, non-string, or empty once
+ * normalized, all yield `null` — an option the operator cannot read is an option they cannot
+ * meaningfully tap. A `description` that normalizes away is simply omitted: it is decoration ON
+ * decoration, so its loss costs nothing the option needs.
+ */
+function enrichmentOptionFromValue(value: unknown): EnrichmentOption | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const { label, description } = value as { label?: unknown; description?: unknown };
+  const displayLabel = enrichmentText(label);
+  if (displayLabel === undefined) {
+    return null;
+  }
+  const displayDescription = enrichmentText(description);
+  return displayDescription === undefined
+    ? { label: displayLabel }
+    : { label: displayLabel, description: displayDescription };
+}
+
+/**
+ * Parse one already-decoded question at `index`, or `null` if it is not a well-formed one.
+ * Fail-closed: a non-object, an unusable `question` text, a PRESENT non-boolean `multiSelect` (an
+ * absent one is the source schema's declared default — see {@link EnrichmentQuestion}), a non-array
+ * / EMPTY / over-long ({@link MAX_ENRICHMENT_OPTIONS}) `options`, any single malformed option, or
+ * two options whose normalized labels COLLIDE all yield `null`. `header` is optional and dropped
+ * when it normalizes away.
+ *
+ * Options are all-or-nothing for the same reason questions are ({@link requiresActionEnrichmentFromValue}):
+ * silently serving a SUBSET of what the agent offered would present the operator a complete-looking
+ * choice they cannot actually make — the missing option is invisible, so they pick the best of a
+ * censored set believing it is the whole one. The collision refusal is the same principle one level
+ * down: two options the operator cannot tell apart, whose answer token is identical, are not a
+ * choice (see {@link EnrichmentOption}'s round-trip constraint).
+ */
+function enrichmentQuestionFromValue(value: unknown, index: number): EnrichmentQuestion | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const { question, header, options, multiSelect } = value as {
+    question?: unknown;
+    header?: unknown;
+    options?: unknown;
+    multiSelect?: unknown;
+  };
+  const prompt = enrichmentText(question);
+  // Absent → the source schema's declared default (single-select); present-but-not-boolean → drift.
+  const selectMode = multiSelect === undefined ? false : multiSelect;
+  if (
+    prompt === undefined ||
+    typeof selectMode !== "boolean" ||
+    !Array.isArray(options) ||
+    options.length === 0 ||
+    options.length > MAX_ENRICHMENT_OPTIONS
+  ) {
+    return null;
+  }
+  const parsed: EnrichmentOption[] = [];
+  const seenLabels = new Set<string>();
+  for (const option of options) {
+    const next = enrichmentOptionFromValue(option);
+    if (next === null || seenLabels.has(next.label)) {
+      return null;
+    }
+    seenLabels.add(next.label);
+    parsed.push(next);
+  }
+  const displayHeader = enrichmentText(header);
+  const base = { questionId: enrichmentQuestionId(index), prompt, options: parsed, multiSelect: selectMode };
+  return displayHeader === undefined ? base : { ...base, header: displayHeader };
+}
+
+/**
+ * Parse an arbitrary decoded value into a {@link RequiresActionEnrichment}, or `null` if it is not
+ * a well-formed one. The single fail-closed seam for the informational class, mirroring
+ * {@link workItemFromValue}'s discriminant-and-shape validation: a non-object, a `sequence_num`
+ * that is not a usable #201 stamp ({@link asWorkerStatusSequence} — the same guard both
+ * `worker_status` legs read it through), a non-array / EMPTY / over-long
+ * ({@link MAX_ENRICHMENT_QUESTIONS}) `questions`, or any single malformed question all yield `null`
+ * rather than a half-typed enrichment.
+ *
+ * **All-or-nothing over `questions`, and that is load-bearing.** Ids are POSITIONAL
+ * ({@link enrichmentQuestionId}), so dropping a malformed question mid-list would RENUMBER the ones
+ * after it — `q2` would silently become `q1` — and an answer keyed `q1` would then be routed to a
+ * question the operator never saw. That is #86's phantom decision arriving through the front door.
+ * Dropping the whole enrichment costs a decoration; renumbering costs a wrong answer to a real
+ * prompt, so the guard refuses to be clever.
+ *
+ * Shape-only, like every guard in this layer: it cannot know which questions the worker actually
+ * has outstanding, because that is STATE and it lives in `@ccctl/server` (#264 buffers the
+ * enrichment per session and drops it on transition out of `requires_action`).
+ */
+export function requiresActionEnrichmentFromValue(value: unknown): RequiresActionEnrichment | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const { sequence_num, questions } = value as { sequence_num?: unknown; questions?: unknown };
+  const sequenceNum = asWorkerStatusSequence(sequence_num);
+  if (
+    sequenceNum === null ||
+    !Array.isArray(questions) ||
+    questions.length === 0 ||
+    questions.length > MAX_ENRICHMENT_QUESTIONS
+  ) {
+    return null;
+  }
+  const parsed: EnrichmentQuestion[] = [];
+  for (const [index, question] of questions.entries()) {
+    const next = enrichmentQuestionFromValue(question, index);
+    if (next === null) {
+      return null;
+    }
+    parsed.push(next);
+  }
+  return { sequenceNum, questions: parsed };
+}
+
+/**
+ * The {@link RequiresActionEnrichment} an `input_request` frame carries, or `null` when the frame
+ * is not one or its payload is not well-formed. The §5 counterpart of
+ * {@link requiresActionEnrichmentFromValue} — the same relationship
+ * {@link workerStatusSequenceFromFrame} has to {@link asWorkerStatusSequence}.
+ *
+ * Note what this CANNOT do, by construction: it returns an enrichment, never a
+ * {@link SessionActivity}. There is no overload, no sibling, and no path from an `input_request`
+ * to {@link sessionActivityFromStatus} — which is why an enrichment cannot move #40's signal.
+ */
+export function requiresActionEnrichmentFromFrame(frame: ControlFrame): RequiresActionEnrichment | null {
+  return isInputRequestEvent(frame) ? requiresActionEnrichmentFromValue(frame.payload) : null;
+}
+
+/**
+ * Parse an arbitrary decoded value into an {@link AnswerEnvelope}, or `null` if it is not a
+ * well-formed one. Fail-closed over the value coming back from the phone: a non-object, a missing
+ * or non-object `answers`, an EMPTY `answers` (answering nothing is not an answer), a selection
+ * that is not an ARRAY — a bare `"Yes"` is REFUSED, never coerced, which is the whole point of
+ * {@link AnswerEnvelope}'s uniform shape — an empty selection array, or any label that is not a
+ * usable string all yield `null`.
+ *
+ * Labels are normalized on the way IN as well as out. For an honest phone this is the identity —
+ * it echoes a label {@link EnrichmentOption} already normalized, and the normalization is
+ * idempotent — so the round-trip is exact; what it buys is that no control character can ride an
+ * answer back toward the worker, whatever the phone sends.
+ *
+ * **Keys are validated against the grammar core MINTS** ({@link isEnrichmentQuestionId}), which is
+ * what makes this fail closed over a JSON-decoded value rather than merely over a well-behaved one.
+ * `JSON.parse` makes `__proto__` an OWN ENUMERABLE property (an object literal does not), so it
+ * survives `Object.entries`, and assigning it on a normal object would silently hit
+ * `Object.prototype`'s setter instead of creating a key — yielding a non-`null` envelope with a
+ * corrupted prototype and the entry vanished, which is neither fail-closed nor all-or-nothing. The
+ * whitelist refuses it as the malformed id it is; the null-prototype accumulator then means no such
+ * setter is reachable even if the grammar ever widens. (Global `Object.prototype` was never at
+ * risk — the write targeted this local object — so this is hygiene at a trust boundary, not a
+ * patched exploit.)
+ *
+ * Shape-only. That a well-formed `questionId` names a real OUTSTANDING question, that a label was
+ * actually offered, that the answer is fresh, single-use, and for the CURRENT turn — all of that is
+ * #86's stateful validation, against the enrichment #264 buffered. A shape guard cannot check
+ * freshness; it can only refuse to hand a malformed answer to something that will.
+ */
+export function answerEnvelopeFromValue(value: unknown): AnswerEnvelope | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const { answers } = value as { answers?: unknown };
+  if (typeof answers !== "object" || answers === null || Array.isArray(answers)) {
+    return null;
+  }
+  const entries = Object.entries(answers);
+  if (entries.length === 0 || entries.length > MAX_ENRICHMENT_QUESTIONS) {
+    return null;
+  }
+  // A null-prototype accumulator: no inherited setter is reachable, whatever the key.
+  const parsed = Object.create(null) as Record<string, readonly string[]>;
+  for (const [questionId, selection] of entries) {
+    if (!isEnrichmentQuestionId(questionId)) {
+      return null;
+    }
+    if (!Array.isArray(selection) || selection.length === 0 || selection.length > MAX_ENRICHMENT_OPTIONS) {
+      return null;
+    }
+    const labels: string[] = [];
+    for (const label of selection) {
+      const displayLabel = enrichmentText(label);
+      if (displayLabel === undefined) {
+        return null;
+      }
+      labels.push(displayLabel);
+    }
+    parsed[questionId] = labels;
+  }
+  return { answers: parsed };
+}
+
 // --- loggable / persistable (JSON) shape + credential-omission proofs ---
 
 /** A JSON-safe value: exactly what may cross into a log line or a snapshot. */
@@ -1592,6 +2059,14 @@ type Assert<T extends true> = T;
 // `Assert` and fail here). Spelled as its own helper so a refutation reads like its assertion rather
 // than as a double-negative conditional.
 type Refute<T extends false> = T;
+// `Exclude<T[K], undefined>` is what makes an OPTIONAL property JSON-safe rather than fatal. An
+// indexed access `T[K]` on `b?: string` yields `string | undefined` — even under `-?`, and even
+// with `exactOptionalPropertyTypes` — and `undefined` is not a {@link JsonValue}, so without the
+// `Exclude` a single optional field would report its whole enclosing type as NOT JSON. That would
+// be wrong: `JSON.stringify` OMITS an absent optional key, so `{ a: "x" }` from `{ a: string; b?:
+// string }` is valid JSON. It does NOT loosen what this proof forbids — a credential or a function
+// in an optional slot is still rejected on its own merits (the `AccountBearer` and function checks
+// above run on the excluded type), which {@link BridgeCredentialJsonProofs} pins with a `Refute`.
 type IsJson<T> = [T] extends [JsonValue]
   ? true
   : [T] extends [(...args: never[]) => unknown]
@@ -1599,7 +2074,7 @@ type IsJson<T> = [T] extends [JsonValue]
     : [T] extends [readonly (infer E)[]]
       ? IsJson<E>
       : [T] extends [object]
-        ? { [K in keyof T]-?: IsJson<T[K]> } extends Record<keyof T, true>
+        ? { [K in keyof T]-?: IsJson<Exclude<T[K], undefined>> } extends Record<keyof T, true>
           ? true
           : false
         : false;
@@ -1622,6 +2097,18 @@ type SetEquals<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : fals
  * (The {@link SessionIngressToken} is a branded string that legitimately travels
  * on the wire inside the {@link WorkSecret}; the {@link WorkItem} / {@link WorkSecret}
  * therefore carry a scoped credential and are deliberately NOT asserted loggable.)
+ *
+ * The enrichment pair ({@link RequiresActionEnrichment}, {@link AnswerEnvelope}) is asserted here
+ * for a second reason beyond credential-freedom: `IsJson` rejects a function-bearing type, so
+ * "enrichment is subordinate DISPLAY data, never active content" (#261) is a compile-time fact
+ * about the shape rather than a claim the runtime guards alone carry.
+ *
+ * The two trailing `Refute`s are the DISCRIMINATING half, and they are why the enrichment asserts
+ * above mean anything. {@link RequiresActionEnrichment} is the first shape asserted here to carry an
+ * OPTIONAL property (nested: `header?` / `description?`), which `IsJson` must tolerate — an omitted
+ * key is valid JSON — and a check loosened until it tolerated ANYTHING in an optional slot would
+ * still pass every `Assert` in this tuple. So the refutations pin the loosening's exact boundary: a
+ * credential, and active content, are each still REJECTED when reached through an optional property.
  */
 export type BridgeCredentialJsonProofs = [
   Assert<IsJson<AccountBearer> extends true ? false : true>,
@@ -1631,6 +2118,10 @@ export type BridgeCredentialJsonProofs = [
   Assert<IsJson<SessionCreateResponse>>,
   Assert<IsJson<SessionActivity>>,
   Assert<IsJson<Session>>,
+  Assert<IsJson<RequiresActionEnrichment>>,
+  Assert<IsJson<AnswerEnvelope>>,
+  Refute<IsJson<{ readonly cred?: AccountBearer }>>,
+  Refute<IsJson<{ readonly act?: () => void }>>,
 ];
 
 // ---------------------------------------------------------------------------
