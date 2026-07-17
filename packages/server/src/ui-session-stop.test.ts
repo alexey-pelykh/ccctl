@@ -68,6 +68,27 @@ function fakeLauncher({ hint = "tmux select-window -t @3 ; attach -t ccctl", clo
   };
 }
 
+/**
+ * The window the one ghost-reaper case below arms (#33), and why it is not the 20ms it used to be.
+ *
+ * That case acts INSIDE the window it arms — its refusal has to be read while the row still exists —
+ * and an armed window is a budget spent in WALL-CLOCK on a loaded host, not in test-steps. Two loopback
+ * round-trips do not fit in 20ms under full-suite load, so the reaper took the row first and the stop
+ * answered 404 `unknown-session` rather than the 409 the case is about: a "flake" that was the timer
+ * doing its job. #231 measured such round-trips at ~34ms apiece under full-suite CPU contention, so
+ * 500ms clears this case's two by ~7x. Named for the work that has to fit inside it, as the sibling
+ * `ui-session-launch.test.ts` names its own — that file carries the full rule and the rest of this
+ * shape's cases.
+ */
+const REFUSAL_WINDOW_MS = 500;
+/** Margin past the window, for the reaper's asynchronous terminal half (#35's probe) to have run. */
+const PAST_WINDOW_MS = 100;
+
+/** Await roughly `ms` of real time — the eviction timers are real one-shots, as in the #173 suite. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const started: CcctlServer[] = [];
 
 async function startTestServer(config: ServerConfig): Promise<CcctlServer> {
@@ -647,17 +668,22 @@ describe("POST /api/sessions/{id}/stop (emergency-stop)", () => {
       port: 0,
       host: DEFAULT_HOST,
       launcher,
-      registrationTimeoutMs: 20,
+      registrationTimeoutMs: REFUSAL_WINDOW_MS,
     });
     const sessionId = await launch(server);
     setLiveness("taken-over");
 
+    // Read while the row still EXISTS — the refusal below is what this case is about, and it is only a
+    // refusal for as long as there is something to refuse.
     expect((await postStop(server, sessionId)).status).toBe(409);
     expect(closeCount()).toBe(0);
 
     // The reaper still fires on schedule. It finds the surface taken over and leaves it running (#35),
     // which is the whole point — but the ROW goes, proving the timer was still armed and still ran.
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    // Waited out rather than awaited into: "the surface was NOT closed" is a negative, so there is no
+    // state to poll for — the wait has to outlast the window AND the reaper's asynchronous terminal
+    // half, or a closeCount still at 0 would only mean the probe had not run yet.
+    await sleep(REFUSAL_WINDOW_MS + PAST_WINDOW_MS);
     expect(await listSessions(server)).toEqual([]);
     expect(closeCount()).toBe(0);
   });
