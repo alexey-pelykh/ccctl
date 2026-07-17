@@ -754,6 +754,25 @@ function reconcileEnrichmentBuffer(state: WorkerChannelState, sessionId: string,
   }
 }
 
+/**
+ * CONSUME a session's buffered `AskUserQuestion` enrichment (#86) — the single-use half of the answer
+ * gate. `ui-command.ts` calls it after it has RELAYED an accepted answer worker-ward, so the decision the
+ * answer resolved is spent: a duplicate/replayed tap then finds no buffered enrichment and is refused
+ * (`@ccctl/core` § {@link validateAnswerAgainstEnrichment} validates against what is buffered; nothing
+ * buffered = nothing to answer). This is what makes an accepted answer single-use BEFORE the worker's own
+ * `requires_action`→next transition would drop it via {@link reconcileEnrichmentBuffer} — closing the
+ * double-tap window between the relay and that transition.
+ *
+ * A `Map.delete` of an absent key is a no-op, so consuming a session with nothing buffered is harmless
+ * (the gate only reaches here after finding an enrichment, but the operation stays total). Purely display
+ * state, exactly like the buffer/reconcile siblings: it never reads or writes {@link Session.activity}, so
+ * it cannot move the #40 needs-you signal — the block itself is cleared only by the worker's real
+ * transition, never by an answer being accepted.
+ */
+export function consumeInputRequestEnrichment(state: WorkerChannelState, sessionId: string): void {
+  state.requiresActionEnrichments.delete(sessionId);
+}
+
 /** Hard ceiling on a hook handoff file's byte size (#262) — pre-parse, mirroring {@link MAX_WORKER_BODY_BYTES}'s
  * role for the HTTP legs; a raw file read has no equivalent cap otherwise (security-architect consult). */
 const MAX_HOOK_HANDOFF_BYTES = 1024 * 1024;

@@ -17,11 +17,14 @@
  *
  *   - `prompt` (send input) → a `{ type: "user" }` turn ({@link injectUserTurn}) — the
  *     user's text becomes a user message, the load-bearing turn injection (#130).
- *   - `answer` (an `AskUserQuestion` reply, #264) → a `{ type: "control_request" }` carrying a
- *     `@ccctl/core` `AnswerEnvelope` ({@link dispatchControlRequest}). The envelope is shape-validated
- *     and NORMALIZED at this boundary (a malformed one is a 400, and label normalization keeps any
- *     control character from riding an answer back to the worker); #86 layers the stateful freshness
- *     check (nonce / TTL, against the #264 buffer) on top of this transport.
+ *   - `answer` (an `AskUserQuestion` reply, #264/#86) → a `{ type: "control_request" }` carrying a
+ *     `@ccctl/core` `AnswerEnvelope` ({@link dispatchControlRequest}). GATED before relay ({@link answerRejection}):
+ *     the envelope is shape-validated and NORMALIZED at this boundary (a malformed one is a 400, and label
+ *     normalization keeps any control character from riding an answer back to the worker), THEN validated
+ *     against the enrichment #264 buffered — #86's stateful freshness / bounded-selection check, so a
+ *     stale-turn, replayed, or out-of-bounds answer is a 409. An accepted answer is SINGLE-USE: the
+ *     outstanding decision is consumed once relayed, closing the double-tap window. The `sequence_num`
+ *     decision-id the phone echoes back is a server-side freshness token — it is NOT relayed to the worker.
  *   - any other verb (`approve` / `interrupt`) → a `{ type: "control_request" }`
  *     ({@link dispatchControlRequest}), the server MINTING the correlation id (the id is
  *     the server's handle, not the browser's to choose).
@@ -35,9 +38,19 @@
 
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { answerEnvelopeFromValue, type ControlRequest } from "@ccctl/core";
+import {
+  answerEnvelopeFromValue,
+  asWorkerStatusSequence,
+  validateAnswerAgainstEnrichment,
+  type ControlRequest,
+} from "@ccctl/core";
 import { writeError, writeJson } from "./http-response.js";
-import { dispatchControlRequest, injectUserTurn, type WorkerChannelState } from "./worker-channel.js";
+import {
+  consumeInputRequestEnrichment,
+  dispatchControlRequest,
+  injectUserTurn,
+  type WorkerChannelState,
+} from "./worker-channel.js";
 
 /** The "send input" steer verb — mapped to a `{ type: "user" }` turn injection (mirrors `@ccctl/web-ui`). */
 const INPUT_SUBTYPE = "prompt";
@@ -149,12 +162,16 @@ export function handleUiCommand(
         return;
       }
     }
-    // An `answer` steer (#264) needs a well-formed `AnswerEnvelope` payload before anything is relayed
-    // (400) — the same fail-closed shape guard `@ccctl/core` mints, which #86 later extends with its
-    // stateful nonce/TTL check against the buffered enrichment.
-    if (command.subtype === ANSWER_SUBTYPE && answerEnvelopeFromValue(command.payload) === null) {
-      writeError(res, 400, "ccctl: an `answer` command requires a well-formed `payload` AnswerEnvelope");
-      return;
+    // An `answer` steer (#264/#86) is GATED before anything is relayed: `@ccctl/core`'s shape guard
+    // (400 on a malformed `AnswerEnvelope`), THEN #86's stateful freshness / bounded-selection check
+    // against the buffered enrichment (409 on a stale-turn, replayed, or out-of-bounds answer). Both
+    // layers live in `answerRejection`.
+    if (command.subtype === ANSWER_SUBTYPE) {
+      const rejection = answerRejection(state, sessionId, command.payload);
+      if (rejection !== null) {
+        writeError(res, rejection.status, rejection.message);
+        return;
+      }
     }
     // The server owns the correlation id; the browser does not choose it.
     const id = randomUUID();
@@ -167,6 +184,13 @@ export function handleUiCommand(
       writeError(res, 409, `ccctl: session ${sessionId} has no live worker channel`);
       return;
     }
+    // #86: an accepted answer is SINGLE-USE — consume the outstanding decision now that it has landed,
+    // so a duplicate/replayed tap meets no buffered enrichment and is refused. AFTER a successful relay
+    // ONLY: a 409-no-worker answer never reached the worker (the `catch` above already returned), so its
+    // decision must stay outstanding for a retry rather than being spent on a delivery that failed.
+    if (command.subtype === ANSWER_SUBTYPE) {
+      consumeInputRequestEnrichment(state, sessionId);
+    }
     writeJson(res, 202, { id });
   });
 
@@ -175,6 +199,50 @@ export function handleUiCommand(
     // there is nothing to relay and no one to answer — drop it.
     handled = true;
   });
+}
+
+/**
+ * The refusal (if any) for an `answer` steer, decided BEFORE any relay, or `null` when the answer is
+ * well-formed AND legitimately answers the session's outstanding decision. Two layers, in order:
+ *
+ *   1. SHAPE (400) — `@ccctl/core`'s {@link answerEnvelopeFromValue}: a well-formed, normalized
+ *      `AnswerEnvelope` (uniform label arrays, ids in core's grammar, no control characters). Stateless,
+ *      so it is wrong INDEPENDENT of server state.
+ *   2. STATE (409) — #86, against the enrichment #264 buffered for THIS session:
+ *        - no enrichment buffered → there is no `AskUserQuestion` outstanding to answer. A bare
+ *          `requires_action` permission prompt (no decoration) is answered via the `approve` / `interrupt`
+ *          path, never this one — the base AC's "own path" for a plain approval/denial, left additive;
+ *        - otherwise {@link validateAnswerAgainstEnrichment}, against the buffered enrichment and the
+ *          `sequence_num` decision-id the phone echoed back ({@link asWorkerStatusSequence} narrows it),
+ *          refusing a stale-turn tap (the anti-phantom guard), a replay (the decision was consumed), an
+ *          unknown question, an unoffered label, or a bad-cardinality selection — each tagged in the
+ *          message via its `@ccctl/core` `AnswerRejection` reason.
+ *
+ * The 400/state-409 split is the same shape/state boundary this handler already draws for a malformed
+ * body vs. a no-live-worker relay: a stateful failure is a well-formed answer that CONFLICTS with the
+ * decision actually outstanding, not a malformed request.
+ */
+function answerRejection(
+  state: WorkerChannelState,
+  sessionId: string,
+  payload: Record<string, unknown> | undefined,
+): { readonly status: number; readonly message: string } | null {
+  const envelope = answerEnvelopeFromValue(payload);
+  if (envelope === null) {
+    return { status: 400, message: "ccctl: an `answer` command requires a well-formed `payload` AnswerEnvelope" };
+  }
+  const enrichment = state.requiresActionEnrichments.get(sessionId);
+  if (enrichment === undefined) {
+    return { status: 409, message: `ccctl: session ${sessionId} has no outstanding AskUserQuestion to answer` };
+  }
+  const verdict = validateAnswerAgainstEnrichment(enrichment, envelope, asWorkerStatusSequence(payload?.sequence_num));
+  if (!verdict.ok) {
+    return {
+      status: 409,
+      message: `ccctl: answer refused (${verdict.reason}) — it does not match session ${sessionId}'s outstanding decision`,
+    };
+  }
+  return null;
 }
 
 /**

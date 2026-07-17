@@ -17,13 +17,18 @@
  * unit-testable without a browser, exactly as the decode/classify logic is; `app.js`
  * stays the thin shell that reads a DOM control, builds a command here, and POSTs it.
  *
- * The three steer verbs (issue #12 AC) and their wire subtypes are MIRRORED from
- * `@ccctl/core`, deliberately NOT imported (this module is served to the browser
- * as-is, no bundler), so it stays dependency-free vanilla ESM:
+ * The steer verbs (issue #12 AC, plus the #86 `answer`) and their wire subtypes are
+ * MIRRORED from `@ccctl/core`, deliberately NOT imported (this module is served to the
+ * browser as-is, no bundler), so it stays dependency-free vanilla ESM:
  *
- *   input    → { subtype: "prompt",    payload: { text } }        — send input to the turn
- *   approve  → { subtype: "approve",   payload: { toolUseId }? }  — approve the pending action
- *   redirect → { subtype: "interrupt", payload: { reason } }      — redirect the current turn
+ *   input    → { subtype: "prompt",    payload: { text } }                    — send input to the turn
+ *   approve  → { subtype: "approve",   payload: { toolUseId }? }              — approve the pending action
+ *   redirect → { subtype: "interrupt", payload: { reason } }                 — redirect the current turn
+ *   answer   → { subtype: "answer",    payload: { answers, sequence_num } }   — reply to an AskUserQuestion (#86)
+ *
+ * The `answer` verb is the ENCODE half of the answer-envelope contract (#86); its SERVER-side
+ * freshness / bounded-selection validation lives in `@ccctl/server` `ui-command.ts`, and #87 renders
+ * the tappable options that feed {@link answerCommand}.
  */
 
 /** Same-origin path the browser GETs the session list from (mirrors the server's `UI_SESSIONS_PATH`). */
@@ -59,6 +64,9 @@ export const APPROVE_SUBTYPE = "approve";
 
 /** Wire subtype of the "redirect the current turn" steer (mirrors `@ccctl/core`). */
 export const REDIRECT_SUBTYPE = "interrupt";
+
+/** Wire subtype of the "answer an AskUserQuestion" steer (#86; mirrors `@ccctl/core`). */
+export const ANSWER_SUBTYPE = "answer";
 
 /** Trim a value to a string, or the empty string when it is not one. */
 function trimmed(value) {
@@ -114,6 +122,46 @@ export function approveCommand(toolUseId) {
     return { subtype: APPROVE_SUBTYPE };
   }
   return { subtype: APPROVE_SUBTYPE, payload: { toolUseId: value } };
+}
+
+/**
+ * Build an `AskUserQuestion` answer steer (#86) — the ENCODE half of the answer-envelope contract whose
+ * SERVER-side validation `@ccctl/server` `ui-command.ts` owns (#87 renders the tappable options that feed
+ * it). The payload is a `@ccctl/core` `AnswerEnvelope` (`{ answers: { [questionId]: labels } }`) PLUS the
+ * `sequence_num` decision-id the phone echoes back from the enrichment it rendered — the server's freshness
+ * token, which matches the answer to the CURRENT outstanding block and refuses a stale-turn tap.
+ *
+ * Returns `null` (so the caller no-ops rather than steering a broken answer) when the decision-id is not a
+ * usable #201 stamp (a non-negative safe integer), or `answers` is not a non-empty map of non-empty label
+ * ARRAYS — the uniform shape `AnswerEnvelope` demands, so a single-select is `[label]` (a bare string is
+ * refused, never coerced, exactly as `@ccctl/core` refuses it). Labels are forwarded verbatim: they are the
+ * ALREADY-normalized option labels the rendered enrichment carried, and the server re-normalizes
+ * authoritatively — re-normalizing here would only risk diverging from that one authority.
+ *
+ * @param {unknown} sequenceNum  The rendered enrichment's `sequenceNum` (the decision-id).
+ * @param {unknown} answers      `{ [questionId: string]: string[] }` — chosen labels per question.
+ * @returns {{ subtype: string, payload: { answers: Record<string, string[]>, sequence_num: number } } | null}
+ */
+export function answerCommand(sequenceNum, answers) {
+  if (!Number.isSafeInteger(sequenceNum) || sequenceNum < 0) {
+    return null;
+  }
+  if (typeof answers !== "object" || answers === null || Array.isArray(answers)) {
+    return null;
+  }
+  const entries = Object.entries(answers);
+  if (entries.length === 0) {
+    return null;
+  }
+  for (const [, selection] of entries) {
+    if (!Array.isArray(selection) || selection.length === 0) {
+      return null;
+    }
+    if (selection.some((label) => typeof label !== "string" || label.trim() === "")) {
+      return null;
+    }
+  }
+  return { subtype: ANSWER_SUBTYPE, payload: { answers, sequence_num: sequenceNum } };
 }
 
 /**

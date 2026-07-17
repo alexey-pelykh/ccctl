@@ -2100,6 +2100,98 @@ export function answerEnvelopeFromValue(value: unknown): AnswerEnvelope | null {
   return { answers: parsed };
 }
 
+/**
+ * Why an operator's {@link AnswerEnvelope} was REFUSED against the {@link RequiresActionEnrichment}
+ * currently outstanding for its session (#86):
+ *
+ *   - `stale-decision` — the answer names a DIFFERENT decision than the one outstanding: the
+ *     `sequence_num` the phone echoes back (the decision-id + single-use token) is absent, or does not
+ *     equal the buffered enrichment's {@link RequiresActionEnrichment.sequenceNum}. This one equality is
+ *     the whole anti-phantom-decision guard — a tap against turn-N's rendered options landing while
+ *     turn-N+1's block is outstanding is exactly a `sequence_num` that no longer matches — and it is
+ *     equally how a DUPLICATE (the server consumes the enrichment on the first accepted answer, so a
+ *     replay meets a different, or absent, decision) and an OUT-OF-ORDER answer are refused: all three
+ *     reduce to "this is not the decision outstanding NOW". It reuses the #80 `sessionMessageCursor`
+ *     "moved-on" stance — a monotonic per-session stamp the client last saw, compared against the live
+ *     one — applied to the enrichment's own #201 stamp rather than the stream cursor.
+ *   - `unknown-question` — a well-formed `questionId` ({@link isEnrichmentQuestionId}) that names no
+ *     question in THIS enrichment. Core mints ids positionally ({@link enrichmentQuestionId}), so an id
+ *     the outstanding decision does not carry cannot be answered.
+ *   - `unoffered-label` — a label the answered question never offered. The label IS the answer token
+ *     ({@link EnrichmentOption}), so an answer may only ever carry labels the worker itself put on the
+ *     wire — this is the "bounded option-selection … never free-form text the worker executes" AC, and
+ *     the reason the freshness check alone is not enough: a fresh answer selecting an unoffered label is
+ *     still free-form content the ungated worker never authored.
+ *   - `cardinality` — a single-select question ({@link EnrichmentQuestion.multiSelect} `false`) answered
+ *     with other than exactly one label, or ANY selection that repeats a label. A choice is a SET, and a
+ *     single-select is a set of one.
+ */
+export type AnswerRejection = "stale-decision" | "unknown-question" | "unoffered-label" | "cardinality";
+
+/** The verdict of {@link validateAnswerAgainstEnrichment}: accepted, or refused with the {@link AnswerRejection}. */
+export type AnswerValidation = { readonly ok: true } | { readonly ok: false; readonly reason: AnswerRejection };
+
+/**
+ * Validate an operator's {@link AnswerEnvelope} against the {@link RequiresActionEnrichment} the server
+ * has OUTSTANDING for the session (#86) — the STATEFUL half {@link answerEnvelopeFromValue}'s shape guard
+ * deliberately cannot do. The shape guard proves the envelope is WELL-FORMED (uniform label arrays,
+ * ids matching core's grammar, no control characters); this proves it is a legitimate answer to the
+ * decision actually outstanding — fresh, single-use, and a bounded selection of options the worker
+ * itself offered. Pure: the STATE (which enrichment is buffered) lives in `@ccctl/server` (#264); this
+ * takes that buffered enrichment as an argument and decides, holding no state of its own — which is why
+ * it is unit-testable exhaustively without a server.
+ *
+ * **Precondition.** `envelope` is a shape-valid {@link AnswerEnvelope} — the product of
+ * {@link answerEnvelopeFromValue}, never a raw decoded value — so `answers` is non-empty, every key is a
+ * mintable id, and every selection is a non-empty array of normalized labels. This validator adds the
+ * SEMANTIC layer on top; it does not re-do the shape guard.
+ *
+ * **Order matters, and freshness comes first.** The `sequence_num` equality is checked before any label,
+ * so a stale-turn tap is refused as `stale-decision` regardless of whether its (turn-N) labels happen to
+ * also appear in the (turn-N+1) enrichment — the answer is for the wrong decision, and that verdict must
+ * not depend on an accidental label overlap between two turns.
+ *
+ * Returns a verdict, never throws (the caller maps a refusal to a fail-closed HTTP status and a
+ * non-relay); an accepted answer is the ONLY path on which the server relays to the worker and consumes
+ * the decision.
+ */
+export function validateAnswerAgainstEnrichment(
+  enrichment: RequiresActionEnrichment,
+  envelope: AnswerEnvelope,
+  submittedSequenceNum: number | null,
+): AnswerValidation {
+  // (1) Freshness — the decision-id / single-use token. An absent or mismatched stamp is the wrong
+  // decision (stale / phantom / duplicate / out-of-order all collapse here). Equality, not `>=`: the
+  // answer must be for EXACTLY the outstanding block, not merely a not-older one.
+  if (submittedSequenceNum === null || submittedSequenceNum !== enrichment.sequenceNum) {
+    return { ok: false, reason: "stale-decision" };
+  }
+  // (2) Bounded selection — every answered question is one THIS decision asks, every label one it
+  // offered, and a single-select is answered with exactly one distinct label.
+  const byId = new Map(enrichment.questions.map((question) => [question.questionId, question]));
+  for (const [questionId, selection] of Object.entries(envelope.answers)) {
+    const question = byId.get(questionId);
+    if (question === undefined) {
+      return { ok: false, reason: "unknown-question" };
+    }
+    if (!question.multiSelect && selection.length !== 1) {
+      return { ok: false, reason: "cardinality" };
+    }
+    const offered = new Set(question.options.map((option) => option.label));
+    const chosen = new Set<string>();
+    for (const label of selection) {
+      if (!offered.has(label)) {
+        return { ok: false, reason: "unoffered-label" };
+      }
+      if (chosen.has(label)) {
+        return { ok: false, reason: "cardinality" };
+      }
+      chosen.add(label);
+    }
+  }
+  return { ok: true };
+}
+
 // --- loggable / persistable (JSON) shape + credential-omission proofs ---
 
 /** A JSON-safe value: exactly what may cross into a log line or a snapshot. */

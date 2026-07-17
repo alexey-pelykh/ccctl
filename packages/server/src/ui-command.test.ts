@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { request as httpRequest, type IncomingMessage } from "node:http";
-import { SESSIONS_PATH, workerEventsStreamPath, workerRegisterPath } from "@ccctl/core";
+import { SESSIONS_PATH, workerEventsPath, workerEventsStreamPath, workerRegisterPath } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
 
 const ACCOUNT_BEARER = "oauth-account-secret-cmd-abc123";
@@ -50,13 +50,14 @@ async function registerSession(server: CcctlServer): Promise<string> {
   return ((await res.json()) as { session_id: string }).session_id;
 }
 
-/** §4 — register the worker so a downstream can attach. */
-async function registerWorker(server: CcctlServer, sessionId: string): Promise<void> {
-  await fetch(`${base(server)}${workerRegisterPath(sessionId)}`, {
+/** §4 — register the worker so a downstream can attach; returns the minted worker_epoch (for §5 posts). */
+async function registerWorker(server: CcctlServer, sessionId: string): Promise<number> {
+  const res = await fetch(`${base(server)}${workerRegisterPath(sessionId)}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: "{}",
   });
+  return ((await res.json()) as { worker_epoch: number }).worker_epoch;
 }
 
 /** POST a UI steer to a session; a string body is sent verbatim, anything else is JSON-encoded. */
@@ -123,12 +124,66 @@ function openWorkerStream(server: CcctlServer, sessionId: string): Promise<() =>
 }
 
 /** Register a session + worker and open its downstream — everything a relay needs to land. */
-async function readyWorker(server: CcctlServer): Promise<{ sessionId: string; frames: () => ClientEventFrame[] }> {
+async function readyWorker(
+  server: CcctlServer,
+): Promise<{ sessionId: string; epoch: number; frames: () => ClientEventFrame[] }> {
   const sessionId = await registerSession(server);
-  await registerWorker(server, sessionId);
+  const epoch = await registerWorker(server, sessionId);
   const frames = await openWorkerStream(server, sessionId);
-  return { sessionId, frames };
+  return { sessionId, epoch, frames };
 }
+
+/** A §5 `worker_status` frame carrying its #201 `sequence_num`. */
+function statusFrame(status: string, sequenceNum: number): unknown {
+  return { type: "control_event", subtype: "worker_status", payload: { status, sequence_num: sequenceNum } };
+}
+
+/** A §5 `input_request` frame (#261) decorating a `requires_action` block, correlated by `sequence_num`. */
+function inputRequestFrame(sequenceNum: number, questions: unknown[]): unknown {
+  return { type: "control_event", subtype: "input_request", payload: { sequence_num: sequenceNum, questions } };
+}
+
+/** POST a §5 upstream `worker/events` batch (the leg that buffers an enrichment + folds status). */
+function postWorkerEvents(
+  server: CcctlServer,
+  sessionId: string,
+  epoch: number,
+  payloads: unknown[],
+): Promise<Response> {
+  return fetch(`${base(server)}${workerEventsPath(sessionId)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ worker_epoch: epoch, events: payloads.map((payload) => ({ payload })) }),
+  });
+}
+
+/**
+ * Buffer an `AskUserQuestion` enrichment at `sequenceNum` — the outstanding decision an `answer` is
+ * validated against (#86). One §5 batch: the `requires_action` block plus its decorating `input_request`,
+ * correlated by `sequence_num` (mirrors the #264 transport buffering).
+ */
+async function bufferEnrichment(
+  server: CcctlServer,
+  sessionId: string,
+  epoch: number,
+  sequenceNum: number,
+  questions: unknown[],
+): Promise<void> {
+  const res = await postWorkerEvents(server, sessionId, epoch, [
+    statusFrame("requires_action", sequenceNum),
+    inputRequestFrame(sequenceNum, questions),
+  ]);
+  expect(res.status).toBe(200);
+  expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
+}
+
+/** One well-formed enrichment question, off ADR-005's observed AskUserQuestion shape (single-select Yes/No). */
+const APPROVE_QUESTION = {
+  question: "Approve the edit to foo.ts?",
+  header: "File edit",
+  options: [{ label: "Yes", description: "apply it" }, { label: "No" }],
+  multiSelect: false,
+};
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
   const start = Date.now();
@@ -264,63 +319,193 @@ describe("UI command ingress — per-session fetch POST /api/sessions/{id}/comma
   });
 });
 
-describe("UI answer verb — POST /api/sessions/{id}/command { subtype: 'answer' } (#264, #78 Option A)", () => {
-  it("relays a well-formed AnswerEnvelope as a control_request carrying the normalized envelope", async () => {
+describe("UI answer verb — stateful gate against the buffered decision (#264 transport, #86 freshness)", () => {
+  it("relays a well-formed answer to the OUTSTANDING decision as a normalized control_request (202), stripping the decision-id", async () => {
     const server = await startTestServer();
-    const { sessionId, frames } = await readyWorker(server);
+    const { sessionId, epoch, frames } = await readyWorker(server);
+    await bufferEnrichment(server, sessionId, epoch, 5, [APPROVE_QUESTION]);
 
-    const res = await postCommand(server, sessionId, { subtype: "answer", payload: { answers: { q0: ["Yes"] } } });
+    const res = await postCommand(server, sessionId, {
+      subtype: "answer",
+      payload: { answers: { q0: ["Yes"] }, sequence_num: 5 },
+    });
     expect(res.status).toBe(202);
     const { id } = (await res.json()) as { id: string };
 
     await waitFor(() => frames().length === 1);
     const payload = frames()[0].data.payload as Record<string, unknown>;
+    // The relayed payload carries the envelope ONLY — the `sequence_num` decision-id is a server-side
+    // freshness token, never forwarded to the worker (which resolves its OWN AskUserQuestion).
     expect(payload).toEqual({ type: "control_request", id, subtype: "answer", payload: { answers: { q0: ["Yes"] } } });
   });
 
-  it("normalizes the answer at the boundary — no control character rides down to the worker (#261 trust boundary)", async () => {
+  it("round-trips ALL chosen labels of a multi-select decision (AC: multi-select)", async () => {
     const server = await startTestServer();
-    const { sessionId, frames } = await readyWorker(server);
+    const { sessionId, epoch, frames } = await readyWorker(server);
+    await bufferEnrichment(server, sessionId, epoch, 2, [
+      {
+        question: "Which checks?",
+        options: [{ label: "lint" }, { label: "test" }, { label: "build" }],
+        multiSelect: true,
+      },
+    ]);
 
-    // A BEL smuggled into a label: the boundary must strip it, so nothing hostile reaches the worker.
     const res = await postCommand(server, sessionId, {
       subtype: "answer",
-      payload: { answers: { q0: ["Ap\u0007prove"] } },
+      payload: { answers: { q0: ["lint", "build"] }, sequence_num: 2 },
+    });
+    expect(res.status).toBe(202);
+    await waitFor(() => frames().length === 1);
+    const relayed = frames()[0].data.payload as { payload: { answers: Record<string, string[]> } };
+    expect(relayed.payload.answers.q0).toEqual(["lint", "build"]);
+  });
+
+  it("is SINGLE-USE — the decision is consumed on the accepted answer, so a replay is refused (409)", async () => {
+    const server = await startTestServer();
+    const { sessionId, epoch, frames } = await readyWorker(server);
+    await bufferEnrichment(server, sessionId, epoch, 5, [APPROVE_QUESTION]);
+
+    const answer = { subtype: "answer", payload: { answers: { q0: ["Yes"] }, sequence_num: 5 } };
+    expect((await postCommand(server, sessionId, answer)).status).toBe(202);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false); // consumed
+    // A duplicate tap of the same rendered decision now finds nothing outstanding.
+    expect((await postCommand(server, sessionId, answer)).status).toBe(409);
+
+    // Only the FIRST answer reached the worker.
+    await waitFor(() => frames().length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(frames()).toHaveLength(1);
+  });
+
+  it("REFUSES a stale-turn tap — a sequence_num that no longer matches the outstanding block (409, #86 anti-phantom)", async () => {
+    const server = await startTestServer();
+    const { sessionId, epoch, frames } = await readyWorker(server);
+    await bufferEnrichment(server, sessionId, epoch, 5, [APPROVE_QUESTION]);
+
+    // The phone rendered turn-5's options but the answer is tagged turn-4 — a superseded decision.
+    const res = await postCommand(server, sessionId, {
+      subtype: "answer",
+      payload: { answers: { q0: ["Yes"] }, sequence_num: 4 },
+    });
+    expect(res.status).toBe(409);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true); // a stale answer does NOT consume the decision
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(frames()).toHaveLength(0);
+  });
+
+  it("REFUSES an answer that carries NO decision-id (absent sequence_num → 409), never relaying it", async () => {
+    const server = await startTestServer();
+    const { sessionId, epoch, frames } = await readyWorker(server);
+    await bufferEnrichment(server, sessionId, epoch, 5, [APPROVE_QUESTION]);
+
+    const res = await postCommand(server, sessionId, { subtype: "answer", payload: { answers: { q0: ["Yes"] } } });
+    expect(res.status).toBe(409);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(frames()).toHaveLength(0);
+  });
+
+  it("REFUSES a label the worker never offered — a fresh answer is still not free-form (409 unoffered-label)", async () => {
+    const server = await startTestServer();
+    const { sessionId, epoch, frames } = await readyWorker(server);
+    await bufferEnrichment(server, sessionId, epoch, 5, [APPROVE_QUESTION]);
+
+    const res = await postCommand(server, sessionId, {
+      subtype: "answer",
+      payload: { answers: { q0: ["rm -rf /"] }, sequence_num: 5 },
+    });
+    expect(res.status).toBe(409);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true); // not consumed
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(frames()).toHaveLength(0);
+  });
+
+  it("REFUSES any answer when the session has NO outstanding AskUserQuestion (409) — the approve/deny path stays separate", async () => {
+    const server = await startTestServer();
+    const { sessionId, frames } = await readyWorker(server);
+    // No enrichment buffered: the session is not blocking on a decorated decision. A plain approval would
+    // ride the `approve` / `interrupt` verbs (the base AC's own path), untouched by this gate.
+    const res = await postCommand(server, sessionId, {
+      subtype: "answer",
+      payload: { answers: { q0: ["Yes"] }, sequence_num: 5 },
+    });
+    expect(res.status).toBe(409);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(frames()).toHaveLength(0);
+  });
+
+  it("normalizes the answer at the boundary — a smuggled control character is neutralized before it reaches the worker (#261 trust boundary)", async () => {
+    const server = await startTestServer();
+    const { sessionId, epoch, frames } = await readyWorker(server);
+    // The outstanding decision offers "Ap prove" (a space in the label). `displayableDetail` turns any
+    // control character into a space, so a phone that smuggles a BEL where the space is normalizes to the
+    // SAME offered label — it matches, and the relayed answer is clean. (A control char that normalized to
+    // a NON-offered label would instead be refused by the bounded-selection gate — either way, nothing
+    // hostile reaches the worker.)
+    await bufferEnrichment(server, sessionId, epoch, 8, [
+      { question: "Proceed?", options: [{ label: "Ap prove" }, { label: "Reject" }], multiSelect: false },
+    ]);
+
+    const res = await postCommand(server, sessionId, {
+      subtype: "answer",
+      payload: { answers: { q0: ["Ap\u0007prove"] }, sequence_num: 8 },
     });
     expect(res.status).toBe(202);
 
     await waitFor(() => frames().length === 1);
     const relayed = frames()[0].data.payload as { payload: { answers: Record<string, string[]> } };
+    expect(relayed.payload.answers.q0[0]).toBe("Ap prove");
     expect(relayed.payload.answers.q0[0]).not.toContain("\u0007");
   });
 
-  it("rejects a malformed answer envelope BEFORE any relay (400), and never opens the worker frame", async () => {
+  it("rejects a malformed answer envelope BEFORE the stateful gate (400 shape), never relaying or consuming", async () => {
     const server = await startTestServer();
-    const { sessionId, frames } = await readyWorker(server);
+    const { sessionId, epoch, frames } = await readyWorker(server);
+    await bufferEnrichment(server, sessionId, epoch, 5, [APPROVE_QUESTION]);
 
     // A bare-string selection (not the uniform array `AnswerEnvelope` demands) fails the #261 shape guard.
     expect(
-      (await postCommand(server, sessionId, { subtype: "answer", payload: { answers: { q0: "Yes" } } })).status,
+      (
+        await postCommand(server, sessionId, {
+          subtype: "answer",
+          payload: { answers: { q0: "Yes" }, sequence_num: 5 },
+        })
+      ).status,
     ).toBe(400);
     // An empty `answers` map answers nothing.
-    expect((await postCommand(server, sessionId, { subtype: "answer", payload: { answers: {} } })).status).toBe(400);
+    expect(
+      (await postCommand(server, sessionId, { subtype: "answer", payload: { answers: {}, sequence_num: 5 } })).status,
+    ).toBe(400);
     // A key outside the minted `q<index>` grammar core validates against.
     expect(
-      (await postCommand(server, sessionId, { subtype: "answer", payload: { answers: { nope: ["x"] } } })).status,
+      (
+        await postCommand(server, sessionId, {
+          subtype: "answer",
+          payload: { answers: { nope: ["x"] }, sequence_num: 5 },
+        })
+      ).status,
     ).toBe(400);
     // No payload at all.
     expect((await postCommand(server, sessionId, { subtype: "answer" })).status).toBe(400);
 
-    // A rejected answer is never relayed — nothing reached the worker.
+    // A shape-rejected answer is never relayed, and 400 does not consume the outstanding decision.
     await new Promise((resolve) => setTimeout(resolve, 40));
     expect(frames()).toHaveLength(0);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
   });
 
-  it("fails closed when the addressed session has no live worker channel, even for a valid answer (409)", async () => {
+  it("fails closed when the addressed session has no live worker channel, even for an otherwise-valid answer (409)", async () => {
     const server = await startTestServer();
     const sessionId = await registerSession(server);
-    // Registered, but the worker never opened its downstream: a well-formed answer still cannot land.
-    const res = await postCommand(server, sessionId, { subtype: "answer", payload: { answers: { q0: ["Yes"] } } });
+    const epoch = await registerWorker(server, sessionId);
+    // Buffer a decision but NEVER open the downstream: the answer passes the gate, then cannot land.
+    await bufferEnrichment(server, sessionId, epoch, 5, [APPROVE_QUESTION]);
+
+    const res = await postCommand(server, sessionId, {
+      subtype: "answer",
+      payload: { answers: { q0: ["Yes"] }, sequence_num: 5 },
+    });
     expect(res.status).toBe(409);
+    // The relay failed, so the decision is NOT consumed — it stays outstanding for a retry.
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
   });
 });
