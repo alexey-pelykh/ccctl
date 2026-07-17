@@ -138,6 +138,13 @@ export interface Tunnel {
    * leaving no mapping behind, and return it to `down`. A clean no-op when nothing
    * is established, so it is always safe to call — e.g. from a shutdown path that
    * does not know whether {@link establish} ran.
+   *
+   * Safe to call after {@link establish}, never CONCURRENTLY with one: the caller
+   * must serialize the two (#259). A teardown reads the release handles an establish
+   * is still writing — and reads them at its own start, so it can decide "no grant to
+   * revert" a tick before the establish records one, then leave that grant behind.
+   * Sequential calls are fine, including repeats: state is cleared only after a step
+   * succeeds, so a second teardown is a no-op and a failed one is retryable.
    */
   teardown(): Promise<void>;
 }

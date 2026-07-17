@@ -670,6 +670,55 @@ describe("TailscaleTunnel ACL provisioning (AC: opt-in, additive, non-destructiv
     expect(Object.keys(established).sort()).toEqual(["kind", "publicHost"]);
     expect(await tunnel.status()).toEqual({ kind: "tailscale", up: true, publicHost: "host.ts.net" });
   });
+
+  // Rule (#259): `teardown` is safe after an establish, never CONCURRENTLY with one — the precondition
+  // `Tunnel.teardown` now states. This pins WHY, executably, rather than leaving it as prose a future
+  // caller can read past: it CHARACTERIZES the hazard, so the contract has evidence and a reordering of
+  // the read below is caught rather than silently making the docs a lie.
+  //
+  // The mechanism is a happens-before edge: `teardown` reads `#provisionedGrant` as its first
+  // synchronous statement, while `#provisionAcl` records that field only AFTER `savePolicy` resolves.
+  // So a teardown landing inside the write reads "no grant to revert", skips the revert, and the write
+  // it never saw lands anyway — an orphaned grant in the operator's policy. Deliberately NOT fixed in
+  // the adapter: the CLI is the one caller that can race these (it alone arms a signal handler over an
+  // in-flight establish) and it serializes them there, so this stays a caller contract rather than
+  // machinery every `Tunnel` implementer would owe. Delete this test if that ever changes.
+  it("strands the grant when a teardown races the provision — the hazard the serialize contract exists for", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    let writeInFlight = false;
+    let releaseWrite!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    // Hold the policy write open, so a teardown can land in the exact window the contract forbids:
+    // after `establish` decided to provision, before it has recorded what it provisioned.
+    const client: TailscaleAclClient = {
+      fetchPolicy: () => acl.client.fetchPolicy(),
+      savePolicy: async (next, etag) => {
+        writeInFlight = true;
+        await held;
+        return acl.client.savePolicy(next, etag);
+      },
+    };
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const tunnel = new TailscaleTunnel(runner, { client, grant: CCCTL_GRANT });
+
+    const establishing = tunnel.establish(LOOPBACK);
+    await vi.waitFor(() => expect(writeInFlight).toBe(true));
+
+    // The forbidden concurrent call. It releases the mapping and reports success — the adapter has no
+    // way to know an establish is mid-write behind it.
+    await tunnel.teardown();
+
+    releaseWrite();
+    await establishing;
+
+    // The mapping IS released, so this is not a no-op teardown — and the grant is in the operator's
+    // policy all the same, with the instance that would revert it already torn down. That is the whole
+    // hazard: a release that reports clean and leaves authorization behind.
+    expect(acl.current().grants).toContainEqual(CCCTL_GRANT);
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: true, publicHost: "host.ts.net" });
+  });
 });
 
 describe("defaultTailscaleAclClient (AC: credential rides the injectable seam, never logged)", () => {

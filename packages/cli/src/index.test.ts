@@ -66,6 +66,13 @@ interface FakeDepsOptions {
   readonly deviceSnapshot?: DeviceStoreSnapshot | null;
 }
 
+/**
+ * The tunnel a fake `establish` resolves with — the shape the real adapter returns. Module-scoped so
+ * {@link makeDeps}' default and the tests that drive their own gated establish resolve the SAME value
+ * by construction, rather than by two literals agreeing.
+ */
+const ESTABLISHED: EstablishedTunnel = { kind: "tailscale", publicHost: "oracle-node.tailnet.ts.net" };
+
 /** Build fake {@link CliDependencies} plus handles to the spies the assertions read. */
 function makeDeps(options: FakeDepsOptions = {}): {
   deps: CliDependencies;
@@ -98,9 +105,7 @@ function makeDeps(options: FakeDepsOptions = {}): {
     Promise.resolve(makeServer(config.host ?? "127.0.0.1", config.port === 0 ? 55555 : config.port, close)),
   );
   const establish = vi.fn(
-    options.establish ??
-      ((_local: { host: string; port: number }) =>
-        Promise.resolve({ kind: "tailscale", publicHost: "oracle-node.tailnet.ts.net" } satisfies EstablishedTunnel)),
+    options.establish ?? ((_local: { host: string; port: number }) => Promise.resolve(ESTABLISHED)),
   );
   // `adopt` / `teardown` are the tunnel's revert half (#242): `--off` adopts a detached mapping and
   // releases it, and `serve --tunnel`'s shutdown releases the one the daemon retained. Shared spies (like
@@ -465,6 +470,20 @@ describe("ccctl serve --tunnel — composes daemon + tunnel (AC4)", () => {
     process.env[LOCAL_SERVER_AUTH_ENV] = "test-secret";
   });
 
+  /**
+   * A promise whose settlement the test decides — the only way to hold an establish open and land a
+   * signal INSIDE it, which is the window #259 is about and the one no test could reach before.
+   */
+  function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason: Error) => void } {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
   it("starts the daemon THEN establishes the tunnel against the bound address, reporting the public host", async () => {
     const { deps, startServer, establish, launcher } = makeDeps();
     await buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
@@ -603,7 +622,11 @@ describe("ccctl serve --tunnel — composes daemon + tunnel (AC4)", () => {
   // Rule: the thunk exists because shutdown is armed BEFORE the tunnel is established (so a Ctrl-C
   // during a slow establish still shuts down gracefully). Proven by reading it at ARM time, when the
   // establish has not run yet — a plain value could not have carried the tunnel at all.
-  it("arms shutdown before the tunnel exists — the thunk answers null until the establish lands", async () => {
+  //
+  // Scoped to ARM time, which is before the establish STARTS — not "until it lands". Once it is in
+  // flight the answer is a releaser rather than `null`, because by then there may be a mapping to
+  // release (#259); this pins the one moment when there provably is not.
+  it("arms shutdown before the tunnel exists — the thunk answers null until the establish starts", async () => {
     const resolvedAtArmTime: unknown[] = [];
     const { deps, installShutdownHandler } = makeDeps();
     installShutdownHandler.mockImplementation((options) => {
@@ -625,9 +648,11 @@ describe("ccctl serve --tunnel — composes daemon + tunnel (AC4)", () => {
     expect(handlerArg.tunnel()).toBeNull();
   });
 
-  // Rule: a FAILED establish leaves no usable tunnel, so the thunk must not hand the shutdown path a
-  // half-up instance to revert a grant that was never provisioned (the adapter records nothing on a
-  // failed establish — provisioning runs last).
+  // Rule: a failed establish that has SETTLED leaves no usable tunnel, so the thunk must not hand the
+  // shutdown path a half-up instance to revert a grant that was never provisioned (the adapter records
+  // nothing on a failed establish — provisioning runs last). Scoped to the settled case on purpose:
+  // while that same establish is still IN FLIGHT the answer is NOT null, because the mapping it may
+  // already have landed is releasable and nothing else will release it (#259, the three tests below).
   it("leaves the thunk answering null when the establish fails", async () => {
     const captured: Array<() => unknown> = [];
     const { deps, installShutdownHandler } = makeDeps({
@@ -641,6 +666,88 @@ describe("ccctl serve --tunnel — composes daemon + tunnel (AC4)", () => {
     await expect(buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" })).rejects.toThrow();
 
     expect(captured[0]?.()).toBeNull();
+  });
+
+  // Rule (#259 AC1): the window between `tailscale serve --bg` landing and `establish` resolving is the
+  // one where a mapping exists and the daemon has not been handed anything — so the thunk must answer a
+  // RELEASER there, not `null`. Answering `null` is what let a Ctrl-C during a slow establish close the
+  // server, release nothing, and exit 0 with the mapping still pointing at the port it just closed.
+  it("answers a releaser — not null — while the establish is still in flight", async () => {
+    const gate = deferred<EstablishedTunnel>();
+    const { deps, installShutdownHandler } = makeDeps({ establish: () => gate.promise });
+    const serving = buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
+    await vi.waitFor(() => expect(installShutdownHandler).toHaveBeenCalled());
+
+    // Mid-establish: the daemon owns no tunnel yet, but has something to release.
+    expect(installShutdownHandler.mock.calls[0][0].tunnel()).not.toBeNull();
+
+    gate.resolve(ESTABLISHED);
+    await serving;
+  });
+
+  // Rule (#259): the releaser WAITS for the establish to settle before releasing, and that ordering is
+  // the whole point — not politeness. `teardown` decides the ACL revert from a synchronous read of the
+  // grant the adapter records only AFTER its policy write lands, so a teardown that ran mid-establish
+  // would read "no grant", skip the revert, and strand the grant the establish went on to write. Proven
+  // by ordering: the release cannot be observed until the establish has settled.
+  it("waits for the in-flight establish to settle before releasing what it left", async () => {
+    const order: string[] = [];
+    const gate = deferred<EstablishedTunnel>();
+    const { deps, installShutdownHandler, teardown } = makeDeps({
+      establish: () => gate.promise,
+      teardown: () => {
+        order.push("teardown");
+        return Promise.resolve();
+      },
+    });
+    const serving = buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
+    await vi.waitFor(() => expect(installShutdownHandler).toHaveBeenCalled());
+
+    // The signal lands mid-establish: the shutdown path resolves the thunk and starts releasing.
+    let released = false;
+    const releasing = installShutdownHandler.mock.calls[0][0]
+      .tunnel()
+      ?.teardown()
+      .then(() => {
+        released = true;
+      });
+    // A real timer turn, not a microtask hop. The property under test is that the release is BLOCKED on
+    // the establish — and "blocked" and "merely deferred" are indistinguishable across a single
+    // `await Promise.resolve()`, so that barrier would also pass a releaser that never waits at all.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    // Still nothing released, and the releaser itself still pending — the establish has not settled, so
+    // there is nothing safe to read yet. Asserting BOTH is the point: the spy alone cannot tell a
+    // releaser that is waiting from one that already gave up and resolved having done nothing.
+    expect(teardown).not.toHaveBeenCalled();
+    expect(released).toBe(false);
+
+    order.push("establish-settled");
+    gate.resolve(ESTABLISHED);
+    await serving;
+    await releasing;
+
+    expect(order).toEqual(["establish-settled", "teardown"]);
+    expect(teardown).toHaveBeenCalledTimes(1);
+  });
+
+  // Rule (#259 AC3): a signal landing mid-establish and a FAILED establish both want to release the same
+  // half-up mapping — and must not both drive `tailscale serve … off` at once. They cannot: #255's catch
+  // releases the instance inline, and the daemon never retains a tunnel it could not establish, so the
+  // waiting releaser finds nothing of its own to release. Exactly ONE teardown, from the catch.
+  it("leaves the inline release as the only one when the in-flight establish then fails", async () => {
+    const gate = deferred<EstablishedTunnel>();
+    const { deps, installShutdownHandler, teardown } = makeDeps({ establish: () => gate.promise });
+    const serving = buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
+    await vi.waitFor(() => expect(installShutdownHandler).toHaveBeenCalled());
+
+    const releasing = installShutdownHandler.mock.calls[0][0].tunnel()?.teardown();
+    gate.reject(new Error("ccctl: tailscale is not an authenticated tailnet member"));
+
+    await expect(serving).rejects.toThrow(/not an authenticated tailnet member/);
+    // The releaser settles rather than propagating the establish error — that error is the establish
+    // path's to report, and a shutdown must never be wedged by it.
+    await expect(releasing).resolves.toBeUndefined();
+    expect(teardown).toHaveBeenCalledTimes(1);
   });
 });
 

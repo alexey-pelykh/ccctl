@@ -106,11 +106,14 @@ export interface CliDependencies {
    * above. Takes the bound {@link https://ccctl | CcctlServer} to close and the daemon's structured-log
    * sink so a FAILED shutdown rides the daemon's #61 trail.
    *
-   * Also takes the daemon's tunnel, to RELEASE after closing the server (#242) — the daemon owns the
+   * Also takes what the daemon has to RELEASE after closing the server (#242) — the daemon owns the
    * tunnel's lifetime, so its shutdown is where any ACL grant the adapter provisioned gets removed. A
    * thunk, because `serve` arms this BEFORE it establishes the tunnel (so a Ctrl-C mid-establish still
    * shuts down gracefully); it is resolved when the signal lands. `@ccctl/server` types it as the narrow
-   * structural {@link https://ccctl | ReleasableTunnel} port, which `Tunnel` satisfies.
+   * structural {@link https://ccctl | ReleasableTunnel} port — deliberately just the `teardown` verb,
+   * because what travels here is not always a `Tunnel`: `Tunnel` satisfies it once the establish has
+   * settled, but DURING one `serve` passes an ad-hoc releaser that waits for it and then releases
+   * whatever it left (#259).
    */
   readonly installShutdownHandler: (options: {
     readonly server: CcctlServer;

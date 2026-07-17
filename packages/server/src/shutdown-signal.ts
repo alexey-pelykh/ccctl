@@ -78,6 +78,15 @@ export const SHUTDOWN_SIGNALS: readonly NodeJS.Signals[] = ["SIGTERM", "SIGINT"]
  * API round-trip plus the `tailscale` spawn, short enough that an operator killing a daemon on a
  * dying network is not left staring at a hung process. Exceeding it is not silent — it is reported as
  * `tunnel-teardown-failed` and exits non-zero, like any other failed teardown.
+ *
+ * Sized for the SETTLED case, which is every `SIGTERM` this is really for — a `kill`, or a laptop
+ * shutting down long after the establish resolved. A signal landing mid-establish is budgeted by the
+ * same number but has more to cover (#259: waiting out the establish, whose own provision may write
+ * the policy this then reverts), so on a slow network it can exceed the budget and be reported rather
+ * than complete. Deliberately not sized for that worst case: it is reachable only by a `Ctrl-C` inside
+ * the establish's own brief window — an operator standing at the terminal, for whom a longer silent
+ * wait is worse than a report naming `ccctl tunnel <kind> --off`, and who can force the issue with a
+ * second `Ctrl-C` (which exits `1` immediately, by design).
  */
 export const DEFAULT_TUNNEL_TEARDOWN_TIMEOUT_MS = 5_000;
 
@@ -99,7 +108,11 @@ export interface ShutdownableServer {
  * RELEASE a tunnel, not to know what a tunnel is.
  */
 export interface ReleasableTunnel {
-  /** Release the tunnel, leaving no mapping — and no provisioned ACL grant — behind. */
+  /**
+   * Release the tunnel, leaving no mapping — and no provisioned ACL grant — behind.
+   *
+   * Not necessarily a tunnel OBJECT — see {@link ShutdownSignalDeps.tunnel} (#259).
+   */
   teardown(): Promise<void>;
 }
 
@@ -116,16 +129,26 @@ export interface ShutdownSignalDeps {
   /** The running server to gracefully close on a termination signal. */
   readonly server: ShutdownableServer;
   /**
-   * The tunnel to release AFTER closing the server, resolved AT SIGNAL TIME — `null`
-   * (or an absent seam) when the daemon is loopback-only, which releases nothing and
-   * leaves the close path exactly as it was.
+   * What to release AFTER closing the server, resolved AT SIGNAL TIME — `null` (or an absent
+   * seam) when there is nothing to release, which leaves the close path exactly as it was.
    *
    * A THUNK, not a value, because of when the handler arms: the daemon arms shutdown as
    * soon as the server binds — deliberately BEFORE it establishes a tunnel, so a `Ctrl-C`
    * during a slow establish still shuts down gracefully — and at that moment there is no
    * tunnel to pass. Resolving on delivery instead means the handler releases whatever the
-   * daemon owns WHEN the signal lands: the established tunnel, or nothing if the establish
-   * had not finished (or had failed).
+   * daemon owns WHEN the signal lands.
+   *
+   * `null` means NOTHING TO RELEASE, which is narrower than "no tunnel" (#259). A daemon
+   * whose establish is still IN FLIGHT has no tunnel to hand over and yet may have plenty to
+   * release — a `tailscale serve` mapping lands well before `establish` resolves — so an
+   * honest `null` there would strand it. The daemon answers that window with a releaser that
+   * waits for its establish to settle and then releases whatever it left; this path neither
+   * knows nor cares which it was handed, because {@link ReleasableTunnel} is just the verb.
+   *
+   * What it DOES care about is that a waiting releaser can wait a while. That is already
+   * budgeted: the teardown is raced against {@link ShutdownSignalDeps.tunnelTeardownTimeoutMs}
+   * exactly so #82's floor is never gated on how long a release takes to decide, and a wedged
+   * one is reported as `tunnel-teardown-failed` rather than trapping the operator.
    */
   readonly tunnel?: () => ReleasableTunnel | null;
   /**
@@ -216,10 +239,10 @@ export function installShutdownSignalHandler(deps: ShutdownSignalDeps): () => vo
       code = 1;
     }
 
-    // Then the tunnel — best-effort within the budget. `null` when the daemon is loopback-only or the
-    // establish never landed: nothing to release. Attempted even if the close above failed: the grant
-    // is in the operator's policy either way, and leaving it there because an unrelated step broke
-    // would be the orphaned-grant bug this exists to fix.
+    // Then the tunnel — best-effort within the budget. `null` when there is nothing to release (see
+    // the `tunnel` seam — narrower than "no tunnel"). Attempted even if the close above failed: the
+    // grant is in the operator's policy either way, and leaving it there because an unrelated step
+    // broke would be the orphaned-grant bug this exists to fix.
     const releasable = tunnel();
     if (releasable !== null) {
       try {
