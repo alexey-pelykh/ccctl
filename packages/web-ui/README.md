@@ -42,10 +42,15 @@ zero-build transport pair:
   whose status / activity changed are relabelled — so each session's per-session
   status (running / idle / awaiting-input) stays live as sessions change state,
   without flicker or losing focus / the current selection. A session carrying the
-  life-long **notifications-degraded** marker (#26 — a non-prompting session whose
-  needs-you notifications never fire) stands a persistent badge on its row (#27); a
-  prompting session shows none. Picking one (re)opens its stream and clears the prior
-  session's transcript — the view + steer below apply to the selected session, and
+  life-long non-prompting marker (#26 — it auto-approves some class of permission
+  decision rather than asking you) stands a persistent badge on its row (#27); a
+  prompting session shows none. The badge is **advisory** (#265): a marked session still
+  raises needs-you when the agent asks a question, because `AskUserQuestion` blocks
+  natively even under bypass (ADR-005) — fewer triggers, not none. It does not mean the
+  session never prompts either: `bypassPermissions` approves every tool call, while
+  `acceptEdits` auto-accepts file edits and still prompts for other tools. Picking
+  one (re)opens its stream and clears the prior session's transcript — the view +
+  steer below apply to the selected session, and
   never bleed across sessions.
 - **Downstream (implemented, #15; per-session #20):** an `EventSource` subscribes to
   the selected session's SSE stream at `GET /api/sessions/{id}/events`. Each

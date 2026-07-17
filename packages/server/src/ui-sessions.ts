@@ -25,8 +25,9 @@
  * + steer each"): it surfaces each session's OWN already-modelled state (its id,
  * transport `status`, derived `activity`, and its life-long `notificationsDegraded`
  * marker — #26) so a client can enumerate the sessions it is carrying, pick one to view
- * / steer, and see which ones run non-prompting (their needs-you notifications are
- * degraded). Per-session STATUS-tracking hardening beyond this surface is a sibling item
+ * / steer, and see which ones run non-prompting (they auto-approve some class of permission
+ * decision rather than prompting on it; advisory only — #265).
+ * Per-session STATUS-tracking hardening beyond this surface is a sibling item
  * (#21); this handler only projects the state the session model already holds.
  *
  * Browser-facing auth is deferred (see `event-stream.ts`) — the loopback ingress is
@@ -106,9 +107,18 @@ export interface SessionSummaryWire {
   readonly activity: SessionActivity;
   /**
    * The session's life-long notifications-degraded marker ({@link Session.notificationsDegraded},
-   * #26): `true` for a non-prompting session (it never emits `requires_action`, so its
-   * needs-you notifications are degraded), `false` otherwise. A persistent badge the attach
-   * flow surfaces — the mode cannot change mid-run, so it never clears.
+   * #26): `true` for a non-prompting session (it auto-approves some class of permission decision
+   * rather than prompting the operator on it), `false` otherwise. A persistent badge the attach
+   * flow surfaces — ccctl derives it once and never re-reads the mode, so it never clears (it can
+   * therefore go stale if the operator changes mode mid-run, which ccctl does not track — #272).
+   *
+   * ADVISORY, and narrower than its name (#265). A marked session still emits `requires_action`
+   * and still raises needs-you when the agent asks a question — `AskUserQuestion` blocks natively
+   * even in bypass (ADR-005 / #263). It carries FEWER triggers, not none. Nor does `true` mean the
+   * session never prompts: that holds for `bypassPermissions`, but `acceptEdits` auto-accepts only
+   * file edits and still prompts for other tools — and this one boolean cannot tell them apart.
+   * Clients render it as a standing property of how the session was launched; they must NOT read
+   * it as "this session cannot notify you" nor use it to suppress a needs-you.
    */
   readonly notificationsDegraded: boolean;
   /**

@@ -358,19 +358,37 @@ function handleEvent(data) {
 }
 
 /**
- * A standing "notifications degraded" badge for a non-prompting session (#26/#27). It is a
+ * A standing "auto-approves permissions" badge for a non-prompting session (#26/#27). It is a
  * SIBLING of the row button, never a child of it: a poll relabels a row via
  * `button.textContent = label`, which would wipe a badge nested inside the button — as a
  * sibling it survives every relabel. It carries an id so the button can point at it as its
  * accessible description ({@link createSessionRow}).
+ *
+ * The copy states what the mode actually does, not what it was once assumed to prevent (#265).
+ * It previously read "notifications degraded" / "it won't raise needs-you notifications" — which
+ * ADR-005 (#263) falsified: `AskUserQuestion` blocks natively even under `bypassPermissions`, so a
+ * marked session DOES still raise needs-you. Telling the operator otherwise is the worst reading of
+ * this badge — it invites them to distrust a channel that works, or to over-monitor a session the
+ * phone would have caught. What stays true, and is worth a standing amber flag, is the permissive
+ * mode itself: this session approves permission decisions the operator would otherwise be asked.
+ *
+ * The title names BOTH modes rather than making one claim about them, because the wire carries a
+ * single boolean — the browser cannot tell which mode a marked session runs, and the two are NOT
+ * equivalent: `bypassPermissions` approves every tool call, while `acceptEdits` auto-accepts file
+ * edits and still prompts for tools it has no mode-specific handling for. A blanket "it will never
+ * prompt you" would be a fresh falsehood for `acceptEdits` — the very kind #265 exists to remove.
+ *
+ * The `data-badge` value and the element id are internal hooks (the CSS selector in `index.html`,
+ * and `aria-describedby`) — no operator reads them, so they stay put; only the strings a human
+ * actually reads are restated.
  */
 function createDegradedBadge(sessionId) {
   const badge = document.createElement("span");
   badge.id = `degraded-${sessionId}`;
   badge.dataset.badge = "notifications-degraded";
-  badge.textContent = "notifications degraded";
+  badge.textContent = "auto-approves permissions";
   badge.title =
-    "This session runs in a non-prompting mode (acceptEdits / bypassPermissions); it won't raise needs-you notifications.";
+    "This session runs in a non-prompting mode: bypassPermissions approves every tool call without asking; acceptEdits auto-accepts file edits and still prompts for other tools. It can still raise a needs-you notification when the agent asks you a question.";
   return badge;
 }
 
@@ -417,7 +435,7 @@ function renderNeedsYouBadges() {
 
 /**
  * Build one picker row: a full-width button whose click views + steers that session, plus —
- * for a session carrying the degraded-notification marker (#26) — a standing badge (#27).
+ * for a session carrying the non-prompting marker (#26) — a standing badge (#27).
  *
  * The badge must sit OUTSIDE the button to survive a poll's relabel (see
  * {@link createDegradedBadge}), which also keeps it out of the button's accessible NAME — so a
