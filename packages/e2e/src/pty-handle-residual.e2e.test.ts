@@ -39,16 +39,14 @@ import {
 //
 // Fenced / opt-in on its OWN arm: CCCTL_E2E + CCCTL_E2E_PTY (`resolvePtyE2EEnv`). The prerequisite is
 // neither a tailnet (#65/#66/#67) nor an API key (#133) but a real, SPAWN-CAPABLE node-pty, which
-// this repo's default install does not have on EITHER platform — for two DIFFERENT reasons: on Linux
-// node-pty ships no prebuild and `allowBuilds: node-pty: false` blocks the node-gyp rebuild that
-// would supply one (so the binding cannot load on CI's ubuntu-latest at all); on darwin the binding
-// loads from the shipped prebuild, but that prebuild's `spawn-helper` is mode 644 and NO node-pty
-// script chmods it, so every spawn fails with `posix_spawnp failed` — and flipping `allowBuilds`
-// does NOT fix that one (`chmod +x` does; see the package README's arming runbook). Absent →
-// `describe.skipIf` SKIPS the whole file, so it lives OUTSIDE the credential-free CI `e2e` lane and
-// never runs, nor fails, there. The fence + classifier LOGIC — the Tier-A encoding of #68's two ACs,
-// plus the OS probe's own semantics — is proven credential-free in the `test` lane by
-// `pty-handle-residual.test.ts`, so what is fenced here is the BINDING, not the judgment.
+// this repo's default install does not have on EITHER platform — for two DIFFERENT per-platform
+// reasons, and with a different lever each. That account is `pty-handle-residual.ts`'s module doc
+// (the canonical one; not restated here — #235), and `pnpm --filter @ccctl/e2e arm:pty` probes this
+// box and prints the lever it needs. Absent → `describe.skipIf` SKIPS the whole file, so it lives
+// OUTSIDE the credential-free CI `e2e` lane and never runs, nor fails, there. The fence + classifier
+// LOGIC — the Tier-A encoding of #68's two ACs, plus the OS probe's own semantics — is proven
+// credential-free in the `test` lane by `pty-handle-residual.test.ts`, so what is fenced here is the
+// BINDING, not the judgment.
 //
 // Self-classifying + skips-never-fakes: a driven run yields `verified` (pass), `drift` (FAIL, naming
 // the violated checks) or `inconclusive` (a leg was never captured — the binding could not load or

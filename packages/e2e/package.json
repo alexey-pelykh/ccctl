@@ -15,12 +15,14 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "test:e2e": "vitest run --config vitest.e2e.config.ts --passWithNoTests",
+    "arm:pty": "tsx src/arm-pty.ts",
     "lint": "eslint src/",
     "dev": "tsc --watch"
   },
   "devDependencies": {
     "@types/node": "^25",
     "eslint": "^10.4.1",
+    "tsx": "^4.22.4",
     "typescript": "~6.0.3",
     "vitest": "^4.1.9"
   },
@@ -29,6 +31,7 @@
     "@ccctl/core": "workspace:*",
     "@ccctl/server": "workspace:*",
     "@ccctl/tunnel-adapters": "workspace:*",
-    "@ccctl/web-ui": "workspace:*"
+    "@ccctl/web-ui": "workspace:*",
+    "node-pty": "^1.1.0"
   }
 }

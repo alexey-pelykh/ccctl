@@ -442,49 +442,22 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   have, and make the absence of one look like a tunnel failure.
 
     **A default checkout cannot spawn a pty, on any platform** — and the reason differs per platform,
-    which is what makes the arming step non-obvious enough to be worth spelling out. node-pty resolves
-    its binding in the order `build/Release` → `build/Debug` → `prebuilds/<platform>-<arch>`
-    (`lib/utils.js` § `loadNativeModule`), and its `install` script is
-    `node scripts/prebuild.js || node-gyp rebuild`, where `prebuild.js` **probes** for the prebuild
-    directory: present → `exit 0`, absent → `exit 1` (and, only under
-    `npm_config_build_from_source=true`, deletes `prebuilds/` and exits 1). It never chmods. So:
-
-    - **Linux** — node-pty ships **no Linux prebuild**, so `prebuild.js` exits 1 and `node-gyp rebuild`
-      is what would produce `build/Release`. `pnpm-workspace.yaml` sets `allowBuilds: node-pty: false`,
-      which blocks that script, so the binding cannot even **load** on CI's `ubuntu-latest` runners.
-      This is the arm `allowBuilds` governs.
-    - **darwin** — a prebuild **is** shipped, so `prebuild.js` exits 0 and `node-gyp rebuild`
-      **never runs** (the `||` short-circuits); the binding loads happily from `prebuilds/`. But the
-      shipped `prebuilds/darwin-*/spawn-helper` is mode **`644` — not executable** — and **no node-pty
-      script ever chmods it** (`prebuild.js` only probes; `post-install.js` touches `build/Release` and
-      win32's `conpty.dll` only; there is no `chmod` anywhere in the package). So every spawn fails
-      with `posix_spawnp failed`. **Flipping `allowBuilds` does not fix this** — it is neither
-      necessary nor sufficient on darwin, because the script it unblocks would not have chmodded
-      anything and exits before `node-gyp` regardless.
+    with a different lever each, which is what makes the arming step non-obvious. That causal account
+    has exactly **one** home: `src/pty-handle-residual.ts`'s module doc, § _"Fenced / opt-in, on its
+    OWN arm"_. It is deliberately **not** restated here — the duplication was the defect generator
+    (#235), and `src/pty-chain-census.ts` now fails the `test` lane if any file other than the
+    canonical one restates it.
 
     So the oracle **cannot** run on a default checkout, CI included — which is exactly why it must never
-    sit in the credential-free lane. To arm it, apply the lever your platform actually needs:
+    sit in the credential-free lane. To arm it, **don't hand-apply a lever from memory** — run the
+    preflight. It probes this box (resolving the real binding, reading the real mode bit) and prints
+    the lever your platform actually needs, exiting non-zero until it is armed:
 
     ```sh
-    # darwin: make the shipped prebuilt spawn-helper executable (it ships 644; nothing chmods it).
-    chmod +x node_modules/.pnpm/node-pty@*/node_modules/node-pty/prebuilds/darwin-$(uname -m | sed 's/^x86_64$/x64/')/spawn-helper
-
-    # linux: flip `allowBuilds.node-pty` to true in pnpm-workspace.yaml, then reinstall — with no
-    # prebuild to find, prebuild.js exits 1, `|| node-gyp rebuild` runs, and build/Release/pty.node
-    # is what loadNativeModule then prefers. No spawn-helper is BUILT or EXEC'd on Linux: binding.gyp
-    # gates that target on OS=="mac", and while pty.cc reads helper_path unconditionally (:352) —
-    # unixTerminal.js passes it on every unix — it is USED only under `#if defined(__APPLE__)` (:356),
-    # so on Linux the string is simply discarded and forkpty(3) (:399) runs instead. Darwin's mode-644
-    # trap therefore has no Linux counterpart. UNVERIFIED end-to-end: no Linux box was available, so
-    # the chain is read off binding.gyp, pty.cc, scripts/prebuild.js, package.json and lib/utils.js
-    # rather than run. (binding.gyp also links -lutil, which can bite on musl/Alpine.)
-    pnpm install
+    pnpm --filter @ccctl/e2e arm:pty
 
     CCCTL_E2E=1 CCCTL_E2E_PTY=1 pnpm --filter @ccctl/e2e test:e2e
     ```
-
-    Note that `pnpm install` **re-extracts the 644 helper**, so on darwin the `chmod` must be re-applied
-    after any reinstall.
 
     When the arm is set but the binding still cannot spawn, the drive self-classifies `inconclusive` —
     naming the typed failure the daemon itself reported (`backend-unavailable` / `spawn-failed`) — and
