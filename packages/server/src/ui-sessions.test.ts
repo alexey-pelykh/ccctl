@@ -176,8 +176,9 @@ describe("GET /api/sessions — session list (#20)", () => {
 
   it("attaches (lists) a non-prompting session and carries the persistent degraded-notification marker (#26)", async () => {
     const server = await startTestServer();
-    // A non-prompting session never emits `requires_action`, so its needs-you notifications
-    // are degraded — but it attaches anyway (it is not refused) and carries the marker.
+    // A non-prompting session auto-approves some class of permission decision rather than
+    // prompting on it — so it carries the marker, and it attaches anyway (it is not refused).
+    // The marker is ADVISORY: it does not mean the session cannot emit `requires_action` (#265).
     for (const mode of ["acceptEdits", "bypassPermissions"] as const) {
       const id = await createSession(server, mode);
       const summary = (await listSessions(server)).find((s) => s.id === id);

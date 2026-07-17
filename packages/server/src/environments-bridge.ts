@@ -229,9 +229,13 @@ export function handleSessionCreate(req: IncomingMessage, res: ServerResponse, s
     // `registering` session — reuse that id (the list row advances in place) and disarm its
     // eviction timer. If not, this is an attached session (UC1): mint a fresh id, as ever.
     const sessionId = claimPendingLaunch(state, body.context.cwd, body.permissionMode) ?? randomUUID();
-    // The session is marked notifications-degraded at birth from its OBSERVED
-    // permission mode (a non-prompting mode never emits `requires_action`); the
-    // marker is life-long since a running session's mode cannot change.
+    // The session is marked at birth from its OBSERVED permission mode (a non-prompting mode
+    // auto-approves some class of permission decision rather than prompting on it); the marker
+    // is life-long because ccctl derives it once here and never re-reads the mode — not because
+    // the mode is immutable (the worker exposes a mid-run `set_permission_mode`, which ccctl does
+    // not track, so the marker can go stale — #272). ADVISORY only — it does NOT mean the session
+    // cannot emit `requires_action`, and nothing gates a notification on it (#265;
+    // `@ccctl/core` § `Session.notificationsDegraded`).
     state.sessions.set(sessionId, createSession(sessionId, body.permissionMode));
     // Registration §2 (#61): a `connecting` session is born on the bridge. The account Bearer that
     // authorized this leg is never a field here (loggable shape omits it by construction).

@@ -559,10 +559,12 @@ describe("createSession notifications-degraded marker (AC: set at attach from th
     }
   });
 
-  it("keeps the marker life-long: no transition clears a degraded session's marker", () => {
+  it("keeps the marker life-long: no ccctl transition clears a degraded session's marker", () => {
     // A non-prompting session marked at birth stays degraded through EVERY transition —
-    // activity, heartbeat, ready, close — since a running session's mode cannot change and
-    // each transition spreads the session forward unchanged on this axis.
+    // activity, heartbeat, ready, close — because ccctl derives the marker once and each
+    // transition spreads the session forward unchanged on this axis (NOT because the mode is
+    // immutable — the worker can change it mid-run, which ccctl does not track; #272). This
+    // pins ccctl's own no-clear invariant, which is what the marker's life-long-ness rests on.
     const born = createSession("sess-np", "bypassPermissions", T0);
     expect(born.notificationsDegraded).toBe(true);
     const running = applyWorkerStatusFrame(born, statusFrame({ status: "running" }), T0 + 1);
@@ -580,5 +582,82 @@ describe("createSession notifications-degraded marker (AC: set at attach from th
     const ready = markSessionReady(acted);
     expect(born.notificationsDegraded).toBe(false);
     expect(ready.notificationsDegraded).toBe(false);
+  });
+});
+
+describe("notificationsDegraded reconciliation (#265: a marked session is NOT silenced)", () => {
+  // #26 derived the marker from an inference that ADR-005 (#263) falsified by observation:
+  // "a non-prompting mode never emits requires_action". `AskUserQuestion` is an INTERACTION
+  // tool, not a permission decision, so `bypassPermissions` — which suppresses permission
+  // *prompts* — does not touch it; it blocks natively and the worker reports that block as
+  // `requires_action` like any other. These tests pin the reconciled semantics so the dead
+  // inference cannot be re-introduced as a suppression gate: that would silence every bypass
+  // session's needs-you (defeating #78) while leaving the whole suite green.
+
+  // Rule: a marked session reaches requires_action and fires needs-you.
+  it("a bypass session CAN reach requires_action — the block AskUserQuestion raises natively", () => {
+    const session = applyWorkerStatusFrame(
+      createSession("sess-bypass", "bypassPermissions", T0),
+      statusFrame({ status: "requires_action", detail: "Which approach should I take?" }),
+      T0 + 10,
+    );
+    expect(session.notificationsDegraded).toBe(true); // marked at birth …
+    expect(isInputAwaited(session.activity)).toBe(true); // … and STILL input-awaited.
+  });
+
+  it("holds the needs-you TRIGGER for EVERY pinned mode, exactly as for a prompting one", () => {
+    for (const mode of PERMISSION_MODES) {
+      const session = applyWorkerStatusFrame(
+        createSession("sess-x", mode, T0),
+        statusFrame({ status: "requires_action", detail: "Pick one" }),
+        T0 + 10,
+      );
+      expect(isInputAwaited(session.activity)).toBe(true);
+    }
+  });
+
+  // Rule: the trigger is mode-agnostic — the marker is never a suppression input (AC4).
+  it("isInputAwaited reads activity ALONE — a marked and an unmarked session are indistinguishable to it", () => {
+    // Documents the invariant; it does not police it. `isInputAwaited` takes a SessionActivity,
+    // not a Session, so it CANNOT reach the marker — the type signature already guarantees this,
+    // and this test cannot fail while that holds. The guard that actually bites lives at the
+    // emitter (`@ccctl/server` § worker-channel.test.ts "#265"), which is mutation-proven: adding
+    // `if (next.notificationsDegraded) return;` to reconcileNeedsInput kills it and nothing else.
+    const marked = applyWorkerStatusFrame(
+      createSession("sess-np", "bypassPermissions", T0),
+      statusFrame({ status: "requires_action", detail: "Same detail" }),
+      T0 + 10,
+    );
+    const unmarked = applyWorkerStatusFrame(
+      createSession("sess-p", "default", T0),
+      statusFrame({ status: "requires_action", detail: "Same detail" }),
+      T0 + 10,
+    );
+    expect(marked.notificationsDegraded).not.toBe(unmarked.notificationsDegraded); // they DIFFER on the marker …
+    expect(marked.activity).toEqual(unmarked.activity); // … and are IDENTICAL on the trigger's only input.
+    expect(isInputAwaited(marked.activity)).toBe(isInputAwaited(unmarked.activity));
+  });
+
+  // Rule: the marker and the signal are orthogonal — neither moves the other.
+  it("the marker does not move when the session enters or leaves requires_action", () => {
+    // Birth-fact vs live-state: reaching (and clearing) the blocking signal leaves the marker put,
+    // so a bypass session that just asked a question is not thereby "un-degraded".
+    let session = createSession("sess-np", "acceptEdits", T0);
+    expect(session.notificationsDegraded).toBe(true);
+    session = applyWorkerStatusFrame(session, statusFrame({ status: "requires_action", detail: "?" }), T0 + 10);
+    expect(session.notificationsDegraded).toBe(true);
+    session = applyWorkerStatusFrame(session, statusFrame({ status: "idle" }), T0 + 20);
+    expect(session.notificationsDegraded).toBe(true);
+  });
+
+  it("is independent of the #78 hook — a hook event moves neither the marker nor the signal", () => {
+    // ADR-005 § Decision 1: the hook is ENRICH-ONLY; it neither creates nor removes a block. So it
+    // cannot be an input to this marker — mirroring #40's structural no-op on non-`worker_status`.
+    const born = createSession("sess-np", "bypassPermissions", T0);
+    const hook: ControlFrame = { type: "control_event", subtype: "message", payload: { text: "AskUserQuestion" } };
+    const afterHook = applyWorkerStatusFrame(born, hook, T0 + 10);
+    expect(afterHook).toBe(born); // structural no-op: same object.
+    expect(afterHook.notificationsDegraded).toBe(true); // the hook did not clear the marker …
+    expect(isInputAwaited(afterHook.activity)).toBe(false); // … nor raise the signal.
   });
 });

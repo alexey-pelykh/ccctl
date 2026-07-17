@@ -85,10 +85,11 @@ credential; the §4/§5 channel is authorized by the locally-minted
 
 The browser-facing transport is a **per-session** namespace (#20), so the daemon
 carries more than one session at once without cross-wiring. `GET /api/sessions` lists
-the carried sessions (id + status + activity, plus a persistent
-notifications-degraded marker for a session created under a non-prompting
-permission mode, #26). Downstream, every payload a session's
-worker POSTs up `worker/events` (§5) fans out to the clients subscribed to THAT
+the carried sessions (id + status + activity, plus a persistent marker for a session
+created under a non-prompting permission mode — it auto-approves permission decisions,
+#26; advisory only, and never a notification-suppression input, #265).
+Downstream, every payload a session's worker POSTs up `worker/events` (§5) fans
+out to the clients subscribed to THAT
 session's **Server-Sent Events** stream at `GET /api/sessions/{id}/events` — and only
 them — each event carrying a per-session `Last-Event-ID`-compatible id so a
 reconnecting client reconciles the gap it missed. The server also RAISES two of its own

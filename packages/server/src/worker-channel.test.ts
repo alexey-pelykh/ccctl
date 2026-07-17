@@ -14,6 +14,7 @@ import {
   workerHeartbeatPath,
   workerRegisterPath,
   type LogEvent,
+  type PermissionMode,
 } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
 import {
@@ -52,24 +53,30 @@ function base(server: CcctlServer): string {
 }
 
 /** Create a session over the §2 flow and return its id (no ws_url; §2→§3 auto-enqueue is orthogonal here). */
-async function registerSession(server: CcctlServer): Promise<string> {
+async function registerSession(server: CcctlServer, permissionMode: PermissionMode = "default"): Promise<string> {
   const res = await fetch(`${base(server)}${SESSIONS_PATH}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${ACCOUNT_BEARER}` },
     body: JSON.stringify({
       session_context: { model: "claude-opus-4-8", cwd: "/home/dev/proj" },
       source: "ui",
-      permission_mode: "default",
+      permission_mode: permissionMode,
     }),
   });
   return ((await res.json()) as { session_id: string }).session_id;
 }
 
-/** GET the browser-facing session list — the surface that projects each session's transport `status` (#172). */
-async function listSessions(server: CcctlServer): Promise<{ id: string; status: string }[]> {
+/**
+ * GET the browser-facing session list — the surface that projects each session's transport `status`
+ * (#172) and its life-long non-prompting marker (#26).
+ */
+async function listSessions(
+  server: CcctlServer,
+): Promise<{ id: string; status: string; notificationsDegraded: boolean }[]> {
   const res = await fetch(`${base(server)}/api/sessions`);
   expect(res.status).toBe(200);
-  return ((await res.json()) as { sessions: { id: string; status: string }[] }).sessions;
+  return ((await res.json()) as { sessions: { id: string; status: string; notificationsDegraded: boolean }[] })
+    .sessions;
 }
 
 /** §4 — POST worker/register `{}` and return the minted worker_epoch. */
@@ -1576,6 +1583,32 @@ describe("§4/§5 blocking needs-input notification — names the session on a t
     // so it defaults to the human-ready fallback rather than an empty label.
     expect(events[0].session_id).toBe(sessionId);
     expect(events[0].detail).toBe(DEFAULT_REQUIRES_ACTION_DETAIL);
+  });
+
+  it("raises it for a NON-PROMPTING session too — the marker is advisory, never a suppression gate (#265)", async () => {
+    // AC4, asserted rather than assumed. `reconcileNeedsInput` composes isInputAwaited + transition +
+    // liveness and never reads `notificationsDegraded` — so a bypass session notifies exactly like a
+    // prompting one. That is the whole point of #78: `AskUserQuestion` blocks natively even under
+    // bypass (ADR-005 / #263), and the operator's phone must raise it. A suppression gate here would
+    // silence every bypass session while leaving the rest of this suite green, so the negative is
+    // pinned at the emitter, not just at the core trigger (`@ccctl/core` § session-model.test.ts #265).
+    const server = await startTestServer();
+    const sessionId = await registerSession(server, "bypassPermissions");
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // The session IS marked — the precondition that would feed a suppression gate, were one added.
+    const [listed] = await listSessions(server);
+    expect(listed.notificationsDegraded).toBe(true);
+
+    expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
+
+    await waitFor(() => needsInputEvents(ui).length >= 1);
+    const events = needsInputEvents(ui);
+    expect(events).toHaveLength(1);
+    expect(events[0].session_id).toBe(sessionId);
+    // …and it is the same BLOCKING class a prompting session raises — not a downgraded variant.
+    expect(events[0].notification_class).toBe(NOTIFICATION_CLASS_BLOCKING);
   });
 
   it("marks the needs-input notification BLOCKING — high-urgency, re-nudgeable, never batched (#44 AC1)", async () => {
