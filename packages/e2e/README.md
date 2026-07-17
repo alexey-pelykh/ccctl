@@ -303,15 +303,18 @@ subscription. Depends on [`@ccctl/cli`](../cli), [`@ccctl/core`](../core),
   move the tally not at all.
   **The consequence is a scope boundary worth reading before trusting this oracle**: every one of the
   daemon's per-session timers — pending-launch eviction (#33), worker liveness (#166), session eviction
-  (#173), idle (#41), close-timeout — calls `.unref()` on the line after it is armed, so **a leaked one
-  is invisible here**. Measured, not reasoned: 22 full lifecycles driven to downstream-open depth put no
+  (#173), idle (#41), close-timeout, pty kill escalation (#76) — calls `.unref()` on the very next
+  statement after it is armed, so **a leaked one is invisible here**. Measured, not reasoned: 22 full lifecycles driven to downstream-open depth put no
   `Timeout` in the tally at all; a real run's settled reading is
   `{ PipeWrap: 4, TCPServerWrap: 1, TCPSocketWrap: 3 }`. So what this soak watches is the **ref'd
   remainder — the sockets and pipes** (a
   stranded downstream or event-relay socket climbs here), plus, via the `maxSessions: 1` skeleton, the
   registry row itself. Stated plainly: **#68 owns the per-fd question** (`fstat`, per-fd), **this owns
-  the ref'd-libuv tally**, and **nothing yet owns the daemon's unref'd timers** (tracked as **#238**) —
-  closing that needs #63's sampler to widen, not this spec to route around it.
+  the ref'd-libuv tally**, and **#238's timer census owns the daemon's unref'd timers** — closed where it
+  belonged, by widening #63's own diagnostics (`installTimerCensus`, an `async_hooks` census reported
+  alongside the ref'd tally) rather than by this spec routing around it. This soak still reads only
+  `captureHandleReport`, so every boundary above is unchanged; wiring the census in here would widen what
+  the soak asks, which is #69's own call.
   **Two detectors, both AC2's own words.** _The count returns to baseline_ — checked on the **total**
   and **per type**, because a total alone is **maskable** (a leaked resource while a pooled socket
   happens to close nets to zero and reads clean); per-type is #63's own stated design intent. And _no

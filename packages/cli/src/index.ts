@@ -335,10 +335,12 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       // tears it down.
       deps.installHeapSnapshotHandler({ logger });
       // Arm the on-demand inspector-attach + FD/handle-count diagnostics trigger (#63): SIGUSR1 samples
-      // the daemon's active FD/handle counts onto the trail AND attaches the loopback-bound Node
-      // inspector for deeper diagnosis — reachable only by a same-uid local process (OS-enforced local
-      // auth, the same choice as the heap snapshot). Same one shared #61 sink; disposer not held (the
-      // handler lives for the daemon's lifetime and process exit tears it down).
+      // the daemon's active FD/handle counts onto the trail, reads the unref'd-TIMER census the ref'd
+      // tally cannot see (#238 — armed lazily on the first poke, so an undiagnosed daemon pays no
+      // async_hooks cost), AND attaches the loopback-bound Node inspector for deeper diagnosis —
+      // reachable only by a same-uid local process (OS-enforced local auth, the same choice as the heap
+      // snapshot). Same one shared #61 sink; disposer not held (the handler lives for the daemon's
+      // lifetime and process exit tears it down, which disposes the census with it).
       deps.installInspectorDiagnosticsHandler({ logger });
       // Arm the local-shutdown floor (#82): SIGTERM/SIGINT gracefully closes the daemon — releasing
       // every session this server owns — and exits, an OS-signal control unreachable over the tunnel
@@ -352,12 +354,19 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       console.log(`ccctl: serving on ${serverUrl(server.address.host, server.address.port)}`);
       // One-time operator hints (plain text, printed before the JSON trail flows — like the line above):
       // how to take a heap snapshot and where it lands (the file is written owner-only 0600 because it
-      // holds process memory), and how to attach the inspector / dump FD-handle counts for a leak hunt.
+      // holds process memory), and how to attach the inspector / dump FD-handle counts / read the timer
+      // census for a leak hunt. The census's "poke twice" is the one instruction an operator CANNOT infer
+      // and would otherwise misread: the first poke ARMS it (async_hooks reports nothing it was not yet
+      // listening for), so that poke's census reads ~0 on a daemon full of timers. Naming the action —
+      // poke again — rather than the mechanism keeps the hint actionable.
       console.log(
         `ccctl: heap snapshot on ${HEAP_SNAPSHOT_SIGNAL} (\`kill -s ${HEAP_SNAPSHOT_SIGNAL} ${process.pid}\`) → ${resolveHeapSnapshotDir()}`,
       );
       console.log(
-        `ccctl: inspector attach + FD/handle report on ${INSPECTOR_DIAGNOSTICS_SIGNAL} (\`kill -s ${INSPECTOR_DIAGNOSTICS_SIGNAL} ${process.pid}\`) → loopback inspector URL + counts on the trail`,
+        `ccctl: inspector attach + FD/handle report + timer census on ${INSPECTOR_DIAGNOSTICS_SIGNAL} (\`kill -s ${INSPECTOR_DIAGNOSTICS_SIGNAL} ${process.pid}\`) → loopback inspector URL + counts on the trail`,
+      );
+      console.log(
+        `ccctl: the first ${INSPECTOR_DIAGNOSTICS_SIGNAL} arms the timer census — poke again later to read an accumulation`,
       );
       // The local-control floor (#82): how to stop the daemon from the box — a graceful shutdown on
       // Ctrl-C or SIGTERM that needs no device token and is unreachable over the tunnel. Paired with

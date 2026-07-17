@@ -158,13 +158,18 @@ export {
 // Inspector attach + FD/handle-count diagnostics (#63): the second on-demand diagnostic slice, triggered
 // by SIGUSR1 (local auth = OS process ownership, the same choice #62 made — an HTTP endpoint would
 // front-run the deferred request-credential boundary). One poke samples the daemon's active libuv
-// FD/handle counts onto the #61 trail AND attaches the loopback-bound Node inspector for deeper
-// diagnosis. The CLI arms the signal handler at the daemon composition root; the seams are injectable
-// for deterministic tests (no real inspector port opened, no real signal delivered).
+// FD/handle counts onto the #61 trail, reads the unref'd-TIMER census the ref'd tally structurally
+// cannot see (#238 — armed lazily on that first poke, reported alongside rather than merged in), AND
+// attaches the loopback-bound Node inspector for deeper diagnosis. The CLI arms the signal handler at
+// the daemon composition root; the seams are injectable for deterministic tests (no real inspector port
+// opened, no real signal delivered).
 export {
   captureHandleReport,
+  captureTimerCensus,
   formatHandleReport,
+  formatTimerCensusReport,
   installInspectorDiagnosticsSignalHandler,
+  installTimerCensus,
   openInspector,
   INSPECTOR_DIAGNOSTICS_HOST,
   INSPECTOR_DIAGNOSTICS_SIGNAL,
@@ -176,6 +181,10 @@ export {
   type InspectorDeps,
   type InspectorDiagnosticsSignalDeps,
   type InspectorOutcome,
+  type TimerCensus,
+  type TimerCensusDeps,
+  type TimerCensusOutcome,
+  type TimerCensusReport,
 } from "./inspector-diagnostics.js";
 
 // Local daemon shutdown on a termination signal (#82) — the "stop the server from the local machine"

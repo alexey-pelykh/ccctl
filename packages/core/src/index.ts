@@ -1752,7 +1752,7 @@ export interface ErrorLogEvent {
  * A DIAGNOSTIC event (#62, #63): an operator-triggered runtime diagnostic action the daemon
  * performed on demand — taken live (no restart) when the daemon is signalled, for chasing a long-run
  * leak. Unlike the five AUTOMATIC surfaces above, a diagnostic event fires ONLY when an operator
- * explicitly asks. Three families ride this category:
+ * explicitly asks. Four families ride this category:
  *
  * - **Heap snapshot (#62), on `SIGUSR2`** — `heap-snapshot` on a written snapshot (`detail` = its
  *   PATH), `heap-snapshot-failed` on a failed attempt (`detail` = the one-line reason).
@@ -1762,6 +1762,12 @@ export interface ErrorLogEvent {
  * - **FD/handle-count report (#63), on `SIGUSR1`** — `handle-report` naming the current active
  *   libuv resource (file-descriptor / handle) counts for leak-vector visibility (`detail` = a compact
  *   `total — type=count, …` tally), `handle-report-failed` on a failed sample (`detail` = the reason).
+ * - **Timer census (#238), on `SIGUSR1`** — `timer-census` naming the daemon's LIVE timer counts split
+ *   by ref-state (`detail` = a compact `total — unref'd=n, ref'd=n` tally), `timer-census-failed` on a
+ *   failed arm or sample (`detail` = the reason). It rides ALONGSIDE `handle-report` rather than inside
+ *   it: the ref'd tally reports only what keeps the event loop alive, so the daemon's `.unref()`'d
+ *   per-session timers are invisible there and a leaked one would fail no oracle. Counts only — a timer
+ *   census can carry no credential by construction.
  *
  * `sessionId` is always `null` — a diagnostic is daemon-wide, concerning no one session. `detail`
  * never carries a credential: a path, a loopback inspector URL, or a resource-count tally — never an
@@ -1776,7 +1782,8 @@ export interface DiagnosticLogEvent {
   /**
    * `heap-snapshot` / `heap-snapshot-failed` (a live heap snapshot, #62); `inspector-open` /
    * `inspector-open-failed` (the Node inspector attach, #63); `handle-report` / `handle-report-failed`
-   * (the FD/handle-count report, #63).
+   * (the FD/handle-count report, #63); `timer-census` / `timer-census-failed` (the live unref'd-timer
+   * census the ref'd tally cannot see, #238).
    */
   readonly event:
     | "heap-snapshot"
@@ -1784,7 +1791,9 @@ export interface DiagnosticLogEvent {
     | "inspector-open"
     | "inspector-open-failed"
     | "handle-report"
-    | "handle-report-failed";
+    | "handle-report-failed"
+    | "timer-census"
+    | "timer-census-failed";
   readonly sessionId: null;
   readonly detail: string;
 }

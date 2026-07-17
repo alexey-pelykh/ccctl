@@ -85,12 +85,13 @@ export interface CliDependencies {
   /**
    * Arm the daemon's on-demand inspector-attach + FD/handle-count diagnostics trigger (#63) — install
    * the {@link https://ccctl | INSPECTOR_DIAGNOSTICS_SIGNAL} (`SIGUSR1`) handler that, on each poke,
-   * samples the daemon's active FD/handle counts onto the trail AND attaches the loopback-bound Node
-   * inspector for deeper diagnosis, and return a disposer. {@link installInspectorDiagnosticsSignalHandler}
-   * in production; behind a seam so `serve` is exercised WITHOUT registering a real process-global
-   * signal handler or opening a real inspector port (which would leak across the test process), the
-   * same determinism discipline as the seams above. The daemon's structured-log sink is passed through
-   * so a report (or a failure) rides the daemon's #61 trail.
+   * samples the daemon's active FD/handle counts onto the trail, reads the unref'd-timer census that
+   * tally cannot see (#238), AND attaches the loopback-bound Node inspector for deeper diagnosis, and
+   * return a disposer. {@link installInspectorDiagnosticsSignalHandler} in production; behind a seam so
+   * `serve` is exercised WITHOUT registering a real process-global signal handler, opening a real
+   * inspector port, or enabling a real `async_hooks` census (each of which would leak across the test
+   * process), the same determinism discipline as the seams above. The daemon's structured-log sink is
+   * passed through so a report (or a failure) rides the daemon's #61 trail.
    */
   readonly installInspectorDiagnosticsHandler: (options: { readonly logger: Logger }) => () => void;
   /**
