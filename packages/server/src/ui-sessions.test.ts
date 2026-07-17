@@ -53,6 +53,8 @@ interface SessionSummary {
   readonly activity: SessionActivity;
   readonly notificationsDegraded: boolean;
   readonly cursor: number;
+  /** The #264 `AskUserQuestion` decoration — present only while the session is actually blocking. */
+  readonly enrichment?: { readonly sequenceNum: number; readonly questions: readonly unknown[] };
 }
 
 /** Register `sessionId`'s §4 worker and return its epoch, so its §5 upstream `worker/events` is drivable. */
@@ -74,6 +76,28 @@ async function emitEvents(server: CcctlServer, sessionId: string, epoch: number,
     body: JSON.stringify({ worker_epoch: epoch, events }),
   });
   expect(res.status).toBe(200);
+}
+
+/** Drive the §5 upstream leg with EXPLICIT payloads (a status frame, an `input_request`, …). */
+async function emitPayloads(server: CcctlServer, sessionId: string, epoch: number, payloads: unknown[]): Promise<void> {
+  const res = await fetch(`${base(server)}${workerEventsPath(sessionId)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ worker_epoch: epoch, events: payloads.map((payload) => ({ payload })) }),
+  });
+  expect(res.status).toBe(200);
+}
+
+/** A §5 `input_request` payload (#261) carrying one well-formed question at `sequenceNum`. */
+function inputRequest(sequenceNum: number): unknown {
+  return {
+    type: "control_event",
+    subtype: "input_request",
+    payload: {
+      sequence_num: sequenceNum,
+      questions: [{ question: "Approve?", options: [{ label: "Yes" }, { label: "No" }], multiSelect: false }],
+    },
+  };
 }
 
 async function listSessions(server: CcctlServer): Promise<SessionSummary[]> {
@@ -216,6 +240,34 @@ describe("GET /api/sessions — session list (#20)", () => {
     const summary = (await listSessions(server)).find((s) => s.id === id);
     expect(summary?.notificationsDegraded).toBe(true);
     expect(summary?.activity).toEqual({ kind: "running" });
+  });
+
+  it("serves a blocked session's AskUserQuestion enrichment — and omits it for one that is not blocking (#264)", async () => {
+    const server = await startTestServer();
+    const blocked = await createSession(server);
+    const decorated = await createSession(server);
+    const blockedEpoch = await registerWorker(server, blocked);
+    const decoratedEpoch = await registerWorker(server, decorated);
+
+    // `blocked` enters requires_action AND is decorated — the read serves the decoration for #87 to render
+    // and #86 to validate an answer against.
+    await emitPayloads(server, blocked, blockedEpoch, [
+      { type: "control_event", subtype: "worker_status", payload: { status: "requires_action", sequence_num: 2 } },
+      inputRequest(2),
+    ]);
+    // `decorated` got the SAME enrichment frame but never entered requires_action — there is no live block
+    // to decorate, so the read must not surface it. A decoration is never evidence of needs-you; that is
+    // `activity`, and only a `worker_status` moves it (#40).
+    await emitPayloads(server, decorated, decoratedEpoch, [inputRequest(9)]);
+
+    const sessions = await listSessions(server);
+    const blockedSummary = sessions.find((s) => s.id === blocked);
+    const decoratedSummary = sessions.find((s) => s.id === decorated);
+
+    expect(blockedSummary?.activity.kind).toBe("requires_action");
+    expect(blockedSummary?.enrichment?.sequenceNum).toBe(2);
+    expect(decoratedSummary?.activity).toEqual({ kind: "idle" });
+    expect(decoratedSummary?.enrichment).toBeUndefined();
   });
 
   it("rejects an unsupported method on /api/sessions (405)", async () => {

@@ -1920,3 +1920,247 @@ describe("§4/§5 structured logging — detection + notification (#61)", () => 
     expect(registered[1]).toMatchObject({ event: "worker-registered", detail: "re-registered (epoch 1→2)" });
   });
 });
+
+// --- #264 / #78 Option A: AskUserQuestion enrichment transport (SRV-C-002) ---
+
+/** A §5 `input_request` control_event payload (#261) carrying its #201 `sequence_num` + questions. */
+function inputRequestFrame(sequenceNum: unknown, questions: unknown[]): unknown {
+  return { type: "control_event", subtype: "input_request", payload: { sequence_num: sequenceNum, questions } };
+}
+
+/** One well-formed enrichment question, off ADR-005's observed `AskUserQuestion` shape. */
+const APPROVE_QUESTION = {
+  question: "Approve the edit to foo.ts?",
+  header: "File edit",
+  options: [{ label: "Yes", description: "apply it" }, { label: "No" }],
+  multiSelect: false,
+};
+
+/** The normalized enrichment `APPROVE_QUESTION` serves as, at `sequenceNum` (positional `q0` id, per #261). */
+function approveEnrichment(sequenceNum: number): unknown {
+  return {
+    sequenceNum,
+    questions: [
+      {
+        questionId: "q0",
+        prompt: "Approve the edit to foo.ts?",
+        header: "File edit",
+        options: [{ label: "Yes", description: "apply it" }, { label: "No" }],
+        multiSelect: false,
+      },
+    ],
+  };
+}
+
+interface EnrichmentWire {
+  readonly sequenceNum: number;
+  readonly questions: readonly {
+    readonly questionId: string;
+    readonly prompt: string;
+    readonly header?: string;
+    readonly options: readonly { readonly label: string; readonly description?: string }[];
+    readonly multiSelect: boolean;
+  }[];
+}
+
+interface SummaryWire {
+  readonly id: string;
+  readonly status: string;
+  readonly activity: { readonly kind: string; readonly detail?: string };
+  readonly enrichment?: EnrichmentWire;
+}
+
+/** GET the browser-facing session list, including the #264 `enrichment` projection. */
+async function sessionSummaries(server: CcctlServer): Promise<SummaryWire[]> {
+  const res = await fetch(`${base(server)}/api/sessions`);
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { sessions: SummaryWire[] }).sessions;
+}
+
+describe("§5 AskUserQuestion enrichment transport — buffer / serve / drop + the #40 firewall (#264, #78 Option A · SRV-C-002)", () => {
+  it("buffers a §5 input_request and serves the NORMALIZED enrichment on the per-session read while the block stands", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // One batch: the requires_action block plus its decorating input_request, correlated by sequence_num.
+    const res = await postWorkerEvents(server, sessionId, epoch, [
+      statusFrame("requires_action", 5),
+      inputRequestFrame(5, [APPROVE_QUESTION]),
+    ]);
+    expect(res.status).toBe(200);
+
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
+    const [summary] = await sessionSummaries(server);
+    expect(summary.activity.kind).toBe("requires_action");
+    expect(summary.enrichment).toEqual(approveEnrichment(5));
+  });
+
+  it("serves the enrichment whichever order the input_request and its requires_action arrive in the batch", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+
+    // input_request FIRST, then the requires_action that makes the block live — the reverse of above.
+    const res = await postWorkerEvents(server, sessionId, epoch, [
+      inputRequestFrame(7, [APPROVE_QUESTION]),
+      statusFrame("requires_action", 7),
+    ]);
+    expect(res.status).toBe(200);
+
+    const [summary] = await sessionSummaries(server);
+    expect(summary.activity.kind).toBe("requires_action");
+    expect(summary.enrichment).toEqual(approveEnrichment(7));
+  });
+
+  it("drops the buffered enrichment when the session leaves requires_action via the §5 leg", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    expect(
+      (
+        await postWorkerEvents(server, sessionId, epoch, [
+          statusFrame("requires_action", 3),
+          inputRequestFrame(3, [APPROVE_QUESTION]),
+        ])
+      ).status,
+    ).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
+
+    // The turn resumes: requires_action → running drops the decoration.
+    expect((await postWorkerEvents(server, sessionId, epoch, [statusFrame("running", 4)])).status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+    const [summary] = await sessionSummaries(server);
+    expect(summary.activity.kind).toBe("running");
+    expect(summary.enrichment).toBeUndefined();
+  });
+
+  it("drops the buffered enrichment when the §4 bare status gate moves the session off requires_action", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    expect(
+      (
+        await postWorkerEvents(server, sessionId, epoch, [
+          statusFrame("requires_action", 8),
+          inputRequestFrame(8, [APPROVE_QUESTION]),
+        ])
+      ).status,
+    ).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
+
+    expect((await putStatus(server, sessionId, epoch, "idle", 9)).status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+  });
+
+  it("keeps the buffered enrichment across a bare requires_action re-affirmation (mirrors capturedRequiresActionDetail)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    expect(
+      (
+        await postWorkerEvents(server, sessionId, epoch, [
+          statusFrame("requires_action", 2),
+          inputRequestFrame(2, [APPROVE_QUESTION]),
+        ])
+      ).status,
+    ).toBe(200);
+
+    // A §4 bare re-affirmation of requires_action is NOT a transition out — the decoration stands.
+    expect((await putStatus(server, sessionId, epoch, "requires_action", 3)).status).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
+    const [summary] = await sessionSummaries(server);
+    expect(summary.enrichment?.sequenceNum).toBe(2);
+  });
+
+  it("drops the buffered enrichment when a blocked session is evicted — no leak past teardown (#264/#173)", async () => {
+    const server = await startEvictionServer(40);
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    await openWorkerStream(server, sessionId);
+    await waitFor(() => server.hasLiveWorker(sessionId));
+
+    // The session blocks on a decorated question…
+    expect(
+      (
+        await postWorkerEvents(server, sessionId, epoch, [
+          statusFrame("requires_action", 1),
+          inputRequestFrame(1, [APPROVE_QUESTION]),
+        ])
+      ).status,
+    ).toBe(200);
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(true);
+
+    // …and its worker then terminally exits WHILE it is still blocked (downstream gone, no heartbeat). The
+    // transition-out drop never fires — teardown moves `status`, not `activity` — so the close reap is the
+    // only thing keeping the decoration from outliving the session's row.
+    streams.pop()?.destroy();
+
+    await waitFor(() => !server.sessions.has(sessionId));
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+  });
+
+  it("SRV-C-002: a lone input_request cannot SET needs-you — it moves neither activity nor the notification, and is not served", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // An input_request with NO accompanying worker_status: the born-idle session must STAY idle.
+    expect((await postWorkerEvents(server, sessionId, epoch, [inputRequestFrame(1, [APPROVE_QUESTION])])).status).toBe(
+      200,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("idle");
+    // No blocking notification — the enrichment is not the #40 source.
+    expect(needsInputEvents(ui)).toEqual([]);
+    // …and the read does NOT surface a decoration for a session that is not actually blocking (the
+    // isInputAwaited serve gate), even though the frame is buffered.
+    const [summary] = await sessionSummaries(server);
+    expect(summary.enrichment).toBeUndefined();
+  });
+
+  it("SRV-C-002: an input_request cannot CLEAR a live requires_action — the block stands and never re-notifies", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // Enter the #40 block — one blocking notification fires on the transition in.
+    expect((await postWorkerEvents(server, sessionId, epoch, [statusFrame("requires_action", 4)])).status).toBe(200);
+    await waitFor(() => needsInputEvents(ui).length === 1);
+
+    // A following input_request decorates the block; it must neither clear it nor fire a second notification.
+    expect((await postWorkerEvents(server, sessionId, epoch, [inputRequestFrame(4, [APPROVE_QUESTION])])).status).toBe(
+      200,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+    expect(needsInputEvents(ui)).toHaveLength(1);
+    // The decoration IS served — but the block was never the enrichment's to move.
+    const [summary] = await sessionSummaries(server);
+    expect(summary.enrichment?.sequenceNum).toBe(4);
+  });
+
+  it("SRV-C-002: a MALFORMED input_request buffers nothing — the forced requires_action still blocks (fail-safe toward blocking)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    const epoch = await registerWorker(server, sessionId);
+    const ui = await openUiEventStream(server, sessionId);
+
+    // requires_action + a malformed enrichment (a question with an EMPTY options list fails the #261 shape
+    // guard). The block must stand blocking, and nothing may be buffered or served.
+    const res = await postWorkerEvents(server, sessionId, epoch, [
+      statusFrame("requires_action", 6),
+      inputRequestFrame(6, [{ question: "Broken?", options: [] }]),
+    ]);
+    expect(res.status).toBe(200);
+
+    await waitFor(() => needsInputEvents(ui).length === 1);
+    expect(server.sessions.get(sessionId)?.activity.kind).toBe("requires_action");
+    expect(server.hasBufferedEnrichment(sessionId)).toBe(false);
+    const [summary] = await sessionSummaries(server);
+    expect(summary.enrichment).toBeUndefined();
+  });
+});

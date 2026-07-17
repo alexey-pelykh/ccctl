@@ -3,7 +3,15 @@
 
 import type { ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
-import { createSession, markSessionReady, NO_OP_LOGGER, type LogEvent, type Logger, type Session } from "@ccctl/core";
+import {
+  createSession,
+  markSessionReady,
+  NO_OP_LOGGER,
+  type LogEvent,
+  type Logger,
+  type RequiresActionEnrichment,
+  type Session,
+} from "@ccctl/core";
 import { createSessionEventRelays, relayFor } from "./event-stream.js";
 import { closeSession, SESSION_CLOSED_EVENT_TYPE, type SessionCloseState } from "./session-close.js";
 
@@ -13,7 +21,12 @@ import { closeSession, SESSION_CLOSED_EVENT_TYPE, type SessionCloseState } from 
 // and `worker-channel.test.ts` (the #173 eviction path).
 
 function makeState(logger: Logger = NO_OP_LOGGER): SessionCloseState {
-  return { sessions: new Map<string, Session>(), eventRelays: createSessionEventRelays(), logger };
+  return {
+    sessions: new Map<string, Session>(),
+    eventRelays: createSessionEventRelays(),
+    requiresActionEnrichments: new Map<string, RequiresActionEnrichment>(),
+    logger,
+  };
 }
 
 /** A stand-in SSE subscriber: the response the relay writes to, plus the record of what it received. */
@@ -101,6 +114,24 @@ describe("closeSession", () => {
     // "reflected to clients" — the row leaves the list, and the stream ends.
     expect(state.sessions.has("sess-1")).toBe(false);
     expect(state.eventRelays.has("sess-1")).toBe(false);
+  });
+
+  it("reaps a buffered AskUserQuestion enrichment — a closed session leaves no decoration behind (#264)", () => {
+    // A session closing WHILE blocked in `requires_action` never trips the transition-out drop (close moves
+    // `status`, not `activity`), so this seam is the only thing standing between that decoration and an
+    // entry that outlives the session's row — a per-closed-session leak, exactly what the relay reap on the
+    // line above it exists to prevent.
+    const state = makeState();
+    state.sessions.set("sess-1", markSessionReady(createSession("sess-1", "default")));
+    state.requiresActionEnrichments.set("sess-1", {
+      sequenceNum: 1,
+      questions: [{ questionId: "q0", prompt: "Approve?", options: [{ label: "Yes" }], multiSelect: false }],
+    });
+
+    closeSession(state, "sess-1");
+
+    expect(state.sessions.has("sess-1")).toBe(false);
+    expect(state.requiresActionEnrichments.has("sess-1")).toBe(false);
   });
 
   it("does not clobber an `errored` session to `closed` — the diagnosis outlives the stop (AC4)", () => {

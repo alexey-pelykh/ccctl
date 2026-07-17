@@ -52,6 +52,7 @@ import {
   SESSIONS_PATH,
   type HostEndpoint,
   type Logger,
+  type RequiresActionEnrichment,
   type Session,
 } from "@ccctl/core";
 import {
@@ -598,6 +599,15 @@ export interface CcctlServer {
    */
   hasSessionRelay(sessionId: string): boolean;
   /**
+   * Whether the session currently has a buffered `AskUserQuestion` enrichment (#264) — the §5
+   * `input_request` decoration is retained on arrival and dropped on transition OUT of
+   * `requires_action` and on teardown. The receiver-grounded read of "this session's enrichment is
+   * still buffered", used to verify the drop lifecycle and that a closed session does not leak one
+   * (the enrichment sibling of {@link CcctlServer.hasSessionRelay}). The served CONTENT is on the
+   * `GET /api/sessions` read; this is the presence probe.
+   */
+  hasBufferedEnrichment(sessionId: string): boolean;
+  /**
    * Launch a fresh headful session (#31) via the configured {@link ServerConfig.launcher} and track
    * its terminal handle for shutdown teardown — the programmatic form of a `POST /api/sessions`
    * "New session" request. Resolves with the {@link LaunchOutcome}: the server-minted session id
@@ -663,6 +673,17 @@ interface ServerState {
   readonly workerChannels: Map<string, WorkerChannelRecord>;
   /** The per-session UI Server-Sent Events relays — each session its own subscribers + replay buffer. */
   readonly eventRelays: SessionEventRelays;
+  /**
+   * The per-session `AskUserQuestion` enrichment buffer (#264), keyed by ccctl session id. Holds the
+   * `input_request` decoration (#261) the worker emitted for a session currently blocked in
+   * `requires_action`, so a UI that reads the session list AFTER the frame was relayed still learns the
+   * outstanding question + tappable options. A separate map parallel to {@link sessions} / {@link
+   * eventRelays} (NOT on the per-epoch worker record): it is per-session state, and the list read reaches
+   * it without knowing the worker channel. Buffered on §5 arrival ({@link handleWorkerEvents}), dropped on
+   * transition OUT of `requires_action` (both status legs) and on session teardown ({@link closeSession}) —
+   * the enrichment is DISPLAY data, so it can never set or clear the #40 needs-you signal.
+   */
+  readonly requiresActionEnrichments: Map<string, RequiresActionEnrichment>;
   /** The injected session launcher (#31), or `undefined` when this server was configured without one. */
   readonly launcher: ISessionLauncher | undefined;
   /**
@@ -807,6 +828,9 @@ function createHandle(httpServer: Server, state: ServerState): CcctlServer {
     hasSessionRelay(sessionId: string): boolean {
       return state.eventRelays.has(sessionId);
     },
+    hasBufferedEnrichment(sessionId: string): boolean {
+      return state.requiresActionEnrichments.has(sessionId);
+    },
     launchSession(options: SessionLaunchOptions): Promise<LaunchOutcome> {
       return launchTrackedSession(state, options);
     },
@@ -920,6 +944,7 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
     environments: new Map<string, EnvironmentRecord>(),
     workerChannels: new Map<string, WorkerChannelRecord>(),
     eventRelays: createSessionEventRelays(),
+    requiresActionEnrichments: new Map<string, RequiresActionEnrichment>(),
     launcher: config.launcher,
     launchedSurfaces: new Map<string, LaunchedSession>(),
     maxSessions: config.maxSessions ?? DEFAULT_MAX_SESSIONS,
