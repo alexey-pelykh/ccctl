@@ -71,8 +71,9 @@ credentials, and constrain the answer:
 ## Evidence
 
 A control plus four conditions, against stock `claude` 2.1.212,
-`--permission-mode bypassPermissions`. The raw hook payloads are archived with the spike;
-the observations:
+`--permission-mode bypassPermissions`. The runs were local and transient, so this record
+is the artifact: what they showed is below, and the one payload shape a build item needs
+is reproduced verbatim in § What remains open rather than left as a pointer.
 
 | #                 | Setup                                                       | Observation                                                                                                                                                                                                                                                          |
 | ----------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
