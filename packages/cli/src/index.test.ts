@@ -394,6 +394,11 @@ describe("ccctl serve — starts the daemon (AC2)", () => {
     // The one-time operator hint names the signal and what it does.
     expect(loggedText()).toContain("SIGUSR1");
     expect(loggedText()).toContain("inspector attach");
+    expect(loggedText()).toContain("timer census");
+    // "Poke again" is the one instruction an operator cannot infer and would otherwise misread: the
+    // FIRST poke only ARMS the census (#238), so its reading is ~0 even on a daemon full of timers.
+    // Pinned so a later edit to the hint cannot drop it silently and leave the census unreadable.
+    expect(loggedText()).toContain("poke again");
   });
 
   it("arms the local-shutdown floor (#82) with the bound server + the SAME sink, and prints how to trigger it", async () => {

@@ -47,9 +47,11 @@
  * blind to them, and saying so plainly matters more than the reach it costs.** A session does accumulate
  * timers in the daemon: the pending-launch eviction timer (#33, `pending-launch.ts`), the worker
  * `setInterval` LIVENESS timer (#166, `worker-channel.ts`), the session-eviction grace timer (#173), the
- * idle-threshold timer (#41), and the close-timeout timer (`session-release.ts`). Every one of them calls
- * `.unref()` on the line after it is armed — deliberately, so that a daemon's pending bookkeeping never
- * by itself keeps the process alive. Which lands them on the wrong side of the boundary stated just
+ * idle-threshold timer (#41), the close-timeout timer (`session-release.ts`), and the pty backend's kill
+ * escalation (#76, `session-launcher-pty.ts`). Every one of them calls `.unref()` on the very next
+ * statement after it is armed — deliberately, so that a daemon's pending bookkeeping never
+ * by itself keeps the process alive. (#238's census module doc carries the canonical list; this one is
+ * here to name what THIS oracle is blind to, and must not drift from it.) Which lands them on the wrong side of the boundary stated just
  * above: an unref'd handle is NOT keeping the event loop alive, so `getActiveResourcesInfo()` does not
  * report it, so a leaked one is INVISIBLE here. Measured, not reasoned: 22 full lifecycles driven to
  * downstream-open depth against a real daemon never put a single `Timeout` in the tally.
@@ -69,11 +71,19 @@
  * drives §4 register + SSE and never polls for work — which is why no `Timeout` appears in any reading.
  * A leaked poll waiter WOULD be caught by this oracle; it is just not on this cycle's path.
  *
- * **The honest consequence: nobody owns the daemon's unref'd timers.** #68's oracle asks the kernel about
- * one pty descriptor (`fstat`, per-fd); this one asks about the ref'd libuv tally; a leaked `.unref()`'d
- * timer falls between them and no oracle in this package would fail. That is a real gap, recorded as
- * **#238** rather than papered over — closing it needs a sampler that reads unref'd handles too, which is
- * #63's sampler's scope to widen, not this spec's to route around.
+ * **The honest consequence: THIS oracle does not own the daemon's unref'd timers — #238's census does.**
+ * #68's oracle asks the kernel about one pty descriptor (`fstat`, per-fd); this one asks about the ref'd
+ * libuv tally; a leaked `.unref()`'d timer falls between them and no oracle in this package would fail.
+ * That was a real gap, recorded as **#238** rather than papered over, and it has since been closed where
+ * it belonged — in #63's own diagnostics rather than by this spec routing around it: `installTimerCensus`
+ * (`packages/server/src/inspector-diagnostics.ts`) tracks live timers over `async_hooks` and reports them
+ * split by ref-state, ALONGSIDE the ref'd tally. Alongside is the load-bearing word for this oracle: the
+ * census is a SEPARATE report on a separate trail line, so `HandleReport` and every baseline semantic
+ * below are exactly what they were.
+ *
+ * What that does NOT mean is that this soak now watches timers — it reads {@link captureHandleReport} and
+ * nothing else, so every boundary stated above still holds unchanged. Wiring the census into this drive
+ * would widen what the soak asks, which is #69's own scope to decide, not a consequence of #238 shipping.
  *
  * **Why the lifecycle is still driven to FULL depth** — launch → §2 claim → worker downstream open →
  * stop. Not for the liveness timer (which, per the above, this cannot see) but because the downstream is

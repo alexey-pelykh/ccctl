@@ -111,10 +111,18 @@ describe("LogEvent JSON-safety (runtime complement to LogEventJsonProofs)", () =
     }
   });
 
-  // Rule: every DIAGNOSTIC event name (#62 heap snapshot, #63 inspector attach + FD/handle report)
-  // shares the one all-string/null shape and round-trips unchanged — so a new diagnostic action never
-  // smuggles a non-JSON (credential-shaped) field onto the trail.
-  it("round-trips every diagnostic event name unchanged (#62, #63)", () => {
+  // Rule: every DIAGNOSTIC event name (#62 heap snapshot, #63 inspector attach + FD/handle report,
+  // #238 timer census) shares the one all-string/null shape and round-trips unchanged — so a new
+  // diagnostic action never smuggles a non-JSON (credential-shaped) field onto the trail.
+  //
+  // The list is HAND-MAINTAINED, and the rule's load-bearing word — "every" — is therefore a convention
+  // rather than a guarantee: a name added to the union but not here leaves this suite GREEN while it
+  // covers strictly less than it claims. Keying a `Record<DiagnosticLogEvent["event"], true>` would not
+  // fix that either — `tsconfig` excludes `**/*.test.ts`, so no compile-time proof placed in a test file
+  // is ever evaluated. Closing it properly means deriving the union FROM an exported value-level list in
+  // `index.ts` (which IS compiled), which changes the package's public surface — filed as #253 rather
+  // than folded in here.
+  it("round-trips every diagnostic event name unchanged (#62, #63, #238)", () => {
     const diagnosticEventNames: readonly DiagnosticLogEvent["event"][] = [
       "heap-snapshot",
       "heap-snapshot-failed",
@@ -122,6 +130,8 @@ describe("LogEvent JSON-safety (runtime complement to LogEventJsonProofs)", () =
       "inspector-open-failed",
       "handle-report",
       "handle-report-failed",
+      "timer-census",
+      "timer-census-failed",
     ];
     for (const event of diagnosticEventNames) {
       const logged: DiagnosticLogEvent = { category: "diagnostic", level: "info", event, sessionId: null, detail: "d" };
