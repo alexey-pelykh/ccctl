@@ -191,10 +191,19 @@ type NodePtySpawn = (
  * inheriting `process.env` (so the worker sees `PATH` and the like). The import is dynamic and
  * inside the spawner — NOT a top-level import — so `node-pty`'s native binding loads ONLY when a
  * launch actually reaches this backend, never merely on importing `@ccctl/server`. When `node-pty`
- * cannot load (absent, or its native binding was not built for this platform — it ships prebuilt
- * binaries for macOS and Windows but compiles from source on Linux), this REJECTS with an
+ * cannot load (absent, or its native binding was not built for this platform), this REJECTS with an
  * actionable message, which {@link ISessionLauncher.launch} turns into the reject the caller falls
  * back on.
+ *
+ * **A default checkout of THIS repo takes that reject on Linux, always** — and the cause is local
+ * config, not a missing toolchain: `pnpm-workspace.yaml` does not permit node-pty's build, so no
+ * compile runs, the binding is never produced, and there is nothing to load. Why that is, why darwin
+ * fails for a DIFFERENT reason, and which lever each platform actually needs live in exactly ONE
+ * home: `packages/e2e/src/pty-handle-residual.ts`, module doc § "Fenced / opt-in, on its OWN arm".
+ * Not restated here — the duplication is the defect generator (#235), and
+ * `packages/e2e/src/pty-chain-census.ts` fails the `test` lane if any other file restates it. To arm
+ * a box, don't hand-apply a lever from memory — run the preflight, which probes this box:
+ * `pnpm --filter @ccctl/e2e arm:pty`.
  */
 export function defaultPtySpawner(): PtySpawner {
   return async (file: string, args: readonly string[], options: PtySpawnOptions): Promise<OwnedPty> => {
