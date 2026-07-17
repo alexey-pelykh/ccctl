@@ -132,9 +132,62 @@
  * / `fstat` do not carry the same meanings there. A handle with no readable master fd is therefore
  * `inconclusive` ({@link PTY_RESIDUAL_CHECK.masterFd}), not a failure: the oracle says "I cannot ask
  * this question here" rather than answering it wrongly.
+ *
+ * **The worker's lifetime is a DETECTION, not merely a margin (#237).** {@link WORKER_ARGS} derives its
+ * sleep from the drive's own tail so the stand-in cannot expire mid-drive — and #237's reviewer proved
+ * empirically that the derivation is load-bearing rather than decorative: driving the identical LEAKING
+ * daemon and changing ONLY the worker's lifetime flips the verdict, because a stand-in that expires
+ * first is reaped by node-pty on its OWN exit, closing the master fd, and the drive then reads a clean
+ * `verified` while crediting the daemon with a teardown it never performed. But a derivation only ever
+ * buys MARGIN, and margin is not detection: a drive that ran long anyway — the `e2e` lane's
+ * `testTimeout` is 120s and the drive's `fetch`es carry no timeout of their own — would reopen the hole
+ * silently, because it reopens it as a GREEN. So the elapsed time is now MEASURED rather than merely
+ * bounded: every spawn is stamped ({@link ObservedSpawn.spawnedAt}), the after-teardown reading is
+ * stamped ({@link PtyResidualCapture.afterTeardownAt}), and a reading that landed at or past the
+ * stand-in's OWN lifetime ({@link WORKER_LIFETIME_MS}) is `inconclusive`
+ * ({@link PTY_RESIDUAL_CHECK.workerOutlived}) — the run says "I could not attribute this teardown"
+ * rather than attributing it to the daemon. That subsumes every CAUSE of a slow drive rather than
+ * enumerating them, which is why no `fetch` timeout is needed to close it. The margin stays: it is what
+ * makes a healthy run pass. The stamp is what makes an unhealthy one impossible to mistake for one.
+ *
+ * **The lazy `import("node-pty")` is a load-bearing invariant, and it is GATED (#237).** Everything
+ * above rests on {@link defaultPtySpawner} doing its `await import("node-pty")` INSIDE the closure: a
+ * refactor hoisting that to module scope would make merely importing `@ccctl/server` load the native
+ * binding, and `describe.skipIf` skips a suite's EXECUTION but never its collection-time imports — so
+ * the break would land on the credential-free CI lane, at collection, as a module-resolution error
+ * naming nothing. This package widened the exposure rather than created it: its barrel
+ * (`packages/e2e/src/index.ts`) puts the whole chain in the `test` lane's import graph too, where the
+ * fence does not reach. {@link loadedNodePtyModules} + its gate in `pty-handle-residual.test.ts` turn
+ * the prose invariant into a test: the binding is a CommonJS module, so loading it — by any route,
+ * including the native `.node` addon — populates `require.cache`, and an empty reading there after
+ * `@ccctl/server` is loaded is the invariant, asserted rather than hoped for.
+ *
+ * **Both teardown paths are exercised against the real binding (#237).** The backend signals a child
+ * POLITELY first and ESCALATES to an uncatchable `SIGKILL` if it is ignored
+ * (`session-launcher-pty.ts` § `close`). {@link WORKER_ARGS}' `sleep` dies on the polite signal, so it
+ * drives only the COOPERATIVE half — which left the escalation proven only by #30's unit suite, against
+ * a fake whose `kill()` fires a synthetic `onExit`. That is precisely the argument this oracle exists to
+ * reject for the polite path, so {@link SIGHUP_IGNORING_WORKER_ARGS} closes it for the other one: the
+ * same stand-in, made deaf to the polite signal, so the only thing that can reap it is the escalation.
+ * It keeps `exec` — POSIX carries an IGNORED disposition across `exec` (unlike a HANDLED one, which is
+ * reset), so `trap '' HUP; exec sleep N` is both deaf AND still the pid node-pty reports, with no shell
+ * wrapper standing between the signal and its target and no grandchild to strand. #237 recorded these as
+ * mutually exclusive; they are not, which is why the fix is a second argv rather than a redesign.
+ *
+ * That stand-in has a STARTUP RACE, and it is the sharpest trap in this file: node-pty returns the pid
+ * the instant it forks the shell, BEFORE that shell has run its `trap`, so a teardown dispatched
+ * milliseconds later — which is what this oracle's drive does — kills an unarmed shell on the POLITE
+ * path and reads a perfect `verified` for a run that never reached the escalation. It is closed by
+ * WAITING for the arming, observed from the OS ({@link SIGHUP_IGNORING_WORKER_ARMED_COMMAND}), and it
+ * was FOUND by {@link createSighupIgnoringPtyLauncher}'s own negative control — which is the whole
+ * argument for why every positive here ships one. The control failed on the first armed run, against an
+ * oracle whose author believed the stand-in was deaf from birth; without it this file would have shipped
+ * a green test that never once escalated.
  */
 
+import { spawnSync } from "node:child_process";
 import { fstatSync } from "node:fs";
+import { basename } from "node:path";
 import {
   createPtySessionLauncher,
   defaultPtySpawner,
@@ -176,6 +229,29 @@ export function resolvePtyE2EEnv(env: NodeJS.ProcessEnv = process.env): PtyFence
     missing.push("CCCTL_E2E_PTY");
   }
   return missing.length > 0 ? { ready: false, missing } : { ready: true };
+}
+
+// --- the lazy-binding gate (pure) ---
+
+/**
+ * Which `node-pty` modules a CommonJS require-cache holds — the observation behind the LAZY-IMPORT
+ * GATE (#237). Empty is the invariant: `@ccctl/server` must be importable without loading the native
+ * binding (see the module doc § "the lazy `import(\"node-pty\")`").
+ *
+ * **Why `require.cache` is the receiver of record here.** node-pty is CommonJS, and its native `.node`
+ * addon is itself loaded through `require` — so EVERY route into the binding, including a dynamic
+ * `import()` from ESM and including the addon itself, lands in that cache. It is the OS-equivalent for
+ * this claim: an answer from the loader about what it actually loaded, not from the module about what
+ * it thinks it did. Pure over the injected keys so the PREDICATE is provable against the real path
+ * shapes without loading anything, which is what keeps its gate from passing because the filter is
+ * broken rather than because the cache is clean.
+ *
+ * Matches a `node-pty` PATH SEGMENT rather than the bare substring: under pnpm the store path also
+ * carries a `node-pty@1.1.0` segment, and a checkout living under some `…/node-pty-notes/…` directory
+ * must not read as a load. Real keys look like `/…/node_modules/node-pty/lib/index.js`.
+ */
+export function loadedNodePtyModules(cacheKeys: Iterable<string>): string[] {
+  return [...cacheKeys].filter((key) => /[\\/]node-pty[\\/]/.test(key));
 }
 
 /** A one-line, human-readable rendering of a {@link PtyFence} — the suite title's suffix. */
@@ -230,6 +306,24 @@ export const WORKER_SLEEP_HEADROOM = 3;
 /** The stand-in worker's sleep, in whole seconds — {@link WORKER_SLEEP_HEADROOM}× the drive's tail. */
 export const WORKER_SLEEP_SECONDS = Math.ceil((REAP_CONVERGENCE_TIMEOUT_MS / 1_000) * WORKER_SLEEP_HEADROOM);
 
+/**
+ * The stand-in worker's whole lifetime, in milliseconds — the DEADLINE past which this oracle can no
+ * longer tell the daemon's teardown from the child's own exit, and therefore the threshold
+ * {@link classifyPtyHandleResidual} refuses to `verified` beyond (see the module doc § "a DETECTION,
+ * not merely a margin").
+ *
+ * Derived from the sleep the worker actually runs rather than written down beside it, for the reason
+ * {@link WORKER_ARGS} derives the sleep in the first place: the two must move together, and a
+ * hand-synced pair is exactly what fails as a green. Raising {@link REAP_CONVERGENCE_TIMEOUT_MS} now
+ * carries the sleep AND this threshold with it.
+ *
+ * Slightly CONSERVATIVE, and deliberately so: the sleep does not begin until `exec` has replaced the
+ * shell, some microseconds after the spawn this is measured from, so the real child outlives this
+ * threshold by that much. Erring toward `inconclusive` at the boundary costs a re-run; erring the other
+ * way costs a false green, which is the whole thing being guarded against.
+ */
+export const WORKER_LIFETIME_MS = WORKER_SLEEP_SECONDS * 1_000;
+
 // --- the worker stand-in ---
 
 /**
@@ -264,14 +358,48 @@ export const WORKER_FILE = "/bin/sh";
  * floor is not documented and hoped for, it is COMPUTED from the constant it depends on
  * ({@link WORKER_SLEEP_HEADROOM} × the window). Raising the window now raises the sleep with it.
  *
- * The one coupling this cannot enforce is a CALLER passing a
- * {@link PtyResidualDriveConfig.reapTimeoutMs} LARGER than this sleep — that would reopen the hole
- * from the outside. No caller does: the positive path takes the default, and the negative control
- * passes a deliberately SMALLER one ({@link LEAK_CONTROL_REAP_TIMEOUT_MS}), which is the safe
- * direction. A future caller wanting a longer window must raise {@link REAP_CONVERGENCE_TIMEOUT_MS}
- * (which carries the sleep with it) rather than override past it.
+ * The coupling the derivation cannot reach is a CALLER passing a
+ * {@link PtyResidualDriveConfig.reapTimeoutMs} LARGER than this sleep, which would reopen the hole
+ * from outside the module. No caller does — the positive path takes the default and the controls pass a
+ * deliberately SMALLER one ({@link LEAK_CONTROL_REAP_TIMEOUT_MS}) — but that is a fact about today's
+ * callers, not a guarantee, which is why the derivation is no longer the only thing standing here.
+ * {@link WORKER_LIFETIME_MS}'s attribution gate closes it from the other side (#237): it measures the
+ * span that actually elapsed, so an over-long window bought from the outside surfaces as an
+ * `inconclusive` rather than a green — and so does any OTHER way a drive runs long, which is the point
+ * of measuring the outcome instead of enumerating the causes.
  */
 export const WORKER_ARGS: readonly string[] = ["-c", `exec sleep ${WORKER_SLEEP_SECONDS}`];
+
+/**
+ * The stand-in worker's SIGHUP-IGNORING argv (#237) — {@link WORKER_ARGS}' twin, and the only thing
+ * that lets the backend's SIGKILL ESCALATION be asked of the real binding.
+ *
+ * **The gap it closes.** `close()` signals politely first and escalates to an uncatchable `SIGKILL`
+ * only if the child ignored that (`session-launcher-pty.ts` § `close`). A plain `sleep` dies on the
+ * polite signal, so every drive this oracle makes with {@link WORKER_ARGS} takes the COOPERATIVE path
+ * and the escalation is never reached. That left it proven only by #30's unit suite — which drives a
+ * fake whose `kill()` fires a synthetic `onExit`, i.e. it proves the backend BELIEVES it escalated.
+ * That is the exact argument this oracle's module doc rejects for the polite path ("a claim about the
+ * operating system, and only a real pty can be asked"), so the escalation had the gap the happy path no
+ * longer does. A child that really ignores a real signal is the only way to ask.
+ *
+ * **`trap '' HUP` and `exec` are COMPATIBLE, which is what makes this cheap.** #237 recorded them as
+ * mutually exclusive — `exec` being load-bearing, so trapping "requires dropping it" — and that is the
+ * one thing here worth stating plainly, because the opposite is true and POSIX says so: `exec` resets
+ * HANDLED signals to their default but carries IGNORED ones into the new process image unchanged. So
+ * `trap '' HUP` (which sets SIG_IGN, not a handler) survives into `sleep`, and every reason `exec`
+ * exists in {@link WORKER_ARGS} survives with it — the pid node-pty reports is still the pid of the
+ * process actually running, so the backend's signal reaches its target with no shell in between, and no
+ * grandchild is left behind to strand. Dropping `exec` would have cost both. VERIFIED end-to-end
+ * (darwin-arm64 / node-pty 1.1.0 / Node 26): the spawned pid reports as `sleep`, survives `SIGHUP`, and
+ * dies on `SIGKILL`.
+ *
+ * The sleep is {@link WORKER_ARGS}' sleep, and must stay so: this worker can only ever be ended by the
+ * escalation or by its own expiry, so the same floor that keeps a cooperative child from being reaped by
+ * its own exit mid-drive keeps this one from being, too — and the same {@link WORKER_LIFETIME_MS}
+ * detection backstops it when the floor is not enough.
+ */
+export const SIGHUP_IGNORING_WORKER_ARGS: readonly string[] = ["-c", `trap '' HUP; exec sleep ${WORKER_SLEEP_SECONDS}`];
 
 /**
  * The registration window the daemon is given for this oracle's drive — raised far above the 10s
@@ -308,7 +436,28 @@ export interface ObservedSpawn {
    * which has no master fd — read as `inconclusive`, never as a failure (see the module doc).
    */
   readonly fd?: number | undefined;
+  /**
+   * WHEN this spawn happened, on {@link ELAPSED_CLOCK} — the instant the stand-in worker's own
+   * {@link WORKER_LIFETIME_MS} starts running down, and therefore the origin every later reading's
+   * attribution is measured from (#237, module doc § "a DETECTION, not merely a margin").
+   *
+   * REQUIRED rather than optional, and that is the point: a real spawn always happened at a time, and
+   * an optional stamp is one a future edit could quietly stop taking — which would retire the
+   * detection silently, as a green. The type is what makes the drive keep measuring.
+   */
+  readonly spawnedAt: number;
 }
+
+/**
+ * The clock every elapsed measurement here is taken on: MONOTONIC, so a duration cannot be bent by an
+ * NTP step mid-drive — `Date.now()` can go backwards, and a stand-in's expiry is not the kind of claim
+ * to settle with a wall clock. Both ends of the span must come off this same clock or the difference is
+ * meaningless, which is why it is named once here rather than called twice.
+ *
+ * `waitForResidualToSettle` deliberately keeps `Date.now()` for its POLLING deadline: a skewed poll
+ * loop costs a run some time, whereas a skewed attribution costs a verdict its meaning.
+ */
+export const ELAPSED_CLOCK: () => number = () => performance.now();
 
 /**
  * Read the pty master fd off a real `node-pty` handle. Structural rather than typed, and
@@ -361,7 +510,10 @@ export function createObservingPtySpawner(inner: PtySpawner = defaultPtySpawner(
   return {
     spawn: async (file, args, options) => {
       const pty = await inner(file, args, options);
-      spawns.push({ pid: pty.pid, fd: readMasterFd(pty) });
+      // Stamped HERE — the first instant the child provably exists, and the closest this drive can
+      // stand to the moment its lifetime starts running down (#237). Read AFTER the spawn resolves
+      // rather than before it is dispatched, so a slow spawn is never charged to the worker's sleep.
+      spawns.push({ pid: pty.pid, fd: readMasterFd(pty), spawnedAt: ELAPSED_CLOCK() });
       return pty;
     },
     observed: () => spawns.at(-1),
@@ -374,20 +526,83 @@ export function createObservingPtySpawner(inner: PtySpawner = defaultPtySpawner(
  * {@link defaultPtySpawner} (through {@link createObservingPtySpawner}) and the stand-in worker
  * command. This is the backend the daemon is given; nothing about its orchestration is faked.
  */
-export function createObservedPtyLauncher(inner?: PtySpawner): {
+export function createObservedPtyLauncher(inner?: PtySpawner): ObservedPtyLauncher {
+  return createObservedLauncherRunning(WORKER_ARGS, inner);
+}
+
+/** The REAL owned-pty launcher plus the readouts of what its real spawns produced. */
+export interface ObservedPtyLauncher {
   readonly launcher: ISessionLauncher;
   readonly observed: () => ObservedSpawn | undefined;
   readonly spawns: () => readonly ObservedSpawn[];
-} {
+}
+
+/**
+ * The REAL owned-pty launcher running `workerArgs`, observed — the shared wiring behind every factory
+ * here. The stand-in's argv, the escalation window and an optional readiness wait are the ONLY things
+ * any of them vary; the backend itself is `createPtySessionLauncher` against the real
+ * {@link defaultPtySpawner} in every case, which is what keeps "nothing about the orchestration is
+ * faked" true of all of them rather than only the first.
+ *
+ * `afterObserved` runs BENEATH the launcher but ABOVE the observer, and that ordering is load-bearing
+ * rather than incidental — see the parameter.
+ */
+function createObservedLauncherRunning(
+  workerArgs: readonly string[],
+  inner?: PtySpawner,
+  killEscalationMs?: number,
+  /**
+   * An extra wait between the spawn and the launcher receiving its handle — for a stand-in that is not
+   * yet what it claims to be at fork time ({@link createSighupIgnoringPtyLauncher}'s arming race).
+   *
+   * It is layered OUTSIDE {@link createObservingPtySpawner} on purpose: inside, its duration would be
+   * charged to nothing, but the spawn's {@link ObservedSpawn.spawnedAt} would be stamped only once it
+   * had finished — so the measured span would START LATE and therefore UNDER-report, letting the
+   * attribution gate stay silent for exactly that long past the child's real self-expiry. That is the
+   * unsafe direction, and the one {@link WORKER_LIFETIME_MS} explicitly errs against. Stamped at the
+   * spawn and waited afterwards, the span over-reports by the wait instead, which is the safe way to be
+   * wrong.
+   */
+  afterObserved?: (pty: OwnedPty) => Promise<void>,
+): ObservedPtyLauncher {
   const spawner = createObservingPtySpawner(inner);
+  const spawn: PtySpawner =
+    afterObserved === undefined
+      ? spawner.spawn
+      : async (file, args, options): Promise<OwnedPty> => {
+          const pty = await spawner.spawn(file, args, options);
+          await afterObserved(pty);
+          return pty;
+        };
   return {
     launcher: createPtySessionLauncher({
-      workerCommand: () => [WORKER_FILE, ...WORKER_ARGS],
-      spawn: spawner.spawn,
+      workerCommand: () => [WORKER_FILE, ...workerArgs],
+      spawn,
+      ...(killEscalationMs !== undefined ? { killEscalationMs } : {}),
     }),
     observed: spawner.observed,
     spawns: spawner.spawns,
   };
+}
+
+/**
+ * SIGKILL every child a launcher spawned, and never throw. The obligation of any factory here that can
+ * strand one: a test helper that leaks on purpose must clean up EVERYTHING it leaked, not merely its
+ * most recent — #68's own controls launch once, but #70's drives many cycles, and a `reap()` that freed
+ * only the newest would leave the rest running on the operator's box.
+ *
+ * `SIGKILL` rather than a polite signal because both callers strand children that a polite signal
+ * cannot end: one by disabling teardown, the other by making the child ignore it
+ * ({@link SIGHUP_IGNORING_WORKER_ARGS}). Safe on an already-gone child, which is the outcome it wanted.
+ */
+function reapAll(spawns: () => readonly ObservedSpawn[]): void {
+  for (const { pid } of spawns()) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone — nothing to reap, which is the outcome this wanted anyway.
+    }
+  }
 }
 
 /**
@@ -410,19 +625,9 @@ export function createObservedPtyLauncher(inner?: PtySpawner): {
  * pre-#166 behavior to prove its stand-in does record a drop.
  *
  * `reap()` is the caller's obligation: this launcher leaks ON PURPOSE, so the test must kill the
- * child it stranded. It is uncatchable (`SIGKILL`) because the whole point of the control is a
- * teardown that does not work, and safe on an already-gone child. It reaps EVERY child this launcher
- * stranded rather than only the last: #68's own control launches once, but a control that drives more
- * than one launch (#70's, over rapid cycles) strands one child PER cycle, and a `reap()` that freed
- * only the newest would leave the rest of them running on the operator's box — a test helper that
- * leaks on purpose must clean up everything it leaked, not merely its most recent.
+ * child it stranded ({@link reapAll}).
  */
-export function createLeakingPtyLauncher(inner?: PtySpawner): {
-  readonly launcher: ISessionLauncher;
-  readonly observed: () => ObservedSpawn | undefined;
-  readonly spawns: () => readonly ObservedSpawn[];
-  readonly reap: () => void;
-} {
+export function createLeakingPtyLauncher(inner?: PtySpawner): ReapableObservedPtyLauncher {
   const real = createObservedPtyLauncher(inner);
   return {
     launcher: {
@@ -439,23 +644,213 @@ export function createLeakingPtyLauncher(inner?: PtySpawner): {
     observed: real.observed,
     spawns: real.spawns,
     reap: (): void => {
-      for (const { pid } of real.spawns()) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // Already gone — nothing to reap, which is the outcome this wanted anyway.
-        }
-      }
+      reapAll(real.spawns);
     },
   };
 }
 
+/** An {@link ObservedPtyLauncher} that can strand a child, and therefore owes the caller a `reap()`. */
+export interface ReapableObservedPtyLauncher extends ObservedPtyLauncher {
+  /** Kill every child this launcher spawned. The caller's obligation — see {@link reapAll}. */
+  readonly reap: () => void;
+}
+
 /**
- * The convergence window the NEGATIVE CONTROL waits. Short on purpose, and the brevity is sound
- * rather than a shortcut: the control's `close()` is a no-op, so there is no teardown in flight and
- * nothing to converge to — the residual is immediate and permanent. Waiting the full
- * {@link REAP_CONVERGENCE_TIMEOUT_MS} would only make the suite slower to reach a verdict it can
- * already read. (The positive path keeps the generous window, where the wait is real.)
+ * The escalation window the SIGHUP-ignoring POSITIVE arms — short, so the escalation lands well inside
+ * the drive's own tail ({@link REAP_CONVERGENCE_TIMEOUT_MS}) and the run reaches a verdict promptly.
+ *
+ * Shortened from the 2s product default via the seam the backend put there for exactly this
+ * (`session-launcher-pty.ts` § `PtySessionLauncherConfig.killEscalationMs`: "a test passes a short
+ * value to exercise the escalation deterministically"). Not shortened to ~0: the contract under test is
+ * *politeness FIRST, escalation after a grace window in which the child was asked nicely and declined*,
+ * and a window a cooperative child could not exit inside would test a different, worse contract.
+ */
+export const ESCALATION_WINDOW_MS = 250;
+
+/**
+ * The escalation window the ESCALATION NEGATIVE CONTROL arms — as far out as the stand-in's own expiry,
+ * which is to say further than anything in the control's drive can reach ({@link
+ * LEAK_CONTROL_REAP_TIMEOUT_MS}). Within that drive the escalation therefore provably CANNOT fire, and
+ * a child still present at the end is a child the POLITE signal did not end.
+ *
+ * Derived from {@link WORKER_LIFETIME_MS} rather than written down, because what it means is "as
+ * unreachable as this oracle's clock ever gets": beyond the worker's own lifetime the run has already
+ * lost the ability to attribute anything ({@link PTY_RESIDUAL_CHECK.workerOutlived}), so there is
+ * nothing further out worth naming. The control reaps in ~1s and never approaches either.
+ */
+export const ESCALATION_CONTROL_WINDOW_MS = WORKER_LIFETIME_MS;
+
+/**
+ * The REAL pty backend running a stand-in that IGNORES the polite signal
+ * ({@link SIGHUP_IGNORING_WORKER_ARGS}) — the drive that asks the OS about the backend's SIGKILL
+ * ESCALATION (#237). See {@link SIGHUP_IGNORING_WORKER_ARGS} for why the escalation had a gap the
+ * cooperative path does not, and why `trap`ping costs `exec` nothing.
+ *
+ * **The pair, and why the positive needs the control.** Nothing about this launcher observes WHICH
+ * signal ended the child — deliberately, because the only thing that could is the backend's own report
+ * that it called `kill("SIGKILL")`, and "the backend believes it escalated" is precisely the evidence
+ * this oracle exists to refuse. So attribution is bought the way this package always buys it: from the
+ * OS, over a PAIR of runs that differ in ONE thing.
+ *
+ *   - `killEscalationMs` = {@link ESCALATION_WINDOW_MS} (the POSITIVE) → the escalation fires, and the
+ *     kernel reports the child reaped and the fd released. `verified`.
+ *   - `killEscalationMs` = {@link ESCALATION_CONTROL_WINDOW_MS} (the CONTROL) → the escalation cannot
+ *     fire inside the drive, and the kernel reports the child STILL THERE. `drift`.
+ *
+ * The control is what licenses the positive's attribution, and it is not ceremony: without it a
+ * stand-in that quietly stopped ignoring the signal — a `trap` typo, a shell that resets the
+ * disposition, a node-pty that grew a process-group kill — would make the positive green via the POLITE
+ * path while still being titled after the escalation. That is the same vacuous-positive this package
+ * guards everywhere ({@link createLeakingPtyLauncher}, `worker-idle-hold.ts`'s starved control): the
+ * control proves the polite signal really does NOT end this child, so in the positive the escalation is
+ * the only thing left that can have.
+ *
+ * `reap()` is the caller's obligation on BOTH: the control strands its child by construction, and a
+ * positive that failed may have stranded one too — and this stand-in ignores the polite signal, so
+ * SIGKILL is the only thing that can clean up after it ({@link reapAll}).
+ */
+export function createSighupIgnoringPtyLauncher(
+  killEscalationMs: number,
+  inner?: PtySpawner,
+): SighupIgnoringPtyLauncher {
+  let spawnsSeen = 0;
+  let allArmed = true;
+
+  // The ARMING WAIT — see SIGHUP_IGNORING_WORKER_ARMED_COMMAND for the race this closes and why the
+  // cooperative stand-in needs no such thing. Wired into the LAUNCH rather than into the drive is what
+  // keeps it airtight: `launch()` cannot resolve until the child is armed, so every caller — this
+  // oracle's teardown included — is ordered after it by construction rather than by remembering to be.
+  const real = createObservedLauncherRunning(
+    SIGHUP_IGNORING_WORKER_ARGS,
+    inner,
+    killEscalationMs,
+    async (pty): Promise<void> => {
+      spawnsSeen += 1;
+      if (!(await awaitWorkerArmed(pty.pid))) {
+        allArmed = false;
+      }
+    },
+  );
+  return {
+    ...real,
+    reap: (): void => {
+      reapAll(real.spawns);
+    },
+    armed: () => spawnsSeen > 0 && allArmed,
+  };
+}
+
+/** A {@link ReapableObservedPtyLauncher} whose stand-in must ARM before its verdict means anything. */
+export interface SighupIgnoringPtyLauncher extends ReapableObservedPtyLauncher {
+  /**
+   * Whether EVERY spawn this launcher made was observed to reach its armed state
+   * ({@link SIGHUP_IGNORING_WORKER_ARMED_COMMAND}) — and whether there was one at all.
+   *
+   * `false` is not a defect in the daemon and must never be reported as one: it says the STAND-IN could
+   * not be brought to the state that makes the question askable, so the run has no signal either way.
+   * The caller skips on it, the way it skips an absent binding.
+   */
+  readonly armed: () => boolean;
+}
+
+/**
+ * The command name {@link SIGHUP_IGNORING_WORKER_ARGS} reports once it is ARMED — and the OS-observable
+ * proof that it is, which is a sharper thing than it looks.
+ *
+ * **The startup race this closes, which cost a real false green to find.** node-pty returns the pid the
+ * instant it forks `/bin/sh` — BEFORE that shell has read, let alone run, a single word of its `-c`
+ * script. So there is a window, at the very start of every launch, in which the child is a shell with
+ * the DEFAULT signal disposition and no trap installed. A teardown dispatched inside that window
+ * delivers the polite signal to an unarmed shell, which duly dies — and the oracle then reads a child
+ * reaped and an fd released and returns `verified`, for a run that never reached the escalation it is
+ * named for. The race is not hypothetical and not narrow: this oracle's drive dispatches its teardown
+ * within milliseconds of the launch, so it lost the race EVERY time until this wait existed. It was
+ * caught by {@link createSighupIgnoringPtyLauncher}'s own negative control, which is the entire reason
+ * that control is not ceremony.
+ *
+ * **Why `exec` makes the arming observable at all.** `trap '' HUP` and `exec sleep N` are ordered: the
+ * `exec` cannot have happened unless the `trap` already did. And `exec` REPLACES the process image, so
+ * the command the OS reports for that pid changes from a shell to `sleep` at exactly that moment — and
+ * never before it. So this name is not a proxy for the arming, it is downstream of it: seeing `sleep`
+ * is seeing that the trap is installed. The same `exec` that keeps the pid identity honest also makes
+ * the arming legible, which is a second reason not to drop it.
+ *
+ * Read via `ps` — the OS's own answer, the receiver of record this module uses everywhere, rather than
+ * node-pty's `process` getter (its self-report about a handle, which is the class of evidence the module
+ * doc rejects on principle).
+ *
+ * The COOPERATIVE stand-in ({@link WORKER_ARGS}) deliberately has no equivalent, and needs none: it is
+ * meant to die on the polite signal, so a signal landing before its `exec` kills the shell instead of
+ * the `sleep` — same pid, same reap, same readings, same verdict. The race only bites a stand-in whose
+ * whole point is to SURVIVE that signal.
+ */
+export const SIGHUP_IGNORING_WORKER_ARMED_COMMAND = "sleep";
+
+/** How long the stand-in gets to arm before the run is treated as unaskable. Generous — it takes ~ms. */
+export const WORKER_ARMING_TIMEOUT_MS = 5_000;
+
+/** How often the arming probe re-asks the OS. Short: the window it is watching is milliseconds wide. */
+const WORKER_ARMING_POLL_INTERVAL_MS = 10;
+
+/**
+ * What command the OS says `pid` is running, by BASENAME — or `undefined` when it will not say (the pid
+ * is gone, or `ps` is unavailable).
+ *
+ * The basename is what makes this portable rather than lucky: `ps -o comm=` reports the string the
+ * process was executed with, so the shell shows as `/bin/sh` (an absolute path, because that is how this
+ * module spawns it) while a `sleep` resolved off `PATH` shows as bare `sleep`. Comparing full strings
+ * would make the answer depend on how each half was invoked; comparing basenames asks the question
+ * actually being asked.
+ */
+export function readProcessCommandName(pid: number): string | undefined {
+  // Bounded, because this is polled: a `ps` that wedged would otherwise hold the arming loop until the
+  // suite's own 120s testTimeout and report the wedge as an oracle failure. A probe that cannot answer
+  // promptly has not answered — `undefined` says so, and the arming loop's own deadline decides.
+  const result = spawnSync("ps", ["-o", "comm=", "-p", String(pid)], {
+    encoding: "utf8",
+    timeout: PROCESS_NAME_PROBE_TIMEOUT_MS,
+  });
+  if (result.status !== 0) {
+    return undefined;
+  }
+  const name = result.stdout.trim();
+  return name === "" ? undefined : basename(name);
+}
+
+/** How long a single `ps` gets to answer before its reading is treated as absent. */
+const PROCESS_NAME_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * Poll the OS until `pid` reports {@link SIGHUP_IGNORING_WORKER_ARMED_COMMAND} — the stand-in is armed —
+ * or the deadline passes. `false` means the question cannot be asked on this box, never that the daemon
+ * did anything wrong.
+ */
+async function awaitWorkerArmed(pid: number, timeoutMs: number = WORKER_ARMING_TIMEOUT_MS): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (readProcessCommandName(pid) === SIGHUP_IGNORING_WORKER_ARMED_COMMAND) {
+      return true;
+    }
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, WORKER_ARMING_POLL_INTERVAL_MS));
+  }
+}
+
+/**
+ * The convergence window a NEGATIVE CONTROL waits. Short on purpose, and the brevity is sound rather
+ * than a shortcut: a control has no teardown in flight and nothing to converge to, so its residual is
+ * immediate and permanent. Waiting the full {@link REAP_CONVERGENCE_TIMEOUT_MS} would only make the
+ * suite slower to reach a verdict it can already read. (The positive paths keep the generous window,
+ * where the wait is real.)
+ *
+ * Named for {@link createLeakingPtyLauncher}, whose control it was first, but it now serves BOTH — the
+ * escalation control ({@link createSighupIgnoringPtyLauncher} at {@link ESCALATION_CONTROL_WINDOW_MS})
+ * waits it too, and the same one sentence explains both: one strands its child by never signalling it,
+ * the other by signalling it something it ignores, and neither has anything converging that a longer
+ * wait would catch. Both leak a child ON PURPOSE and both owe a `reap()`, so the LEAK in the name still
+ * describes what it is a window for.
  */
 export const LEAK_CONTROL_REAP_TIMEOUT_MS = 1_000;
 
@@ -538,6 +933,7 @@ export const PTY_RESIDUAL_CHECK = {
   childLive: "child-live-on-launch (AC2)",
   fdReleased: "fd-released-on-teardown (AC2)",
   childReaped: "child-reaped-on-teardown (AC2)",
+  workerOutlived: "teardown-attributable (AC2)",
 } as const;
 
 /** Everything one drive observed — the input to the pure {@link classifyPtyHandleResidual}. */
@@ -556,6 +952,19 @@ export interface PtyResidualCapture {
   readonly atLaunch?: HandleReading | undefined;
   /** The OS's reading after the daemon's own teardown ran to convergence. */
   readonly afterTeardown?: HandleReading | undefined;
+  /**
+   * WHEN {@link afterTeardown} was read, on the same {@link ELAPSED_CLOCK} as
+   * {@link ObservedSpawn.spawnedAt} — the other end of the span that decides whether this run may
+   * attribute its clean reading to the daemon at all (#237, module doc § "a DETECTION, not merely a
+   * margin").
+   *
+   * Optional only because {@link afterTeardown} is: they are taken together, and a capture carrying the
+   * reading WITHOUT its stamp is itself an inconclusive gap ({@link PTY_RESIDUAL_CHECK.workerOutlived})
+   * rather than a run that skips the check. That asymmetry is the point — an unstamped reading must not
+   * be a cheaper way to reach `verified` than a stamped one, or the detection is optional in practice
+   * however required it looks in the type.
+   */
+  readonly afterTeardownAt?: number | undefined;
   /** Whether the real teardown path was actually driven. */
   readonly teardownDriven?: boolean | undefined;
 }
@@ -673,6 +1082,18 @@ export function classifyPtyHandleResidual(capture: PtyResidualCapture): PtyResid
   }
   if (capture.afterTeardown === undefined) {
     gaps.push(`${PTY_RESIDUAL_CHECK.fdReleased}: the handle was never read after teardown`);
+  } else {
+    // THE ATTRIBUTION GAP (#237). Everything above asks WHAT the readings say; this asks whether this
+    // run has earned the right to credit them to the DAEMON. Past the stand-in's own lifetime it has
+    // not: the child would have exited on its own, node-pty would have reaped it and closed the master
+    // fd on that exit, and the readings a leaking daemon then produces are indistinguishable from a
+    // faithful one's. `verified` there is a fabricated green — the reviewer built exactly that run —
+    // so the honest verdict is that the question went unasked. See the module doc.
+    //
+    // A gap rather than a violation, and checked AFTER drift, because it is a limit on what this run
+    // could ASK rather than something the daemon DID: a residual actually observed is a residual
+    // whenever it was seen, and must not be downgraded to "inconclusive" by a slow drive.
+    gaps.push(...attributionGaps(capture));
   }
   if (gaps.length > 0) {
     return {
@@ -689,8 +1110,43 @@ export function classifyPtyHandleResidual(capture: PtyResidualCapture): PtyResid
       `a session launched through the daemon onto the REAL node-pty backend opened a live pty master fd ` +
       `(${capture.atLaunch?.fdIdentity ?? "?"}) and a live child (pid ${capture.spawned?.pid ?? "?"}), and the ` +
       `daemon's own teardown released the fd (${capture.afterTeardown?.fdErrno ?? "released"}) and REAPED the ` +
-      `child (${capture.afterTeardown?.childErrno ?? "gone"}) — no residual`,
+      `child (${capture.afterTeardown?.childErrno ?? "gone"}) — no residual, read ` +
+      // The span is carried on the PASS as well as the gap, so a reader can see how much of the
+      // stand-in's lifetime the run actually left on the table rather than only that it cleared it
+      // (#69's `spannedMultiDay` posture: the verdict never lies about the axis it turned on).
+      `${Math.round((capture.afterTeardownAt ?? 0) - (capture.spawned?.spawnedAt ?? 0))}ms into the ` +
+      `stand-in's ${WORKER_LIFETIME_MS}ms lifetime, so the teardown is the daemon's and nothing else's`,
   };
+}
+
+/**
+ * Whether this run may credit its after-teardown reading to the DAEMON — the #237 detection, as the
+ * gaps it reports.
+ *
+ * Two ways to fail it, and the second matters as much as the first: the span may be too long (the
+ * stand-in could have expired and reaped itself), or it may be UNMEASURED, which is the same ignorance
+ * wearing a cleaner face. An unstamped reading is not evidence that nothing went wrong; it is the
+ * absence of the evidence that would say.
+ */
+function attributionGaps(capture: PtyResidualCapture): string[] {
+  const spawnedAt = capture.spawned?.spawnedAt;
+  if (spawnedAt === undefined || capture.afterTeardownAt === undefined) {
+    return [
+      `${PTY_RESIDUAL_CHECK.workerOutlived}: the after-teardown reading carries no timestamp, so it ` +
+        `cannot be told from one taken after the stand-in worker's own ${WORKER_LIFETIME_MS}ms lifetime ` +
+        `had expired — an unmeasured span is not a short one`,
+    ];
+  }
+  const elapsedMs = Math.round(capture.afterTeardownAt - spawnedAt);
+  if (elapsedMs >= WORKER_LIFETIME_MS) {
+    return [
+      `${PTY_RESIDUAL_CHECK.workerOutlived}: the after-teardown reading landed ${elapsedMs}ms after the ` +
+        `spawn, at or past the stand-in worker's own ${WORKER_LIFETIME_MS}ms lifetime — the child could ` +
+        `have exited on its OWN and been reaped by node-pty on that exit, closing the master fd, so a ` +
+        `LEAKING daemon would read identically here. This teardown is unattributable, not clean`,
+    ];
+  }
+  return [];
 }
 
 // --- the drive (impure) ---
@@ -781,8 +1237,16 @@ export async function drivePtyHandleResidual(config: PtyResidualDriveConfig): Pr
   }
 
   let afterTeardown: HandleReading | undefined;
+  let afterTeardownAt: number | undefined;
   if (teardownDriven && spawned !== undefined && fd !== undefined) {
     afterTeardown = await waitForResidualToSettle(spawned.pid, fd, atLaunch, config.reapTimeoutMs);
+    // Stamped WITH the reading, never apart from it: this is the instant the verdict is about, and the
+    // whole of what makes that verdict attributable to the daemon rather than to the clock (#237). On a
+    // healthy run the settle loop exits the moment the residual is gone, so this lands milliseconds
+    // after the spawn; on a leaking one it lands at the convergence deadline, still far short of the
+    // stand-in's lifetime — and a run slow enough to reach that lifetime is exactly the one this stamp
+    // refuses to let pass as a green.
+    afterTeardownAt = ELAPSED_CLOCK();
   }
 
   return classifyPtyHandleResidual({
@@ -793,6 +1257,7 @@ export async function drivePtyHandleResidual(config: PtyResidualDriveConfig): Pr
     listedStatus,
     atLaunch,
     afterTeardown,
+    afterTeardownAt,
     teardownDriven,
   });
 }

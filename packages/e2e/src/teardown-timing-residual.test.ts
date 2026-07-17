@@ -50,7 +50,11 @@ const GONE: HandleReading = {
 function healthyCycle(index: number, overrides: Partial<TimingCycleCapture> = {}): TimingCycleCapture {
   return {
     index,
-    spawned: { pid: 4242 + index, fd: 12 },
+    // `spawnedAt` is #68's attribution stamp (#237). This oracle carries it because it reuses #68's
+    // observing spawner, but its OWN classifier never reads it: the stop path REPORTS the confound the
+    // stamp exists to catch (an `already-exited` outcome rather than a silent green — module doc), so
+    // there is nothing here for it to decide.
+    spawned: { pid: 4242 + index, fd: 12, spawnedAt: 1_000 + index },
     launchStatus: 201,
     sessionId: `session-${index}`,
     atLaunch: LIVE,
@@ -332,7 +336,7 @@ describe("classifyTeardownTimingResidual (#70) — Rule: rapid teardown leaves N
 
     it("is INCONCLUSIVE when the handle exposes no master fd — a ConPTY has none, so the question cannot be asked", () => {
       const report = classifyTeardownTimingResidual(
-        captureOf({ index: 0, spawned: { pid: 1 }, launchStatus: 201, sessionId: "s" }),
+        captureOf({ index: 0, spawned: { pid: 1, spawnedAt: 1_000 }, launchStatus: 201, sessionId: "s" }),
       );
       expect(report.verdict).toBe("inconclusive");
       expect(report.reason).toContain(TIMING_RESIDUAL_CHECK.masterFd);
