@@ -206,18 +206,38 @@ export function activityText(status, detail) {
 }
 
 /**
+ * The #201 ordering stamp a `worker_status` frame carries (`payload.sequence_num`), or `null` when it
+ * carries none. This is the JOIN key #87 correlates an `AskUserQuestion` enrichment against: the
+ * enrichment (served on the session list, #264) names the block it decorates by `sequenceNum`, and the
+ * block's OWN stamp rides here on the live SSE `worker_status` frame — the options render only when the
+ * two agree (`enrichment.js` `enrichmentMatchesBlock`), so turn-N's options never decorate turn-N+1's
+ * block. Mirrors `@ccctl/core`'s `asWorkerStatusSequence`: a valid stamp is a non-negative safe integer;
+ * ABSENT (an older worker omits it) and MALFORMED both collapse to `null` — "no usable ordering signal",
+ * which the join reads as unknown and fails safe on (render no options rather than possibly-stale ones).
+ *
+ * @param {{ sequence_num?: unknown }} payload - a `worker_status` payload (already a known-status object).
+ * @returns {number | null}
+ */
+function workerStatusSequence(payload) {
+  const value = payload.sequence_num;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
  * Derive the current-turn activity a control event reports, or `null` when it is
- * not a `worker_status` frame.
+ * not a `worker_status` frame. The `sequenceNum` is the block's #201 stamp
+ * ({@link workerStatusSequence}) — `null` when the frame carries none — the key #87
+ * joins an `AskUserQuestion` enrichment's options against.
  *
  * @param {{ subtype: string, payload?: unknown }} event
- * @returns {{ status: string, text: string } | null}
+ * @returns {{ status: string, text: string, sequenceNum: number | null } | null}
  */
 export function activityFromEvent(event) {
   if (!isWorkerStatusEvent(event)) {
     return null;
   }
   const { status, detail } = event.payload;
-  return { status, text: activityText(status, detail) };
+  return { status, text: activityText(status, detail), sequenceNum: workerStatusSequence(event.payload) };
 }
 
 /**
@@ -256,8 +276,9 @@ export function formatTranscriptEntry(event) {
 /**
  * Turn one raw SSE `data:` line into a render instruction the DOM shell applies:
  *
- *   - `{ kind: "activity", status, text }`     — a `worker_status` current turn
- *     (rendered in place, latest wins);
+ *   - `{ kind: "activity", status, text, sequenceNum }` — a `worker_status` current
+ *     turn (rendered in place, latest wins); `sequenceNum` is the block's #201 stamp
+ *     (`null` when absent), the key #87 joins an `AskUserQuestion` enrichment against;
  *   - `{ kind: "transcript", subtype, summary }` — any other control event
  *     (appended to the transcript in order);
  *   - `{ kind: "closed", status, text }`       — the session's terminal frame
@@ -272,7 +293,7 @@ export function formatTranscriptEntry(event) {
  * accepts and the order cannot change any verdict.
  *
  * @param {string} data - one SSE `data:` line.
- * @returns {{ kind: "activity", status: string, text: string }
+ * @returns {{ kind: "activity", status: string, text: string, sequenceNum: number | null }
  *          | { kind: "transcript", subtype: string, summary: string }
  *          | { kind: "closed", status: string, text: string }
  *          | { kind: "unparsed", raw: string }}
@@ -282,7 +303,7 @@ export function processEventData(data) {
   if (decoded.ok) {
     const activity = activityFromEvent(decoded.event);
     if (activity !== null) {
-      return { kind: "activity", status: activity.status, text: activity.text };
+      return { kind: "activity", status: activity.status, text: activity.text, sequenceNum: activity.sequenceNum };
     }
     const entry = formatTranscriptEntry(decoded.event);
     return { kind: "transcript", subtype: entry.subtype, summary: entry.summary };

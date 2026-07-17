@@ -126,6 +126,11 @@ describe("describeCommand", () => {
     expect(describeCommand(approveCommand("tool-9"))).toBe("tool-9");
   });
 
+  it("summarizes an answer (#86) by its chosen labels, across questions", () => {
+    expect(describeCommand(answerCommand(3, { q0: ["Yes"] }))).toBe("Yes");
+    expect(describeCommand(answerCommand(3, { q0: ["A", "B"], q1: ["Left"] }))).toBe("A, B, Left");
+  });
+
   it("summarizes a payload-less approve to the empty string", () => {
     expect(describeCommand(approveCommand())).toBe("");
   });

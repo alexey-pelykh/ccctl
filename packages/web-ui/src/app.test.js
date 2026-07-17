@@ -12,12 +12,16 @@ import { join } from "node:path";
 // against the builder tests. It also keeps the wire VOCABULARY out of this file — `command.js` owns
 // that a redirect goes out as `interrupt` (and `command.test.js` / `@ccctl/e2e` pin it there), so a
 // literal here would be a second copy of a contract this file has no business restating.
-import { approveCommand, inputCommand, redirectCommand } from "./command.js";
+import { answerCommand, approveCommand, inputCommand, redirectCommand } from "./command.js";
 import { launchRequest } from "./launch.js";
 import { stopRequest } from "./stop.js";
 // The INBOUND half of the same rule: `push.js` owns what a service-worker→client navigate looks like
 // (and `push.test.js` pins that decode), so the wiring test below names the type rather than re-spelling it.
 import { NAVIGATE_MESSAGE_TYPE } from "./push.js";
+// The AskUserQuestion surface's decode / join / answer-map contract lives in `enrichment.js`; this file
+// names its ONE user-facing constant — the shortcut-chip set — rather than re-spelling the phrases, the
+// same "assert against the owner, not a copy" rule the command imports above follow.
+import { SHORTCUT_CHIPS } from "./enrichment.js";
 
 // The SHELL, driven against the REAL markup (#199).
 //
@@ -49,6 +53,15 @@ const INDEX_HTML = readFileSync(join(import.meta.dirname, "..", "index.html"), "
 /** A `SessionSummaryWire` row — the `GET /api/sessions` shape, as `sessions.test.js` fixtures it. */
 function summary(id) {
   return { id, status: "ready", activity: { kind: "running" }, notificationsDegraded: false };
+}
+
+/**
+ * A `SessionSummaryWire` row carrying an outstanding AskUserQuestion enrichment (#87): the server serves
+ * `enrichment` on the session list while the session blocks (#264), and `app.js` joins it to the live
+ * block by `sequence_num`. The join key itself arrives on the stream, not here — {@link emitWorkerStatus}.
+ */
+function blocking(id, enrichment) {
+  return { ...summary(id), enrichment };
 }
 
 /**
@@ -210,6 +223,18 @@ async function settle() {
 /** The requests the shell made since the last checkpoint, narrowed to one leg. */
 function requestsTo(predicate) {
   return requests.filter(predicate);
+}
+
+/**
+ * Deliver one `worker_status` frame on the viewed session's stream, the way the server relays the block's
+ * state (#201). Its `payload.sequence_num` is the #201 stamp the enrichment join keys on (#87): a
+ * `requires_action` frame carrying it puts the block "on" that sequence; a `running` frame clears it.
+ */
+function emitWorkerStatus(payload, lastEventId = "1") {
+  FakeEventSource.instances.at(-1).emit("message", {
+    lastEventId,
+    data: JSON.stringify({ type: "control_event", subtype: "worker_status", payload }),
+  });
 }
 
 beforeEach(() => {
@@ -446,5 +471,169 @@ describe("the shell when the viewed session goes away (#199)", () => {
 
     expect(stopStatus.hidden).toBe(false);
     expect(stopStatus.dataset.stop).toBe("stopped");
+  });
+});
+
+// The AskUserQuestion decision surface (#87): the worker's question + options ride the #264 enrichment
+// relay on the session summary; the block's own #201 stamp rides the live `worker_status` frame; and the
+// shell RENDERS the tappable options only when the two join by `sequence_num` (AC5). These drive that join
+// end-to-end through the real shell — the pure decode / join / answer-map is `enrichment.test.js`'s job;
+// this is the wiring the pure suite is structurally blind to (paint, taps, the POSTed answer).
+describe("the AskUserQuestion decision surface (#87)", () => {
+  // One single-select question — answered by a single option tap (`submitsOnTap`), so NO "Send answer".
+  const oneSingleSelect = {
+    sequenceNum: 5,
+    questions: [
+      {
+        questionId: "q0",
+        header: "Lint scope",
+        prompt: "Which lint scope should I run?",
+        multiSelect: false,
+        options: [{ label: "Just the package", description: "faster" }, { label: "The whole repo" }],
+      },
+    ],
+  };
+  // One multi-select question — the operator assembles a selection across taps, then presses Send (AC2).
+  const oneMultiSelect = {
+    sequenceNum: 7,
+    questions: [
+      {
+        questionId: "q0",
+        prompt: "Which checks must pass first?",
+        multiSelect: true,
+        options: [{ label: "lint" }, { label: "build" }, { label: "test" }],
+      },
+    ],
+  };
+
+  it("renders the options as tappable buttons once the enrichment joins the live block (AC1/AC5)", async () => {
+    await loadShell({ sessions: [blocking("sess-1", oneSingleSelect)] });
+    const panel = document.getElementById("needs-you-question");
+    // Until the block's own sequence arrives on the stream the join is unknown, so the panel stays hidden —
+    // fail-safe toward the bare (free-text-steerable) block, never a phantom decision over an unknown turn.
+    expect(panel.hidden, "precondition: no options before the block sequence is known").toBe(true);
+
+    emitWorkerStatus({ status: "requires_action", detail: "Which lint scope?", sequence_num: 5 });
+    await settle();
+
+    expect(panel.hidden).toBe(false);
+    const options = [...panel.querySelectorAll('[data-option="true"]')];
+    expect(options.map((button) => button.dataset.label)).toEqual(["Just the package", "The whole repo"]);
+    // The question's header paints as a heading; each option's optional description rides under its label —
+    // and the option that carries none paints no description node (the `buildOption` branch, both ways).
+    expect(panel.querySelector("h3").textContent).toBe("Lint scope");
+    expect(options[0].querySelector("[data-option-description]").textContent).toBe("faster");
+    expect(options[1].querySelector("[data-option-description]")).toBeNull();
+    // A single single-select question answers on the tap itself, so it offers no separate submit (AC1).
+    expect(panel.querySelector('[data-answer-submit="true"]')).toBeNull();
+    // AC6: the operator is pointed at the real session before acting on the worker-authored labels (ADR-005).
+    expect(panel.querySelector("[data-view-session-note]")).not.toBeNull();
+  });
+
+  it("sends the answer envelope on a single-select option tap (AC1)", async () => {
+    await loadShell({ sessions: [blocking("sess-1", oneSingleSelect)] });
+    const panel = document.getElementById("needs-you-question");
+    emitWorkerStatus({ status: "requires_action", sequence_num: 5 });
+    await settle();
+
+    panel.querySelector('[data-option="true"][data-label="The whole repo"]').click();
+
+    await vi.waitFor(() => {
+      const [answer] = requestsTo((request) => request.path === "/api/sessions/sess-1/command");
+      expect(answer).toBeDefined();
+      // Asserted against the REAL builder: the shell's job is to route the tap into `answerCommand` with the
+      // JOINED `sequence_num` and the chosen label, and POST what it returns intact — exactly this compares.
+      expect(JSON.parse(answer.body)).toEqual(answerCommand(5, { q0: ["The whole repo"] }));
+    });
+    // Answered optimistically — the panel hides at once rather than inviting a double-tap the server 409s.
+    expect(panel.hidden).toBe(true);
+  });
+
+  it("assembles a multi-select answer across taps, then sends it on Send (AC2)", async () => {
+    await loadShell({ sessions: [blocking("sess-1", oneMultiSelect)] });
+    const panel = document.getElementById("needs-you-question");
+    emitWorkerStatus({ status: "requires_action", sequence_num: 7 });
+    await settle();
+
+    const submit = panel.querySelector('[data-answer-submit="true"]');
+    expect(submit.disabled, "precondition: Send is gated until the selection is a valid answer").toBe(true);
+
+    panel.querySelector('[data-option="true"][data-label="lint"]').click();
+    panel.querySelector('[data-option="true"][data-label="build"]').click();
+
+    // The second tap ADDS to the selection rather than replacing it (AC2), and each is reflected for a
+    // screen reader via `aria-pressed` — the multi-select is a checkbox group, not a radio.
+    expect(panel.querySelector('[data-label="lint"]').getAttribute("aria-pressed")).toBe("true");
+    expect(panel.querySelector('[data-label="build"]').getAttribute("aria-pressed")).toBe("true");
+    expect(submit.disabled).toBe(false);
+
+    submit.click();
+
+    await vi.waitFor(() => {
+      const [answer] = requestsTo((request) => request.path === "/api/sessions/sess-1/command");
+      expect(answer).toBeDefined();
+      // Both chosen labels, in tap order, under the one question id — the whole envelope in one answer (#86).
+      expect(JSON.parse(answer.body)).toEqual(answerCommand(7, { q0: ["lint", "build"] }));
+    });
+    expect(panel.hidden).toBe(true);
+  });
+
+  it("DISCARDS a stale-turn enrichment against a moved-on block — turn-N options never over turn-N+1 (AC5)", async () => {
+    await loadShell({ sessions: [blocking("sess-1", oneSingleSelect)] }); // enrichment decorates sequence 5
+    const panel = document.getElementById("needs-you-question");
+
+    emitWorkerStatus({ status: "requires_action", detail: "a DIFFERENT question", sequence_num: 6 });
+    await settle();
+
+    // The block is on sequence 6; the buffered enrichment decorates sequence 5 → discard it, panel hidden.
+    expect(panel.hidden).toBe(true);
+    expect(panel.querySelectorAll('[data-option="true"]')).toHaveLength(0);
+    // And nothing can be answered against a question the operator was never shown.
+    expect(requestsTo((request) => request.path === "/api/sessions/sess-1/command")).toEqual([]);
+  });
+
+  it("keeps the options hidden while the block carries no sequence stamp — the join is unknown (AC5)", async () => {
+    await loadShell({ sessions: [blocking("sess-1", oneSingleSelect)] });
+    const panel = document.getElementById("needs-you-question");
+
+    // A `requires_action` frame with no #201 stamp: the join key is unknown, so fail safe on the bare block.
+    emitWorkerStatus({ status: "requires_action", detail: "no stamp" });
+    await settle();
+
+    expect(panel.hidden).toBe(true);
+    expect(panel.querySelectorAll('[data-option="true"]')).toHaveLength(0);
+  });
+
+  it("tears the panel down when the block clears — the decision is moot once the turn resumes (AC5)", async () => {
+    await loadShell({ sessions: [blocking("sess-1", oneSingleSelect)] });
+    const panel = document.getElementById("needs-you-question");
+    emitWorkerStatus({ status: "requires_action", sequence_num: 5 });
+    await settle();
+    expect(panel.hidden, "precondition: the options are on screen").toBe(false);
+
+    // The worker moved off the block (running again); the tappable options must not outlive the block.
+    emitWorkerStatus({ status: "running" }, "2");
+    await settle();
+
+    expect(panel.hidden).toBe(true);
+    expect(panel.querySelectorAll('[data-option="true"]')).toHaveLength(0);
+  });
+
+  it("inserts a shortcut phrase into the free-text steer input, non-destructively (AC3/AC4)", async () => {
+    await loadShell({ sessions: [summary("sess-1")] });
+    const input = document.getElementById("prompt-input");
+    const chips = [...document.getElementById("shortcut-chips").querySelectorAll('[data-chip="true"]')];
+
+    // The chip row IS the `SHORTCUT_CHIPS` set — the single configurable list, rendered verbatim.
+    expect(chips.map((chip) => chip.textContent)).toEqual(SHORTCUT_CHIPS);
+
+    chips[0].click();
+    expect(input.value).toBe(SHORTCUT_CHIPS[0]);
+
+    // A chip APPENDS to whatever the operator already typed rather than replacing it — free-text steering
+    // stays fully available alongside the chips (AC4), and the existing prompt-form test proves it still sends.
+    input.value = "hold on";
+    chips[2].click();
+    expect(input.value).toBe(`hold on ${SHORTCUT_CHIPS[2]}`);
   });
 });

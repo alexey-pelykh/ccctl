@@ -166,8 +166,9 @@ export function answerCommand(sequenceNum, answers) {
 
 /**
  * One-line summary of a steer command, for echoing the sent steer into the viewed
- * transcript. Pulls the salient field per verb (`text` / `reason` / `toolUseId`);
- * a payload-less approve summarizes to the empty string.
+ * transcript (and labelling a queued steer row). Pulls the salient field per verb
+ * (`text` / `reason` / `toolUseId`, or an `answer`'s chosen labels); a payload-less
+ * approve summarizes to the empty string.
  *
  * @param {{ subtype: string, payload?: Record<string, unknown> }} command
  * @returns {string}
@@ -185,6 +186,14 @@ export function describeCommand(command) {
   }
   if (typeof payload.toolUseId === "string") {
     return payload.toolUseId;
+  }
+  // An `answer` (#86) carries `answers: { [questionId]: string[] }` — summarize the chosen labels, so an
+  // echoed / queued answer reads as what the operator picked rather than a bare "answer".
+  if (typeof payload.answers === "object" && payload.answers !== null && !Array.isArray(payload.answers)) {
+    return Object.values(payload.answers)
+      .flat()
+      .filter((label) => typeof label === "string")
+      .join(", ");
   }
   return "";
 }

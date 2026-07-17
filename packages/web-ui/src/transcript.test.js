@@ -93,14 +93,40 @@ describe("activityText", () => {
 });
 
 describe("activityFromEvent", () => {
-  it("derives the activity of a worker_status frame", () => {
+  it("derives the activity of a worker_status frame (sequenceNum null when the frame carries none)", () => {
     expect(activityFromEvent({ subtype: WORKER_STATUS_SUBTYPE, payload: { status: "running" } })).toEqual({
       status: "running",
       text: "Running…",
+      sequenceNum: null,
     });
     expect(
       activityFromEvent({ subtype: WORKER_STATUS_SUBTYPE, payload: { status: "requires_action", detail: "Pick one" } }),
-    ).toEqual({ status: "requires_action", text: "Pick one" });
+    ).toEqual({ status: "requires_action", text: "Pick one", sequenceNum: null });
+  });
+
+  it("carries the block's #201 sequence_num (the #87 enrichment join key) when present", () => {
+    expect(
+      activityFromEvent({
+        subtype: WORKER_STATUS_SUBTYPE,
+        payload: { status: "requires_action", detail: "Pick one", sequence_num: 7 },
+      }),
+    ).toEqual({ status: "requires_action", text: "Pick one", sequenceNum: 7 });
+    // Sequence 0 is the first stamp of an epoch — a real value, not "absent".
+    expect(
+      activityFromEvent({ subtype: WORKER_STATUS_SUBTYPE, payload: { status: "requires_action", sequence_num: 0 } })
+        .sequenceNum,
+    ).toBe(0);
+  });
+
+  it("reads a malformed sequence_num as null (no usable ordering signal — the join then fails safe)", () => {
+    for (const bad of [-1, 1.5, "7", Number.NaN, null]) {
+      expect(
+        activityFromEvent({
+          subtype: WORKER_STATUS_SUBTYPE,
+          payload: { status: "requires_action", sequence_num: bad },
+        }).sequenceNum,
+      ).toBeNull();
+    }
   });
 
   it("returns null for a non-worker_status event", () => {
@@ -138,14 +164,24 @@ describe("formatTranscriptEntry", () => {
 });
 
 describe("processEventData", () => {
-  it("routes a worker_status frame to an activity instruction", () => {
+  it("routes a worker_status frame to an activity instruction (carrying its sequenceNum, #87 join key)", () => {
     expect(
       processEventData(line({ type: "control_event", subtype: "worker_status", payload: { status: "idle" } })),
     ).toEqual({
       kind: "activity",
       status: "idle",
       text: "Idle",
+      sequenceNum: null,
     });
+    expect(
+      processEventData(
+        line({
+          type: "control_event",
+          subtype: "worker_status",
+          payload: { status: "requires_action", detail: "Pick one", sequence_num: 9 },
+        }),
+      ),
+    ).toEqual({ kind: "activity", status: "requires_action", text: "Pick one", sequenceNum: 9 });
   });
 
   it("routes any other control event to a transcript instruction", () => {

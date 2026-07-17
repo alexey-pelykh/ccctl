@@ -73,6 +73,101 @@
       #activity[data-status="requires_action"] {
         color: #b45309;
       }
+      /* The AskUserQuestion decision panel (#87): rendered when the session blocks on a question, its
+         options as tappable buttons. Amber — the page's requires_action / attention hue — with a thick
+         left accent so it reads as the thing to act on, sitting above the transcript. */
+      #needs-you-question {
+        margin: 0.5rem 0;
+        padding: 0.5rem 0.75rem;
+        border: 1px solid #f59e0b;
+        border-left-width: 4px;
+        border-radius: 0.25rem;
+        background: #fffbeb;
+      }
+      /* The "review the transcript before answering" note (#87 AC6) — muted, since the actionable content
+         is the question + options below it. */
+      #needs-you-question [data-view-session-note] {
+        margin: 0 0 0.5rem;
+        color: #b45309;
+        font-size: 0.85rem;
+      }
+      #needs-you-question [data-question] {
+        margin-bottom: 0.75rem;
+      }
+      #needs-you-question h3 {
+        margin: 0 0 0.25rem;
+        font-size: 0.95rem;
+      }
+      #needs-you-question [data-question-prompt] {
+        margin: 0 0 0.5rem;
+        font-weight: 600;
+      }
+      #needs-you-question [data-options] {
+        display: flex;
+        flex-direction: column;
+        gap: 0.4rem;
+      }
+      /* Each option is a full-width tappable button (label + optional sub-text); a chosen one
+         (aria-pressed) fills amber so the selection reads at a glance, sighted or via the pressed state. */
+      #needs-you-question button[data-option] {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.1rem;
+        width: 100%;
+        text-align: left;
+        cursor: pointer;
+        padding: 0.4rem 0.6rem;
+        border: 1px solid #f59e0b;
+        border-radius: 0.25rem;
+        background: #fff;
+      }
+      #needs-you-question button[data-option][aria-pressed="true"] {
+        color: #fff;
+        background: #b45309;
+        border-color: #b45309;
+      }
+      #needs-you-question [data-option-label] {
+        font-weight: 600;
+      }
+      #needs-you-question [data-option-description] {
+        font-size: 0.8rem;
+        opacity: 0.85;
+      }
+      /* The multi-select / multi-question submit — filled amber, disabled until the answer is complete. */
+      #needs-you-question button[data-answer-submit] {
+        margin-top: 0.25rem;
+        cursor: pointer;
+        padding: 0.4rem 0.8rem;
+        font-weight: 600;
+        color: #fff;
+        background: #b45309;
+        border: 1px solid #b45309;
+        border-radius: 0.25rem;
+      }
+      #needs-you-question button[data-answer-submit]:disabled {
+        cursor: not-allowed;
+        color: #999;
+        background: #fff;
+        border-color: #ddd;
+      }
+      /* The shortcut-phrase chips (#87 AC3): a wrapping row of small tappable replies below the prompt
+         input, in a neutral pill styling (they feed the EXISTING free-text steer, so they read as an
+         input affordance, not a destructive control). */
+      #shortcut-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+        margin-top: 0.4rem;
+      }
+      #shortcut-chips button[data-chip] {
+        cursor: pointer;
+        padding: 0.2rem 0.7rem;
+        font-size: 0.85rem;
+        border: 1px solid #ccc;
+        border-radius: 1rem;
+        background: #f9fafb;
+      }
       #session-list {
         list-style: none;
         padding: 0;
@@ -321,12 +416,15 @@
       .steer-form input,
       .steer-form button,
       #approve-button,
+      #needs-you-question button[data-option],
+      #needs-you-question button[data-answer-submit],
       #stop-button,
       #enable-push {
         min-height: 2.75rem;
       }
       #stop-force-button,
       #device-list li button[data-revoke="true"],
+      #shortcut-chips button[data-chip],
       #steer-queue [data-queue-cancel],
       #steer-queue [data-queue-send] {
         min-height: 2rem;
@@ -422,6 +520,16 @@
           <section id="status" aria-live="polite">no session selected</section>
           <!-- The session's current turn (worker_status); revealed on the first frame. -->
           <section id="activity" aria-live="polite" hidden></section>
+          <!-- ASKUSERQUESTION DECISION PANEL (#87, UI-B-009): when the session blocks on an
+           `AskUserQuestion`, the worker's question + options ride the server-served enrichment relay
+           (#264) and render here as TAPPABLE buttons — so the operator decides with a tap instead of
+           typing (AC1). A multi-select / multi-question envelope assembles a selection and Sends (AC2);
+           the answer rides the #86 `answer` verb. `app.js` paints this from the viewed session's summary,
+           JOINED on `sequence_num` against the live block so turn-N's options never decorate turn-N+1's
+           block (AC5); the transcript below stays the "view the full session before answering" path (AC6),
+           since a possibly-ungated worker authored the labels. `src/enrichment.js` owns the pure
+           decode / join / answer-building decisions; this section is painted, hidden until a match. -->
+          <section id="needs-you-question" aria-live="polite" hidden></section>
           <h2>Transcript</h2>
           <ul id="events" aria-live="polite"></ul>
           <!-- Upstream steer controls (#16): input / redirect / approve. Each POSTs a
@@ -430,6 +538,11 @@
             <input id="prompt-input" name="prompt" type="text" autocomplete="off" placeholder="Send to session…" />
             <button type="submit">Send</button>
           </form>
+          <!-- SHORTCUT-PHRASE CHIPS (#87 AC3): a row of common steering replies; each INSERTS its phrase
+           into the free-text steer input above on tap (appended, non-destructive), so a routine reply is a
+           tap rather than a typed sentence — free text stays fully available beside them (AC4). `app.js`
+           paints these from the editable `SHORTCUT_CHIPS` list in `src/enrichment.js`. -->
+          <div id="shortcut-chips" aria-label="Shortcut replies"></div>
           <form id="redirect-form" class="steer-form">
             <input
               id="redirect-input"
