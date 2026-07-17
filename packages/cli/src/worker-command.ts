@@ -77,16 +77,31 @@ export function resolveClaudeBin(env: NodeJS.ProcessEnv = process.env): string {
  * {@link resolveClaudeBin}); the trailing flags are the issue's pinned shape:
  *
  *   `<claudeBin> remote-control --name <name> --permission-mode <mode> --spawn=same-dir`
+ *   `  [--settings <path>]`
  *
  * `--name` is the launch's {@link SessionLaunchOptions.project} label (or {@link
  * DEFAULT_WORKER_NAME} when unset); `--permission-mode` is the pinned {@link
  * https://ccctl | PermissionMode} the launch runs under; `--spawn=same-dir` (one token,
  * as the issue writes it) skips the interactive spawn-mode prompt a non-interactive
- * launcher would stall on. Pure over its inputs so the exact argv is unit-testable.
+ * launcher would stall on. `--settings <path>` is APPENDED, trailing, only when
+ * {@link SessionLaunchOptions.settingsPath} is set (#262, #78 Option A) — the daemon-owned
+ * settings file wiring the `AskUserQuestion` `PreToolUse` hook; its absence leaves the argv
+ * byte-for-byte the pre-#262 shape, so every launch that does not install a hook (a test
+ * launcher, an opted-out mode) is unaffected. Pure over its inputs so the exact argv — with and
+ * without `--settings` — is unit-testable.
  */
 export function buildWorkerCommand(claudeBin: string, options: SessionLaunchOptions): readonly string[] {
   const name = options.project ?? DEFAULT_WORKER_NAME;
-  return [claudeBin, "remote-control", "--name", name, "--permission-mode", options.permissionMode, "--spawn=same-dir"];
+  const base = [
+    claudeBin,
+    "remote-control",
+    "--name",
+    name,
+    "--permission-mode",
+    options.permissionMode,
+    "--spawn=same-dir",
+  ];
+  return options.settingsPath === undefined ? base : [...base, "--settings", options.settingsPath];
 }
 
 /**

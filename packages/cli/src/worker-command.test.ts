@@ -90,6 +90,38 @@ describe("buildWorkerCommand — emits the remote-control subcommand argv (#157)
       expect(argv[argv.indexOf("--permission-mode") + 1]).toBe(mode);
     }
   });
+
+  // The `AskUserQuestion` hook wiring (#262, #78 Option A): `--settings <path>` is APPENDED, trailing,
+  // only when the launch's `settingsPath` is set — the daemon-owned settings file the launch-time
+  // installer wrote (`hook-settings-installer.ts`), never a value the CLI itself constructs.
+  it("appends `--settings <path>` as a trailing pair when settingsPath is set", () => {
+    const argv = buildWorkerCommand("claude", { ...base, settingsPath: "/state/hooks/tok.settings.json" });
+
+    expect(argv).toEqual([
+      "claude",
+      "remote-control",
+      "--name",
+      DEFAULT_WORKER_NAME,
+      "--permission-mode",
+      "default",
+      "--spawn=same-dir",
+      "--settings",
+      "/state/hooks/tok.settings.json",
+    ]);
+  });
+
+  it("omits --settings entirely when settingsPath is absent — the pre-#262 argv shape, byte-for-byte", () => {
+    expect(buildWorkerCommand("claude", base)).toEqual([
+      "claude",
+      "remote-control",
+      "--name",
+      DEFAULT_WORKER_NAME,
+      "--permission-mode",
+      "default",
+      "--spawn=same-dir",
+    ]);
+    expect(buildWorkerCommand("claude", base)).not.toContain("--settings");
+  });
 });
 
 describe("defaultWorkerCommand — resolves the binary from the environment at launch time", () => {
@@ -196,5 +228,29 @@ describe("wired through the tmux launcher — the argv the daemon actually execs
     await launcher.launch(options);
 
     expect(newWindowWorkerArgv(calls)[0]).toBe("/opt/ccctl/claude-patched");
+  });
+
+  it("execs `--settings <path>` trailing when the launch carries a settingsPath (#262)", async () => {
+    Reflect.deleteProperty(process.env, CLAUDE_BIN_ENV);
+    const { runner, calls } = recordingRunner();
+    const launcher = createTmuxSessionLauncher({
+      workerCommand: defaultWorkerCommand,
+      runner,
+      workerBinaryProbe: () => true,
+    });
+
+    await launcher.launch({ ...options, settingsPath: "/state/hooks/tok.settings.json" });
+
+    expect(newWindowWorkerArgv(calls)).toEqual([
+      "claude",
+      "remote-control",
+      "--name",
+      "oracle",
+      "--permission-mode",
+      "default",
+      "--spawn=same-dir",
+      "--settings",
+      "/state/hooks/tok.settings.json",
+    ]);
   });
 });

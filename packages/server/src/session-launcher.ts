@@ -57,6 +57,16 @@ export interface SessionLaunchOptions {
    * the operator will drive by hand.
    */
   readonly initialPrompt?: string;
+  /**
+   * Optional path to a daemon-owned settings JSON file, passed to the worker as
+   * `--settings <path>` (#262, #78 Option A) — a REAL, currently-shipping Claude Code CLI flag
+   * ("Path to a settings JSON file … to load additional settings from"), confirmed via
+   * `claude --help`. Wires the `AskUserQuestion` `PreToolUse` hook (`hook-settings-installer.ts`)
+   * for this ONE launch without touching the operator's own project `.claude/settings.json`.
+   * Absent when the caller did not install a hook settings file for this launch (e.g. a test
+   * launcher, or a future launch mode that opts out).
+   */
+  readonly settingsPath?: string;
 }
 
 /**

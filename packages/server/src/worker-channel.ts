@@ -92,7 +92,9 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { readFileSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { dirname } from "node:path";
 import {
   applyWorkerStatus,
   applyWorkerStatusFrame,
@@ -114,6 +116,7 @@ import {
   type Session,
 } from "@ccctl/core";
 import { broadcastEvent, type SessionEventRelays } from "./event-stream.js";
+import { type HookInstall } from "./hook-settings-installer.js";
 import { readJsonBody, writeError, writeJson } from "./http-response.js";
 import { closeSession } from "./session-close.js";
 
@@ -377,6 +380,18 @@ export interface WorkerChannelState extends WorkerChannelReapState {
    * {@link Session.activity}, so it structurally cannot set or clear the #40 needs-you signal.
    */
   readonly requiresActionEnrichments: Map<string, RequiresActionEnrichment>;
+  /**
+   * A launch's `AskUserQuestion` hook install record (#262, #78 Option A), keyed by ccctl session id —
+   * where its settings file landed and where its hook writes a captured payload. Populated by
+   * `ui-session-launch.ts` § `launchSession` right after a launch succeeds; consumed exactly once by
+   * {@link reconcileHookHandoff} at the moment it observes THIS session's transition into
+   * `requires_action`. A session with no entry here (a launch whose hook install failed and degraded,
+   * or a test fixture that never wires one) simply gets no `AskUserQuestion` enrichment — same as
+   * before this issue shipped. NOT the same map as {@link requiresActionEnrichments} above: that one
+   * holds a PARSED, validated enrichment already correlated to a block; this one holds raw file paths,
+   * for a block that may not even exist yet.
+   */
+  readonly hookInstalls: Map<string, HookInstall>;
   /**
    * The structured-log sink (#61) — the worker channel is where the daemon's stall signals live:
    * `ready` transitions, `worker_status` activity changes, staleness, and the needs-you / idle
@@ -739,6 +754,151 @@ function reconcileEnrichmentBuffer(state: WorkerChannelState, sessionId: string,
   }
 }
 
+/** Hard ceiling on a hook handoff file's byte size (#262) — pre-parse, mirroring {@link MAX_WORKER_BODY_BYTES}'s
+ * role for the HTTP legs; a raw file read has no equivalent cap otherwise (security-architect consult). */
+const MAX_HOOK_HANDOFF_BYTES = 1024 * 1024;
+
+/** Best-effort delete — swallows any error (already gone, never written). Matches the hook's own fail-open stance. */
+function unlinkQuietly(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // Already gone, or never written (e.g. the hook never fired) — either way, nothing to report.
+  }
+}
+
+/**
+ * Extract the raw, UNVALIDATED `questions` value from a decoded handoff file's parsed JSON, or
+ * `undefined` when it does not even have the right outer shape. Deliberately NOT validation — as with
+ * `ask-user-question-hook.ts` § `extractAskUserQuestionPayload`, {@link requiresActionEnrichmentFromValue}
+ * is the one place the real shape is enforced, reached via {@link bufferInputRequestEnrichment} below.
+ */
+function extractHandoffQuestions(parsed: unknown): unknown {
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return undefined;
+  }
+  return (parsed as { questions?: unknown }).questions;
+}
+
+/**
+ * Read, validate, and CONSUME (delete) a hook's handoff file — the same-host local-file hand-off
+ * `ask-user-question-hook.ts` writes to (#262, #78 Option A). Returns the raw, UNVALIDATED `questions`
+ * value the hook captured, or `undefined` for every non-happy path: no file (the hook has not fired yet —
+ * the ordinary case for a launch with no `AskUserQuestion` call), a symlink escaping the hook state
+ * directory (refused before any read — see below), an oversized file, or malformed JSON. `undefined` means
+ * exactly what it means everywhere else in this pipeline: "nothing captured", never an error — this
+ * hand-off is decoration, and losing it must never touch the native block.
+ *
+ * **The symlink guard.** `ask-user-question-hook.ts`'s atomic write (temp file in the SAME directory +
+ * `rename`) can only ever leave a REGULAR file at `handoffPath` — `rename(2)` replaces the destination
+ * directory entry with the source's, so even a destination that used to be a symlink becomes a regular
+ * file after a legitimate hook write. So a symlink found AT `handoffPath` at read time did not come from
+ * the hook; something else placed it — and since the ccctl SERVER process is what eventually reads
+ * whatever this resolves to (and broadcasts it, verbatim, onto the session's UI stream), an unguarded read
+ * would turn a planted symlink into an arbitrary-file-read-and-leak primitive. The guard: resolve BOTH the
+ * target ({@link realpathSync}`.native`) and its expected parent (the hook state directory, which
+ * `installAskUserQuestionHookSettings` always creates ahead of any hook run) and require the first's
+ * directory to equal the second — the same `realpathSync.native` idiom `pending-launch.ts` §
+ * `resolveLaunchCwd` uses for its own launch pre-flight, applied here to a read instead of a launch. A
+ * missing file (`ENOENT` — the hook has not fired yet) is the ordinary case, not a guard failure.
+ */
+function consumeHookHandoffQuestions(handoffPath: string): unknown {
+  let resolvedPath: string;
+  let resolvedDir: string;
+  try {
+    resolvedPath = realpathSync.native(handoffPath);
+    resolvedDir = realpathSync.native(dirname(handoffPath));
+  } catch {
+    return undefined;
+  }
+  if (dirname(resolvedPath) !== resolvedDir) {
+    // A symlink (or a traversal component) redirected `handoffPath` outside the hook state directory a
+    // legitimate hook write can never produce — refuse to read it, but still remove the planted entry.
+    unlinkQuietly(handoffPath);
+    return undefined;
+  }
+  let size: number;
+  try {
+    size = statSync(resolvedPath).size;
+  } catch {
+    return undefined;
+  }
+  if (size > MAX_HOOK_HANDOFF_BYTES) {
+    // Refuse BEFORE `JSON.parse` — `requiresActionEnrichmentFromValue` caps text length only AFTER
+    // parsing; a raw file read has no equivalent cap otherwise.
+    unlinkQuietly(handoffPath);
+    return undefined;
+  }
+  try {
+    const raw = readFileSync(resolvedPath, "utf8");
+    // Strip a leading BOM (U+FEFF) explicitly by code point — `JSON.parse` rejects it otherwise.
+    const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+    const parsed: unknown = JSON.parse(text);
+    return extractHandoffQuestions(parsed);
+  } catch {
+    return undefined;
+  } finally {
+    // Consume-once: remove the file the moment it's been read, successfully or not, so a stale capture
+    // from an earlier `AskUserQuestion` in the same long-running session can never be replayed against a
+    // LATER, unrelated `requires_action` transition (the "#86 phantom decision" hazard).
+    unlinkQuietly(handoffPath);
+  }
+}
+
+/**
+ * Correlate a hook-captured `AskUserQuestion` payload into the SAME `input_request` enrichment pipeline
+ * #264 built (#262, #78 Option A) — fired exactly at the moment a `worker_status` transition is OBSERVED
+ * to move a session INTO `requires_action`, on EITHER status leg (mirrors {@link reconcileNeedsInput} /
+ * {@link reconcileIdleTimer}: one derivation, both legs).
+ *
+ * **Why here, and not on the hook's own write.** The hook (`PreToolUse`) fires BEFORE the tool executes —
+ * before the corresponding `requires_action` transition even exists — so its handoff file may already sit
+ * on disk well before this reconcile ever runs. Reading it eagerly (on a timer, or on file creation) would
+ * correlate it to whatever `requires_action` transition happens to be current at THAT moment, which is not
+ * necessarily the one it decorates — the "#86 phantom decision" staleness this codebase's docs warn about
+ * elsewhere. Instead: only at the instant THIS transition is observed, stamp the capture with THIS
+ * transition's own `sequence_num` (the hook itself never could — it runs before that number exists), so
+ * the enrichment is tied to the exact block it decorates.
+ *
+ * A transition to any OTHER activity (including a re-affirmed `requires_action`) is a no-op — the guard
+ * fires only on a prior-NOT-awaited → next-awaited edge, the same transition shape
+ * {@link reconcileNeedsInput} keys on. No `hookInstalls` entry for this session (a launch whose hook
+ * install failed and degraded, or a test fixture that never wires one) is ALSO a no-op. Either way,
+ * {@link consumeHookHandoffQuestions} returning `undefined` (no fresh capture) is the ordinary case, not
+ * an error, and this function does nothing further.
+ *
+ * The synthesized frame is fed through the EXISTING #264 pipeline ({@link bufferInputRequestEnrichment})
+ * rather than duplicating its validation: this function's entire job is producing a well-formed
+ * `input_request`-shaped {@link ControlFrame} stamped with a REAL `sequence_num` — every
+ * length/cardinality/shape guard from #261's `requiresActionEnrichmentFromValue` still applies exactly as
+ * it does to a worker-emitted frame.
+ */
+function reconcileHookHandoff(
+  state: WorkerChannelState,
+  sessionId: string,
+  prior: Session,
+  next: Session,
+  sequence: number | null,
+): void {
+  if (isInputAwaited(prior.activity) || !isInputAwaited(next.activity) || sequence === null) {
+    return;
+  }
+  const install = state.hookInstalls.get(sessionId);
+  if (install === undefined) {
+    return;
+  }
+  const questions = consumeHookHandoffQuestions(install.handoffPath);
+  if (questions === undefined) {
+    return;
+  }
+  const frame: ControlFrame = {
+    type: "control_event",
+    subtype: "input_request",
+    payload: { sequence_num: sequence, questions },
+  };
+  bufferInputRequestEnrichment(state, sessionId, frame);
+}
+
 /**
  * Fold a §5 payload into the session's classification when it is a `worker_status` frame
  * (#39). This is the leg that carries the RICH frame — `payload: { status, detail }` — so it
@@ -810,6 +970,9 @@ function foldWorkerStatus(
     // is gone, so its question must not be re-served against whatever it moved to. A no-op while the block
     // persists (a re-affirmation) and when there is nothing buffered.
     reconcileEnrichmentBuffer(state, sessionId, next);
+    // ... and correlate a hook-captured `AskUserQuestion` payload (#262) on the SAME transition INTO
+    // `requires_action` this reconcile family already keys on — one derivation, one more consumer.
+    reconcileHookHandoff(state, sessionId, session, next, sequence);
   }
   return false;
 }
@@ -900,6 +1063,9 @@ export function handleWorkerStatus(
       // ... and drop the buffered enrichment (#264) if this bare status moved the session off
       // `requires_action` — one derivation governs both legs, exactly as the reconciles above.
       reconcileEnrichmentBuffer(state, sessionId, next);
+      // ... and the same hook-handoff correlation (#262) — one derivation, both legs, exactly as the
+      // reconciles above.
+      reconcileHookHandoff(state, sessionId, session, next, sequence);
     }
     writeJson(res, 200, {});
   });

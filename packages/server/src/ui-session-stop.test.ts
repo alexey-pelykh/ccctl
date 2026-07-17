@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
+import { mkdtempSync, rmSync } from "node:fs";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { join } from "node:path";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { SESSIONS_PATH, workerEventsStreamPath, workerRegisterPath } from "@ccctl/core";
 import { DEFAULT_HOST, startServer, type CcctlServer, type ServerConfig } from "./index.js";
 import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions, SurfaceLiveness } from "./session-launcher.js";
+import { XDG_STATE_HOME_ENV } from "./session-store-file.js";
 import { isStopFailureCode, STOP_FAILURE_CODES } from "./ui-session-stop.js";
 
 // The EMERGENCY-STOP path (#76), exercised END TO END through the wired server: a real HTTP
@@ -22,6 +25,31 @@ import { isStopFailureCode, STOP_FAILURE_CODES } from "./ui-session-stop.js";
 /** Two REAL directories — the launch pre-flight rejects a cwd that does not exist, so a test cwd must. */
 const CWD = process.cwd();
 const OTHER_CWD = tmpdir();
+
+/**
+ * A disposable directory THIS FILE's `AskUserQuestion` hook installs are routed to, via
+ * `XDG_STATE_HOME` (#262) — mirrors `ui-session-launch.test.ts`'s own fixture. Every launch driven
+ * below runs through the REAL, wired `launchSession`, which installs a REAL hook (synchronous,
+ * best-effort, never mocked out); without this override every run of this suite would write
+ * settings/handoff files under the developer's own `~/.local/state/ccctl/hooks`.
+ */
+let hookStateRoot = "";
+let previousXdgStateHome: string | undefined;
+
+beforeAll(() => {
+  hookStateRoot = mkdtempSync(join(tmpdir(), "ccctl-hook-state-"));
+  previousXdgStateHome = process.env[XDG_STATE_HOME_ENV];
+  process.env[XDG_STATE_HOME_ENV] = hookStateRoot;
+});
+
+afterAll(() => {
+  if (previousXdgStateHome === undefined) {
+    Reflect.deleteProperty(process.env, XDG_STATE_HOME_ENV);
+  } else {
+    process.env[XDG_STATE_HOME_ENV] = previousXdgStateHome;
+  }
+  rmSync(hookStateRoot, { recursive: true, force: true });
+});
 
 /**
  * A recording fake launcher. Every handle it hands out reports the launcher's CURRENT `liveness`, so a

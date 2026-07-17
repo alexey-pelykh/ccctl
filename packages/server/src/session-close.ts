@@ -72,6 +72,7 @@ import {
   type SessionStatus,
 } from "@ccctl/core";
 import { broadcastEvent, closeSessionRelay, type SessionEventRelays } from "./event-stream.js";
+import { cleanupHookInstall, type HookInstall } from "./hook-settings-installer.js";
 
 /**
  * The `type` discriminant of the TERMINAL frame (#196) this seam broadcasts onto a session's UI stream
@@ -146,6 +147,15 @@ export interface SessionCloseState {
    * bounded but real per-closed-session leak, exactly the kind {@link closeSessionRelay} exists to prevent.
    */
   readonly requiresActionEnrichments: Map<string, RequiresActionEnrichment>;
+  /**
+   * A launch's `AskUserQuestion` hook install record (#262, #78 Option A), keyed by ccctl session id —
+   * cleaned up here whether or not it was ever consumed by `worker-channel.ts` § `reconcileHookHandoff`.
+   * A session that closes with a handoff file still unread (no `AskUserQuestion` was ever asked, or one
+   * was asked but never correlated before the session ended) would otherwise leave its settings + handoff
+   * files on disk for the daemon's life — the same per-closed-session leak {@link requiresActionEnrichments}
+   * above exists to prevent for its own map.
+   */
+  readonly hookInstalls: Map<string, HookInstall>;
   /** The structured-log sink (#61) — every session death is emitted here, so a created-but-never-closed leak is diagnosable. */
   readonly logger: Logger;
 }
@@ -204,6 +214,15 @@ export function closeSession(state: SessionCloseState, sessionId: string): Sessi
   // never trips the transition-out drop (close moves `status`, not `activity`), so this is where that
   // decoration is reaped. A no-op when nothing is buffered (`Map.delete` of an absent key).
   state.requiresActionEnrichments.delete(sessionId);
+  // Clean up this session's `AskUserQuestion` hook install (#262) — its settings + handoff files —
+  // whether or not the handoff was ever consumed. A no-op (both `cleanupHookInstall` and `Map.delete`
+  // tolerate an absent entry) for a session whose hook install failed at launch, or one that never had
+  // an `AskUserQuestion` call at all.
+  const hookInstall = state.hookInstalls.get(sessionId);
+  if (hookInstall !== undefined) {
+    cleanupHookInstall(hookInstall);
+    state.hookInstalls.delete(sessionId);
+  }
   // The one terminal-transition log (#61): every session death — a #173 eviction or a #76 stop —
   // funnels through here, so a `created` with no matching `closed` is a leaked slot the trail exposes.
   // `markSessionClosed` preserves an `errored` status, so the terminal `status` here is the diagnosis
