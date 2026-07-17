@@ -23,12 +23,33 @@
  * expects to reach for. No HTTP route is added — so nothing here can front-run the deferred
  * per-request local-server-auth boundary (#57/#58).
  *
- * **Graceful, not a hard exit.** On the first signal it drives `CcctlServer.close` — which
- * settles held work-polls, ends every SSE stream, and releases every terminal this server launched
- * (a taken-over one is left running for the operator, #35/#76) — and THEN exits `0`. A second signal
- * while that close is still in flight means the operator is insisting: it stops waiting and force-exits
- * (`1`), so a wedged teardown can never trap them. A close that REJECTS is recorded on the #61 trail as
- * an `error`/`shutdown-failed` line and force-exits `1` — a failed graceful stop still stops.
+ * **Graceful, not a hard exit.** On the first signal it drives `CcctlServer.close` — which settles held
+ * work-polls, ends every SSE stream, and releases every terminal this server launched (a taken-over one
+ * is left running for the operator, #35/#76) — then releases the tunnel (below), and THEN exits `0`. A
+ * second signal while that is still in flight means the operator is insisting: it stops waiting and
+ * force-exits (`1`), so a wedged teardown can never trap them. A close that REJECTS is recorded on the
+ * #61 trail as an `error`/`shutdown-failed` line and force-exits `1` — a failed graceful stop still stops.
+ *
+ * **The tunnel goes after the close, and is time-boxed (#242).** A daemon exposed through a tunnel
+ * (`ccctl serve --tunnel`) owns that tunnel's lifetime, so it owns its teardown: the daemon is the only
+ * thing that knows when the session is over. Without this the daemon closed and left the mapping (and
+ * any ACL grant the adapter had provisioned) behind, because nothing retained the tunnel.
+ *
+ * Two ordering constraints decide where it goes, and they agree. **Safety**: closing the server is what
+ * actually ends reach — nothing is listening afterwards, so a still-live mapping to a dead port
+ * authorizes nobody. Reverting the ACL grant first would buy no security while the socket was still
+ * open. (The adapter's OWN internal order — revert the grant, THEN turn the serve off, ADR-002 § (3) —
+ * is a different question and still holds: there, the serve mapping IS the reach.) **Liveness**: the
+ * close is fast and local, while a Tailscale teardown is a network round-trip to `api.tailscale.com`
+ * plus a `tailscale` spawn. #82's floor promises a graceful close that always lands; gating it on a
+ * third-party API would break that promise exactly when it matters most — a laptop shutting down or a
+ * partitioned network is precisely when `SIGTERM` fires and when that API is unreachable.
+ *
+ * So the close never waits on the tunnel, and the tunnel revert is **best-effort within
+ * {@link DEFAULT_TUNNEL_TEARDOWN_TIMEOUT_MS}** rather than unbounded — otherwise a hung API would hold
+ * the process open forever and the daemon would never exit at all. A tunnel teardown that fails, or
+ * outruns its budget, is recorded as `error`/`tunnel-teardown-failed` and forces exit `1`: the grant may
+ * still be in the operator's policy, and a stop that says so beats one that silently claims to be clean.
  *
  * Everything host-touching (the signal source, the process exit) is an INJECTED seam so the wiring is
  * unit-testable with fakes — no real process-global handler registered, no real `process.exit` called —
@@ -51,6 +72,16 @@ import { type SignalSource } from "./heap-snapshot.js";
 export const SHUTDOWN_SIGNALS: readonly NodeJS.Signals[] = ["SIGTERM", "SIGINT"];
 
 /**
+ * How long the shutdown will wait for the tunnel teardown before giving up on it and exiting anyway
+ * (#242). The teardown is a network round-trip to a third-party API; #82's floor promises the daemon
+ * STOPS, so that promise cannot be pledged against an unbounded wait. Generous enough for a healthy
+ * API round-trip plus the `tailscale` spawn, short enough that an operator killing a daemon on a
+ * dying network is not left staring at a hung process. Exceeding it is not silent — it is reported as
+ * `tunnel-teardown-failed` and exits non-zero, like any other failed teardown.
+ */
+export const DEFAULT_TUNNEL_TEARDOWN_TIMEOUT_MS = 5_000;
+
+/**
  * The minimal server surface {@link installShutdownSignalHandler} needs — just an async `close`, which
  * the full `CcctlServer` satisfies structurally. Kept narrow (not the whole `CcctlServer`) so a
  * test passes a trivial fake and there is no import cycle with the server barrel.
@@ -58,6 +89,18 @@ export const SHUTDOWN_SIGNALS: readonly NodeJS.Signals[] = ["SIGTERM", "SIGINT"]
 export interface ShutdownableServer {
   /** Stop accepting connections and release everything the server owns. */
   close(): Promise<void>;
+}
+
+/**
+ * The minimal tunnel surface the shutdown path needs — just an async `teardown`, which
+ * `@ccctl/tunnel-adapters`' `Tunnel` satisfies structurally. Kept narrow (not the whole
+ * `Tunnel`) for the same reason as {@link ShutdownableServer}, and because it keeps
+ * `@ccctl/server` free of a dependency on the tunnel package: the daemon needs to
+ * RELEASE a tunnel, not to know what a tunnel is.
+ */
+export interface ReleasableTunnel {
+  /** Release the tunnel, leaving no mapping — and no provisioned ACL grant — behind. */
+  teardown(): Promise<void>;
 }
 
 /** The injectable `process.exit` seam — a test passes a fake that records the code instead of exiting. */
@@ -72,11 +115,30 @@ const defaultExit: ExitFn = (code) => {
 export interface ShutdownSignalDeps {
   /** The running server to gracefully close on a termination signal. */
   readonly server: ShutdownableServer;
+  /**
+   * The tunnel to release AFTER closing the server, resolved AT SIGNAL TIME — `null`
+   * (or an absent seam) when the daemon is loopback-only, which releases nothing and
+   * leaves the close path exactly as it was.
+   *
+   * A THUNK, not a value, because of when the handler arms: the daemon arms shutdown as
+   * soon as the server binds — deliberately BEFORE it establishes a tunnel, so a `Ctrl-C`
+   * during a slow establish still shuts down gracefully — and at that moment there is no
+   * tunnel to pass. Resolving on delivery instead means the handler releases whatever the
+   * daemon owns WHEN the signal lands: the established tunnel, or nothing if the establish
+   * had not finished (or had failed).
+   */
+  readonly tunnel?: () => ReleasableTunnel | null;
+  /**
+   * How long to wait for the tunnel teardown before giving up and exiting anyway
+   * (default: {@link DEFAULT_TUNNEL_TEARDOWN_TIMEOUT_MS}). Injectable so a test drives the
+   * timeout arm without waiting out the real budget.
+   */
+  readonly tunnelTeardownTimeoutMs?: number;
   /** The signals to arm (default: {@link SHUTDOWN_SIGNALS}). */
   readonly signals?: readonly NodeJS.Signals[];
   /** The signal source (default: {@link process}). */
   readonly source?: SignalSource;
-  /** How to exit the process once the close settles (default: {@link process.exit}). */
+  /** How to exit the process once the shutdown settles (default: {@link process.exit}). */
   readonly exit?: ExitFn;
   /** Structured-log sink a FAILED shutdown is recorded on (default: {@link NO_OP_LOGGER}). */
   readonly logger?: Logger;
@@ -84,9 +146,11 @@ export interface ShutdownSignalDeps {
 
 /**
  * Arm the local-shutdown trigger: install a handler for each of {@link SHUTDOWN_SIGNALS} that, on the
- * first delivery, gracefully closes the server and exits `0`; on a second delivery while that close is
- * still running, force-exits `1`; and on a close that rejects, records `error`/`shutdown-failed` on the
- * trail and force-exits `1`. Returns a disposer that removes every handler it armed.
+ * first delivery, gracefully closes the server, then releases the tunnel (if any) within
+ * {@link DEFAULT_TUNNEL_TEARDOWN_TIMEOUT_MS}, and exits `0`; on a second delivery while that is still
+ * running, force-exits `1`; and on a close that rejects — or a tunnel teardown that fails or outruns its
+ * budget — records `error`/`shutdown-failed` (resp. `error`/`tunnel-teardown-failed`) on the trail and
+ * force-exits `1`. Returns a disposer that removes every handler it armed.
  *
  * Each signal is armed independently and guarded: a platform that cannot listen for one (Windows has no
  * real `SIGTERM`) must not crash the daemon — the inability is surfaced once on the trail as
@@ -94,7 +158,94 @@ export interface ShutdownSignalDeps {
  * where `SIGTERM` does not. The disposer only removes the handlers that actually armed.
  */
 export function installShutdownSignalHandler(deps: ShutdownSignalDeps): () => void {
-  const { server, signals = SHUTDOWN_SIGNALS, source = process, exit = defaultExit, logger = NO_OP_LOGGER } = deps;
+  const {
+    server,
+    tunnel = () => null,
+    tunnelTeardownTimeoutMs = DEFAULT_TUNNEL_TEARDOWN_TIMEOUT_MS,
+    signals = SHUTDOWN_SIGNALS,
+    source = process,
+    exit = defaultExit,
+    logger = NO_OP_LOGGER,
+  } = deps;
+
+  /** Describe a thrown value for the trail — an `Error`'s message, else the value itself. */
+  const reasonOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+  /**
+   * Release the tunnel, but never wait longer than the budget: the teardown is a network round-trip, and
+   * #82's floor promises the daemon exits. Rejects on failure OR on the budget running out, so both
+   * arrive at the same honest report — the tunnel may still be up and its grant still in the policy
+   * either way, and which of the two it was does not change what the operator has to do about it.
+   */
+  const releaseTunnel = async (releasable: ReleasableTunnel): Promise<void> => {
+    let timer: NodeJS.Timeout | undefined;
+    const budget = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`gave up after ${tunnelTeardownTimeoutMs}ms`));
+      }, tunnelTeardownTimeoutMs);
+      // Never let the budget timer itself hold the process open — the whole point is to let it exit.
+      timer.unref();
+    });
+    try {
+      await Promise.race([releasable.teardown(), budget]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  /**
+   * The graceful shutdown itself: close the server, then release the tunnel, and answer with the exit
+   * code they earned (`0` clean, `1` if either step failed). Each step is reported and survived
+   * independently — neither failure may skip the other — so this settles rather than rejects.
+   */
+  const shutdown = async (): Promise<number> => {
+    let code = 0;
+
+    // The server FIRST: it is the fast, local step, and closing it is what actually ends reach — so
+    // #82's floor is never gated on the tunnel's network round-trip (see the header).
+    try {
+      await server.close();
+    } catch (error) {
+      logger.log({
+        category: "error",
+        level: "error",
+        event: "shutdown-failed",
+        sessionId: null,
+        detail: `graceful shutdown failed, exiting anyway: ${reasonOf(error)}`,
+      });
+      code = 1;
+    }
+
+    // Then the tunnel — best-effort within the budget. `null` when the daemon is loopback-only or the
+    // establish never landed: nothing to release. Attempted even if the close above failed: the grant
+    // is in the operator's policy either way, and leaving it there because an unrelated step broke
+    // would be the orphaned-grant bug this exists to fix.
+    const releasable = tunnel();
+    if (releasable !== null) {
+      try {
+        await releaseTunnel(releasable);
+      } catch (error) {
+        // Never swallowed: the adapter guarantees a failed teardown leaves the tunnel established and
+        // retryable, and a shutdown cannot retry — so the honest move is to name what may still be out
+        // there (the mapping, and any ACL grant provisioned for it) and the verb that clears it. Hedged
+        // deliberately: the adapter reverts the grant BEFORE turning the serve off, so a teardown that
+        // failed at the serve-off step has already removed the grant — and the budget arm cannot know
+        // which step it died in. `--off` is the right remedy for every one of those cases.
+        logger.log({
+          category: "error",
+          level: "error",
+          event: "tunnel-teardown-failed",
+          sessionId: null,
+          detail:
+            `tunnel teardown failed, exiting anyway — the tunnel, and any ACL grant it provisioned, may ` +
+            `still be in place; clear them with \`ccctl tunnel <kind> --off\`: ${reasonOf(error)}`,
+        });
+        code = 1;
+      }
+    }
+
+    return code;
+  };
 
   // Latched at the FIRST signal so a second one force-exits rather than kicking off a second close —
   // scoped to this install call, so two independent handlers never share the latch.
@@ -107,25 +258,14 @@ export function installShutdownSignalHandler(deps: ShutdownSignalDeps): () => vo
       return;
     }
     shuttingDown = true;
-    // A signal handler cannot be async; drive the close and settle the exit off its resolution. The
+    // A signal handler cannot be async; drive the shutdown and settle the exit off its resolution. The
     // rejection arm is provided, so this promise never goes unhandled — `void` marks it deliberately
-    // fire-and-forget (the process is ending either way).
-    void server.close().then(
-      () => {
-        exit(0);
-      },
-      (error: unknown) => {
-        const reason = error instanceof Error ? error.message : String(error);
-        logger.log({
-          category: "error",
-          level: "error",
-          event: "shutdown-failed",
-          sessionId: null,
-          detail: `graceful shutdown failed, exiting anyway: ${reason}`,
-        });
-        exit(1);
-      },
-    );
+    // fire-and-forget (the process is ending either way). `shutdown` reports its own failures and
+    // resolves with an exit code, so the rejection arm is the defensive floor (e.g. a throwing sink),
+    // not the failure path.
+    void shutdown().then(exit, () => {
+      exit(1);
+    });
   };
 
   // Arm each signal independently so one unsupported signal does not drop the others. Track exactly the

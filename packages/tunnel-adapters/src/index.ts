@@ -17,8 +17,10 @@
  * tunnel-auth — it refuses unless the node is an authenticated, connected
  * tailnet member, so an unauthorized device can never reach the daemon;
  * {@link TailscaleTunnel.status | status} reports whether it is up and the host
- * it is reachable at; and {@link TailscaleTunnel.teardown | teardown} releases
- * it cleanly. Which authenticated devices may reach the endpoint is governed by
+ * it is reachable at; {@link TailscaleTunnel.adopt | adopt} takes over a mapping
+ * a PREVIOUS process established, so a later one can release what it left behind;
+ * and {@link TailscaleTunnel.teardown | teardown} releases it cleanly — the grant
+ * included. Which authenticated devices may reach the endpoint is governed by
  * the tailnet's own ACL policy — operator-owned central state the adapter relies
  * on by default and never edits in place. It can OPTIONALLY narrow that policy
  * through the {@link TailscaleAclClient} API seam: an opt-in, additive grant it
@@ -75,7 +77,8 @@ function downStatus(kind: TunnelKind): TunnelStatus {
 /**
  * Pluggable tunnel backend — one lifecycle contract, interchangeable
  * implementations: bring a loopback endpoint up ({@link establish}), report
- * whether it is up ({@link status}), and release it ({@link teardown}).
+ * whether it is up ({@link status}), take over a mapping a previous process
+ * brought up ({@link adopt}), and release it ({@link teardown}).
  */
 export interface Tunnel {
   /** Which backend this tunnel drives. */
@@ -95,10 +98,46 @@ export interface Tunnel {
    */
   status(): Promise<TunnelStatus>;
   /**
-   * Release the tunnel {@link establish} brought up, leaving no mapping behind,
-   * and return it to `down`. A clean no-op when nothing is established, so it is
-   * always safe to call — e.g. from a shutdown path that does not know whether
-   * {@link establish} ran.
+   * Take ownership of a mapping a PREVIOUS process established at `local`, so
+   * this instance's {@link teardown} releases it — the missing half of a
+   * FIRE-AND-FORGET establish.
+   *
+   * A tunnel's real state lives OUTSIDE the process (for Tailscale: `tailscaled`'s
+   * detached `serve --bg` config, and the tailnet's ACL policy); the lifecycle an
+   * instance tracks is a cache of it. A command that establishes and exits — the
+   * `ccctl tunnel` verb, whose `--bg` mapping is *meant* to outlive it — abandons
+   * that cache while the mapping itself lives on. `adopt` rebuilds exactly the
+   * cache {@link teardown} needs, from the same operator-supplied inputs the
+   * establish used, so a later process can release what an earlier one brought up.
+   *
+   * Deliberately NOT a `status`-reportable `up`: an adopting instance never
+   * resolved a public host, and an `up` {@link TunnelStatus} must carry one. So
+   * `status` still answers `down` after `adopt` — this seeds release handles, not
+   * a claim about reachability (the same rule that makes a served-but-unresolved
+   * establish "not a usable `up`").
+   *
+   * **`adopt` ASSERTS ownership; it cannot verify it.** Out-of-process there is
+   * nothing to verify against — no handle survived, and (for Tailscale) a policy
+   * grant is compared by VALUE, so a grant an earlier `establish` appended is
+   * indistinguishable from an identical one the operator hand-authored. Adopting is
+   * therefore the CALLER's explicit claim that the mapping and the configured grant
+   * are ccctl's to release, and a subsequent `teardown` acts on that claim. This is
+   * the deliberate asymmetry with `establish`, which — being an implicit side effect
+   * of bringing a tunnel up — stays conservative and never claims a grant it did not
+   * itself append. Only wire `adopt` to something the operator explicitly asked for
+   * (`ccctl tunnel <kind> --off`), never to an inferred or automatic release. See
+   * ADR-004.
+   *
+   * Synchronous and total: it only records what to release. A backend that never
+   * establishes has nothing to adopt and no-ops, keeping the lifecycle total
+   * across every backend, as {@link status} / {@link teardown} already are.
+   */
+  adopt(local: HostEndpoint): void;
+  /**
+   * Release the tunnel {@link establish} brought up (or {@link adopt} took over),
+   * leaving no mapping behind, and return it to `down`. A clean no-op when nothing
+   * is established, so it is always safe to call — e.g. from a shutdown path that
+   * does not know whether {@link establish} ran.
    */
   teardown(): Promise<void>;
 }
@@ -358,8 +397,17 @@ interface TailscaleSelf {
  * mandatory-auth is verified) and removes it on `teardown`, via the injected
  * {@link TailscaleAclClient} API seam. It is additive and non-destructive — the
  * read/modify/write preserves every operator rule verbatim and touches only its
- * own managed grant — and fail-closed: a failed revert leaves the tunnel
- * established and retryable, never an orphaned grant on the success path.
+ * own managed grant — idempotent (an equal grant already in the policy is left
+ * alone rather than duplicated, and is not claimed for revert) — and fail-closed:
+ * a failed revert leaves the tunnel established and retryable, never an orphaned
+ * grant on the success path.
+ *
+ * Because `serve --bg` is DETACHED, a mapping (and its grant) outlives the process
+ * that established it. {@link TailscaleTunnel.adopt | adopt} is how a later process
+ * takes one over: it rebuilds the release handles from the same operator-supplied
+ * endpoint and declared grant, so `teardown` releases what an earlier `establish`
+ * brought up. That is what gives the fire-and-forget `ccctl tunnel` verb a revert
+ * path without making it hold the tunnel open.
  */
 export class TailscaleTunnel implements Tunnel {
   readonly kind = "tailscale" as const;
@@ -374,11 +422,12 @@ export class TailscaleTunnel implements Tunnel {
   readonly #provisioning: TailscaleAclProvisioning | null;
 
   /**
-   * The loopback endpoint currently served, recorded the moment `tailscale
-   * serve` succeeds — before the tailnet host is resolved — so `teardown` can
-   * turn the mapping back off even if `establish` later rejected while resolving
-   * the host (a half-up serve is still cleanly releasable). `null` when nothing
-   * is served: before `establish`, or after `teardown`.
+   * The loopback endpoint whose mapping this instance will release, recorded the
+   * moment `tailscale serve` succeeds — before the tailnet host is resolved — so
+   * `teardown` can turn the mapping back off even if `establish` later rejected
+   * while resolving the host (a half-up serve is still cleanly releasable) — or
+   * seeded by `adopt` for a mapping a previous process served. `null` when there
+   * is nothing to release: before `establish` / `adopt`, or after `teardown`.
    */
   #servedLocal: HostEndpoint | null = null;
 
@@ -392,17 +441,21 @@ export class TailscaleTunnel implements Tunnel {
   #established: EstablishedTunnel | null = null;
 
   /**
-   * The grant this `establish` appended to the operator's policy, recorded only
-   * AFTER the write succeeds — so a failed provision leaves nothing to revert.
-   * `teardown` removes the one grant equal to it; `null` when nothing is
-   * provisioned (no provisioning injected, provision not yet run, or reverted).
+   * The grant this instance is responsible for removing: appended by `establish`
+   * and recorded only AFTER the write succeeds — so a failed provision leaves
+   * nothing to revert — or seeded by `adopt` for a mapping a previous process
+   * established. `teardown` removes the one grant equal to it; `null` when nothing
+   * is provisioned (no provisioning injected, provision not yet run, an establish
+   * that found an equal grant already present, or reverted).
    */
   #provisionedGrant: AclGrant | null = null;
 
   /**
    * Whether this `establish` created the policy's `grants` key (it was absent
    * before). If so, `teardown` deletes the now-empty key to leave the
-   * operator's policy as it was found, rather than a stray `grants: []`.
+   * operator's policy as it was found, rather than a stray `grants: []`. Always
+   * `false` after `adopt` — an adopting process cannot know whether the earlier
+   * establish created the key, so it never claims to have (see `adopt`).
    */
   #createdGrantsKey = false;
 
@@ -459,13 +512,37 @@ export class TailscaleTunnel implements Tunnel {
     );
   }
 
+  adopt(local: HostEndpoint): void {
+    // Rebuild exactly the two release handles `teardown` reads, from the same
+    // operator-supplied inputs the establish used — the endpoint (the caller passes
+    // the same `--host`/`--port` it served) and the declared grant (the same
+    // injected provisioning, resolved from the operator's env). Nothing else is
+    // recoverable out-of-process, and nothing else is needed to release.
+    this.#servedLocal = local;
+    // Only claim a grant to revert when provisioning is actually configured: with
+    // none, `establish` wrote no policy, so there is none to remove and `teardown`
+    // is just the serve-off. `structuredClone` so the recorded grant is this
+    // instance's own object, never aliased with the injected provisioning's.
+    this.#provisionedGrant = this.#provisioning === null ? null : structuredClone(this.#provisioning.grant);
+    // Deliberately NOT `#createdGrantsKey`: an adopting process cannot know whether
+    // the establish created the `grants` key, and `false` is the RIGHT answer rather
+    // than a fallback — deleting a key we may not have created would be an edit to
+    // the operator's policy beyond our managed scope. A revert that empties the list
+    // therefore leaves `grants: []`, which is strictly within scope (only our own
+    // grant was removed) even though it is one key tidier when `establish` reverts.
+    this.#createdGrantsKey = false;
+    // `#established` stays null: this instance resolved no public host, and an `up`
+    // TunnelStatus must carry one (see the `adopt` contract on Tunnel).
+  }
+
   async teardown(): Promise<void> {
     // Revert the scoped ACL grant FIRST — withdraw authorization before releasing
     // the serve (fail-closed) and leave no orphaned grant behind. Reached only when
-    // `establish` provisioned one; if it rejects, state is preserved and the serve
-    // is NOT turned off, so `teardown` can be retried (symmetric with the serve-off
-    // retry below). A grant is only ever recorded once its write succeeded, and
-    // `#provisioning` is non-`null` whenever a grant was recorded.
+    // a grant was recorded — by `establish` provisioning one, or by `adopt` claiming
+    // one an earlier process left behind; if it rejects, state is preserved and the
+    // serve is NOT turned off, so `teardown` can be retried (symmetric with the
+    // serve-off retry below). `establish` only records a grant once its write
+    // succeeded, and `#provisioning` is non-`null` whenever a grant was recorded.
     const provisioned = this.#provisionedGrant;
     if (provisioned !== null && this.#provisioning !== null) {
       await this.#revertAcl(this.#provisioning, provisioned);
@@ -522,6 +599,17 @@ export class TailscaleTunnel implements Tunnel {
    * verbatim; only `grants` is touched. Records what was added — and whether the
    * key was created — AFTER the write succeeds, so `teardown` reverts exactly this
    * and a failed write leaves nothing recorded to revert.
+   *
+   * IDEMPOTENT: a grant equal to ours already in the policy means there is nothing
+   * to add — appending a second copy would leave the policy saying exactly what it
+   * already says, and (because the establishes that write them are fire-and-forget)
+   * copies would accumulate one per run. So the write is skipped, and NOTHING is
+   * recorded: an equal grant is value-indistinguishable from one the operator
+   * hand-authored, so an instance that did not add it must not remove it either.
+   * That keeps the adapter's managed scope exactly "the grant this instance
+   * appended" — `adopt` is the explicit way to claim a grant an earlier process
+   * left behind. Reads the policy either way, so a skip is still decided against
+   * the live document rather than a guess.
    */
   async #provisionAcl(provisioning: TailscaleAclProvisioning): Promise<void> {
     const { client, grant } = provisioning;
@@ -529,12 +617,13 @@ export class TailscaleTunnel implements Tunnel {
 
     const existing = policy.grants;
     const hadGrants = Array.isArray(existing);
+    const currentGrants: readonly unknown[] = hadGrants ? (existing as readonly unknown[]) : [];
+    if (currentGrants.some((item) => deepEqual(item, grant))) {
+      return; // Already granted — no duplicate, and not ours to revert.
+    }
     // Shallow-clone the top level (operator keys carried by reference, never
     // mutated) and give `grants` a fresh array so the operator's object is untouched.
-    const next: AclPolicy = {
-      ...policy,
-      grants: [...(hadGrants ? (existing as readonly unknown[]) : []), structuredClone(grant)],
-    };
+    const next: AclPolicy = { ...policy, grants: [...currentGrants, structuredClone(grant)] };
 
     await client.savePolicy(next, etag);
     this.#provisionedGrant = grant;
@@ -706,9 +795,10 @@ function removeFirstEqual(items: readonly unknown[], target: unknown): { result:
  * Tailscale path.
  *
  * Only `establish` is the unimplemented capability, so only it rejects. A
- * backend that never establishes is honestly `down` and has nothing to release,
- * so its `status` / `teardown` answer normally ({@link downStatus} / a no-op)
- * rather than reject — keeping the whole lifecycle total across every backend.
+ * backend that never establishes is honestly `down`, has nothing to adopt, and
+ * has nothing to release — so its `status` / `adopt` / `teardown` answer normally
+ * ({@link downStatus} / a no-op / a no-op) rather than reject, keeping the whole
+ * lifecycle total across every backend.
  */
 function notImplemented(kind: TunnelKind): Promise<never> {
   return Promise.reject(new Error(`ccctl: ${kind} tunnel adapter is not implemented yet (skeleton)`));
@@ -726,6 +816,10 @@ export class CloudflareTunnel implements Tunnel {
     return Promise.resolve(downStatus(this.kind));
   }
 
+  adopt(_local: HostEndpoint): void {
+    // A backend that never establishes left no mapping behind to take over.
+  }
+
   teardown(): Promise<void> {
     return Promise.resolve();
   }
@@ -741,6 +835,10 @@ export class HeadscaleTunnel implements Tunnel {
 
   status(): Promise<TunnelStatus> {
     return Promise.resolve(downStatus(this.kind));
+  }
+
+  adopt(_local: HostEndpoint): void {
+    // A backend that never establishes left no mapping behind to take over.
   }
 
   teardown(): Promise<void> {

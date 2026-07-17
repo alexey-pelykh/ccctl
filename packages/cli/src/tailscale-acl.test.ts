@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
+import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { HostEndpoint } from "@ccctl/core";
+import type { HostEndpoint, LogEvent } from "@ccctl/core";
+import { installShutdownSignalHandler } from "@ccctl/server";
 import {
   ADAPTERS,
   type AclGrant,
@@ -287,8 +289,9 @@ describe("createTailscaleTunnel — provisioning is PASSED to the adapter (AC-2,
     await tunnel.teardown();
 
     expect(api.current()).toEqual(OPERATOR_POLICY);
-    // NOTE: no CLI verb reaches this teardown today — see #242. This covers the adapter's bracketing
-    // contract THROUGH our composition; it is not evidence that a `ccctl tunnel` run reverts anything.
+    // This covers the adapter's bracketing contract THROUGH our composition. The CLI paths that
+    // actually REACH this teardown — the daemon's shutdown and the `--off` down-verb — are #242's,
+    // and are covered below.
   });
 
   it("sends the token as a Bearer credential to the Tailscale API, and nowhere else", async () => {
@@ -396,5 +399,142 @@ describe("defaultDependencies — provisioning is reachable from the verbs (#153
 
   it("hands out a fresh tunnel per call — a tunnel is a stateful lifecycle object", () => {
     expect(defaultDependencies.adapters.tailscale()).not.toBe(defaultDependencies.adapters.tailscale());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the grant's revert path, end to end (#242)
+//
+// #153 made provisioning REACHABLE; nothing made the revert reachable, so the grant an establish
+// appended stayed in the operator's policy forever. These drive the two paths that now reach
+// `teardown` — the daemon's shutdown, and the `--off` down-verb — through the REAL composition
+// (real `createTailscaleTunnel`, real `defaultTailscaleAclClient`, real `installShutdownSignalHandler`),
+// with only the two leaf seams faked. So they assert the POLICY ITSELF — the grant gone after a revert,
+// and never duplicated by a repeat — not merely that a teardown spy was called: the wiring cannot be
+// green here while the operator's policy still carries the grant.
+// ---------------------------------------------------------------------------
+
+describe("the grant's revert path is reachable end to end (#242)", () => {
+  // Rule (AC1): the daemon owns the tunnel's lifetime, so its shutdown reverts the grant. The real
+  // signal handler drives the real tunnel's teardown — the chain the CLI wires at `serve --tunnel`.
+  it("a daemon shutdown reverts the grant (SIGTERM → tunnel teardown → policy restored)", async () => {
+    const api = fakeTailscaleApi(OPERATOR_POLICY);
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const tunnel = createTailscaleTunnel(provisionedEnv(), { runner, fetch: api.fetch });
+    await tunnel.establish(LOOPBACK);
+    // The grant LANDED — without this the assertion below would pass on a policy nothing ever wrote.
+    expect(api.current().grants).toEqual([OPERATOR_GRANT]);
+
+    // Arm the REAL shutdown handler over the REAL tunnel, exactly as `serve --tunnel` does (a thunk,
+    // since the daemon arms before the establish); fake only the signal source and `process.exit`.
+    const source = new EventEmitter();
+    const codes: number[] = [];
+    installShutdownSignalHandler({
+      server: { close: () => Promise.resolve() },
+      tunnel: () => tunnel,
+      source,
+      exit: (code) => codes.push(code),
+    });
+
+    source.emit("SIGTERM");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // The operator's policy is exactly as it was found — the grant is gone, and so is the `grants`
+    // key the establish created.
+    expect(api.current()).toEqual(OPERATOR_POLICY);
+    expect(codes).toEqual([0]);
+  });
+
+  // Rule (AC2): the standalone `ccctl tunnel <kind>` is fire-and-forget, so its revert is `--off` — a
+  // LATER process with none of the establish's in-process state. Two separately-composed tunnels here,
+  // which is exactly the two-process shape: the second reverts what the first left behind.
+  it("the down-verb reverts the grant from a fresh process (adopt → teardown → policy restored)", async () => {
+    const api = fakeTailscaleApi(OPERATOR_POLICY);
+    const env = provisionedEnv();
+
+    // Process 1 — `ccctl tunnel tailscale`: establish, then exit. The mapping and grant live on.
+    const up = createTailscaleTunnel(env, {
+      runner: fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." }))).runner,
+      fetch: api.fetch,
+    });
+    await up.establish(LOOPBACK);
+    expect(api.current().grants).toEqual([OPERATOR_GRANT]);
+
+    // Process 2 — `ccctl tunnel tailscale --off`: a brand-new composition off the SAME env, which is
+    // what lets it resolve the same declared grant and revert it.
+    const { runner: downRunner, calls: downCalls } = fakeRunner(() => ({ stdout: "", stderr: "" }));
+    const down = createTailscaleTunnel(env, { runner: downRunner, fetch: api.fetch });
+    down.adopt(LOOPBACK);
+    await down.teardown();
+
+    // The grant is gone — but `grants: []` rather than the key deleted: an adopting process cannot know
+    // whether the establish created the key, so it never claims it (see `adopt`). The mapping is off.
+    expect(api.current().grants).toEqual([]);
+    expect(api.current().acls).toEqual(OPERATOR_POLICY.acls);
+    expect(downCalls.map((call) => call.args.join(" "))).toEqual(["serve --bg http://127.0.0.1:4321 off"]);
+  });
+
+  // Rule (AC3): the establishes that write these grants are fire-and-forget, so without an idempotent
+  // append a repeated `ccctl tunnel tailscale` piles up one copy per run — forever, since nothing
+  // reverted them. Repeated real compositions against one tailnet are exactly that repeat.
+  it("repeated establishes do not accumulate duplicate grants", async () => {
+    const api = fakeTailscaleApi(OPERATOR_POLICY);
+    const env = provisionedEnv();
+    const handler = tailscaleHandler(statusJson({ DNSName: "host.ts.net." }));
+
+    await createTailscaleTunnel(env, { runner: fakeRunner(handler).runner, fetch: api.fetch }).establish(LOOPBACK);
+    await createTailscaleTunnel(env, { runner: fakeRunner(handler).runner, fetch: api.fetch }).establish(LOOPBACK);
+    await createTailscaleTunnel(env, { runner: fakeRunner(handler).runner, fetch: api.fetch }).establish(LOOPBACK);
+
+    expect(api.current().grants).toEqual([OPERATOR_GRANT]);
+    // Only the first run wrote policy; the other two read, saw their grant, and skipped.
+    expect(api.calls.filter((call) => (call.init.method ?? "GET") === "POST")).toHaveLength(1);
+  });
+
+  // Rule (AC1, the failure arm): a revert that fails must not be swallowed. The adapter leaves the
+  // tunnel established and retryable; the shutdown cannot retry, so it names what is still out there
+  // and exits non-zero rather than reporting a clean stop over a grant it did not remove.
+  it("a shutdown whose revert fails still stops, but reports it and exits 1", async () => {
+    const api = fakeTailscaleApi(OPERATOR_POLICY);
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    // Let the establish's write through, then fail every later (revert) write.
+    let writes = 0;
+    const fetch: typeof globalThis.fetch = (input, init) => {
+      if ((init?.method ?? "GET") === "POST" && ++writes > 1) {
+        return Promise.resolve(new Response("", { status: 500 }));
+      }
+      return api.fetch(input, init);
+    };
+    const tunnel = createTailscaleTunnel(provisionedEnv(), { runner, fetch });
+    await tunnel.establish(LOOPBACK);
+    expect(api.current().grants).toEqual([OPERATOR_GRANT]);
+
+    const source = new EventEmitter();
+    const codes: number[] = [];
+    const captured: LogEvent[] = [];
+    let closed = false;
+    installShutdownSignalHandler({
+      server: {
+        close: () => {
+          closed = true;
+          return Promise.resolve();
+        },
+      },
+      tunnel: () => tunnel,
+      source,
+      exit: (code) => codes.push(code),
+      logger: { log: (event) => captured.push(event) },
+    });
+
+    source.emit("SIGTERM");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // The grant is still there — honestly reported rather than silently dropped …
+    expect(api.current().grants).toEqual([OPERATOR_GRANT]);
+    expect(captured.map((event) => event.event)).toEqual(["tunnel-teardown-failed"]);
+    expect(codes).toEqual([1]);
+    // … and the daemon still stopped: the operator asked to stop, and the sessions must not be
+    // trapped behind a policy write that would not land.
+    expect(closed).toBe(true);
   });
 });

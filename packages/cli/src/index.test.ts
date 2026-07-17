@@ -14,6 +14,7 @@ import {
   type ISessionLauncher,
   type LaunchAcceptedWire,
   type LaunchedSession,
+  type ReleasableTunnel,
   type SessionLaunchOptions,
   type SessionStopOptions,
   type SessionSummaryWire,
@@ -49,6 +50,8 @@ function makeServer(host: string, port: number, close: () => Promise<void>): Ccc
 interface FakeDepsOptions {
   /** Override the tunnel `establish` (e.g. to reject); defaults to a successful Tailscale host. */
   readonly establish?: (local: { host: string; port: number }) => Promise<EstablishedTunnel>;
+  /** Override the tunnel `teardown` (e.g. to reject, for the `--off` failure path); defaults to a clean release. */
+  readonly teardown?: () => Promise<void>;
   /** Override the session-client `launch` (e.g. to reject); defaults to an attachable tmux surface. */
   readonly launch?: (target: HostEndpoint, options: SessionLaunchOptions) => Promise<LaunchAcceptedWire>;
   /** Override the session-client `list` (e.g. to reject or seed sessions); defaults to an empty list. */
@@ -66,6 +69,9 @@ function makeDeps(options: FakeDepsOptions = {}): {
   deps: CliDependencies;
   startServer: ReturnType<typeof vi.fn>;
   establish: ReturnType<typeof vi.fn>;
+  adopt: ReturnType<typeof vi.fn>;
+  teardown: ReturnType<typeof vi.fn>;
+  tunnels: Tunnel[];
   runPatcher: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
   launch: ReturnType<typeof vi.fn>;
@@ -94,12 +100,24 @@ function makeDeps(options: FakeDepsOptions = {}): {
       ((_local: { host: string; port: number }) =>
         Promise.resolve({ kind: "tailscale", publicHost: "oracle-node.tailnet.ts.net" } satisfies EstablishedTunnel)),
   );
-  const makeTunnel = (kind: TunnelKind): Tunnel => ({
-    kind,
-    establish,
-    status: () => Promise.resolve({ kind, up: false }),
-    teardown: () => Promise.resolve(),
-  });
+  // `adopt` / `teardown` are the tunnel's revert half (#242): `--off` adopts a detached mapping and
+  // releases it, and `serve --tunnel`'s shutdown releases the one the daemon retained. Shared spies (like
+  // `establish`), so a test asserts on them without reaching for the instance the verb built internally —
+  // and `tunnels` records those instances so a test can prove WHICH one reached the shutdown path.
+  const adopt = vi.fn((_local: { host: string; port: number }) => undefined);
+  const teardown = vi.fn(options.teardown ?? (() => Promise.resolve()));
+  const tunnels: Tunnel[] = [];
+  const makeTunnel = (kind: TunnelKind): Tunnel => {
+    const tunnel: Tunnel = {
+      kind,
+      establish,
+      status: () => Promise.resolve({ kind, up: false }),
+      adopt,
+      teardown,
+    };
+    tunnels.push(tunnel);
+    return tunnel;
+  };
   const adapters: Record<TunnelKind, () => Tunnel> = {
     tailscale: () => makeTunnel("tailscale"),
     cloudflare: () => makeTunnel("cloudflare"),
@@ -164,12 +182,17 @@ function makeDeps(options: FakeDepsOptions = {}): {
     (_options: { readonly logger: Logger }) => disposeInspectorDiagnosticsHandler,
   );
   // The local-shutdown signal-arming seam (#82): the SIGTERM/SIGINT graceful-shutdown floor. A fake that
-  // records the bound server + logger it was handed and returns a spy disposer — so a test asserts `serve`
-  // arms the trigger WITHOUT installing a real process-global SIGTERM/SIGINT handler (which would leak) or
-  // wiring a real `process.exit` (which would kill the test process on a delivered signal).
+  // records the bound server, the logger, and the tunnel thunk it was handed (#242 — the daemon's revert
+  // path) and returns a spy disposer — so a test asserts `serve` arms the trigger WITHOUT installing a
+  // real process-global SIGTERM/SIGINT handler (which would leak) or wiring a real `process.exit` (which
+  // would kill the test process on a delivered signal).
   const disposeShutdownHandler = vi.fn(() => undefined);
   const installShutdownHandler = vi.fn(
-    (_options: { readonly server: CcctlServer; readonly logger: Logger }) => disposeShutdownHandler,
+    (_options: {
+      readonly server: CcctlServer;
+      readonly logger: Logger;
+      readonly tunnel: () => ReleasableTunnel | null;
+    }) => disposeShutdownHandler,
   );
   // The device store the `revoke-all` verb drives (#88). A minimal in-memory IDeviceStore seeded
   // from `deviceSnapshot` (default `null` — nothing paired) that records every `save`, so a test
@@ -200,6 +223,9 @@ function makeDeps(options: FakeDepsOptions = {}): {
     },
     startServer,
     establish,
+    adopt,
+    teardown,
+    tunnels,
     runPatcher,
     close,
     launch,
@@ -458,6 +484,62 @@ describe("ccctl serve --tunnel — composes daemon + tunnel (AC4)", () => {
     await buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
     expect(close).not.toHaveBeenCalled();
   });
+
+  // Rule (#242 AC1): the daemon owns the tunnel's lifetime, so it must RETAIN the tunnel and hand it to
+  // the shutdown path — the whole defect was that `establishAndReport` dropped the instance the moment
+  // `establish` returned, leaving nothing able to call `teardown` and so no way to revert the grant.
+  it("retains the established tunnel and hands it to the shutdown path (the grant's revert path)", async () => {
+    const { deps, installShutdownHandler, tunnels } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
+
+    const handlerArg = installShutdownHandler.mock.calls[0][0];
+    // Exactly the instance the verb established — resolved through the thunk, as the handler does.
+    expect(tunnels).toHaveLength(1);
+    expect(handlerArg.tunnel()).toBe(tunnels[0]);
+  });
+
+  // Rule: the thunk exists because shutdown is armed BEFORE the tunnel is established (so a Ctrl-C
+  // during a slow establish still shuts down gracefully). Proven by reading it at ARM time, when the
+  // establish has not run yet — a plain value could not have carried the tunnel at all.
+  it("arms shutdown before the tunnel exists — the thunk answers null until the establish lands", async () => {
+    const resolvedAtArmTime: unknown[] = [];
+    const { deps, installShutdownHandler } = makeDeps();
+    installShutdownHandler.mockImplementation((options) => {
+      resolvedAtArmTime.push(options.tunnel());
+      return () => undefined;
+    });
+
+    await buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" });
+
+    expect(resolvedAtArmTime).toEqual([null]);
+  });
+
+  // Rule: a loopback-only daemon has no tunnel to release — the thunk says so honestly rather than
+  // handing the shutdown path something to tear down.
+  it("passes a thunk resolving to null when serving without a tunnel", async () => {
+    const { deps, installShutdownHandler } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve"], { from: "user" });
+    const handlerArg = installShutdownHandler.mock.calls[0][0];
+    expect(handlerArg.tunnel()).toBeNull();
+  });
+
+  // Rule: a FAILED establish leaves no usable tunnel, so the thunk must not hand the shutdown path a
+  // half-up instance to revert a grant that was never provisioned (the adapter records nothing on a
+  // failed establish — provisioning runs last).
+  it("leaves the thunk answering null when the establish fails", async () => {
+    const captured: Array<() => unknown> = [];
+    const { deps, installShutdownHandler } = makeDeps({
+      establish: () => Promise.reject(new Error("ccctl: tailscale is not an authenticated tailnet member")),
+    });
+    installShutdownHandler.mockImplementation((options) => {
+      captured.push(options.tunnel);
+      return () => undefined;
+    });
+
+    await expect(buildProgram(deps).parseAsync(["serve", "--tunnel", "tailscale"], { from: "user" })).rejects.toThrow();
+
+    expect(captured[0]?.()).toBeNull();
+  });
 });
 
 describe("QR-pair onboarding — mint a per-device token + print a terminal QR (#74)", () => {
@@ -566,6 +648,78 @@ describe("ccctl tunnel — establishes the tunnel (AC3)", () => {
     await expect(buildProgram(deps).parseAsync(["tunnel", "cloudflare"], { from: "user" })).rejects.toThrow(
       /not implemented yet \(skeleton\)/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the down-verb (#242)
+//
+// `ccctl tunnel` stays FIRE-AND-FORGET — `tailscale serve --bg` is a detached mapping meant to outlive
+// the command — so the revert half is `--off` on the same verb rather than a self-bracketing establish.
+// It runs in a LATER process with none of the establish's lifecycle state, which is why it adopts.
+// ---------------------------------------------------------------------------
+
+describe("ccctl tunnel --off — the down-verb reverts what the establish provisioned (#242 AC2)", () => {
+  it("adopts the mapping at the default endpoint and tears it down — never establishing anything", async () => {
+    const { deps, adopt, teardown, establish } = makeDeps();
+    await buildProgram(deps).parseAsync(["tunnel", "tailscale", "--off"], { from: "user" });
+
+    // Adopt rebuilds the release handles a fresh process lacks, THEN teardown reverts the grant and
+    // turns the mapping off. `--off` must never bring a tunnel UP.
+    expect(adopt).toHaveBeenCalledWith({ host: "127.0.0.1", port: 4321 });
+    expect(teardown).toHaveBeenCalledTimes(1);
+    expect(establish).not.toHaveBeenCalled();
+  });
+
+  it("adopts the SAME --host/--port the establish served — the off-target must name that mapping", async () => {
+    const { deps, adopt } = makeDeps();
+    await buildProgram(deps).parseAsync(["tunnel", "tailscale", "--off", "--host", "127.0.0.1", "--port", "9999"], {
+      from: "user",
+    });
+    expect(adopt).toHaveBeenCalledWith({ host: "127.0.0.1", port: 9999 });
+  });
+
+  it("reports the tunnel is down and says the grant is gone — the operator's confirmation", async () => {
+    const { deps } = makeDeps();
+    await buildProgram(deps).parseAsync(["tunnel", "tailscale", "--off"], { from: "user" });
+    expect(loggedText()).toContain("is down");
+    expect(loggedText()).toContain("ACL grant");
+  });
+
+  it("prints no QR / pairing block — nothing was exposed, so there is no device to onboard", async () => {
+    const { deps, renderQr } = makeDeps();
+    await buildProgram(deps).parseAsync(["tunnel", "tailscale", "--off"], { from: "user" });
+    expect(renderQr).not.toHaveBeenCalled();
+    expect(loggedText()).not.toContain("scan to pair");
+  });
+
+  it("propagates a teardown failure (the adapter leaves it retryable, so a retry is the next move)", async () => {
+    const { deps } = makeDeps({ teardown: () => Promise.reject(new Error("ccctl: tailscale ACL save failed")) });
+    await expect(buildProgram(deps).parseAsync(["tunnel", "tailscale", "--off"], { from: "user" })).rejects.toThrow(
+      /tailscale ACL save failed/,
+    );
+  });
+
+  it("validates the target before touching anything — an unknown kind or a 0.0.0.0 host adopts nothing", async () => {
+    for (const argv of [
+      ["tunnel", "ngrok", "--off"],
+      ["tunnel", "tailscale", "--off", "--host", "0.0.0.0"],
+    ]) {
+      const { deps, adopt, teardown } = makeDeps();
+      await expect(buildProgram(deps).parseAsync(argv, { from: "user" })).rejects.toThrow();
+      expect(adopt).not.toHaveBeenCalled();
+      expect(teardown).not.toHaveBeenCalled();
+    }
+  });
+
+  it("without --off the verb still establishes — the default stays fire-and-forget", async () => {
+    const { deps, establish, adopt, teardown } = makeDeps();
+    await buildProgram(deps).parseAsync(["tunnel", "tailscale"], { from: "user" });
+    expect(establish).toHaveBeenCalledTimes(1);
+    // Fire-and-forget: the detached mapping is meant to outlive this process, so the verb never
+    // releases what it just brought up.
+    expect(adopt).not.toHaveBeenCalled();
+    expect(teardown).not.toHaveBeenCalled();
   });
 });
 

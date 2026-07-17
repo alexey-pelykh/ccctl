@@ -193,11 +193,18 @@ export {
 // Because it rides an OS signal — same-uid-local, unreachable over the tunnel — and adds no HTTP route,
 // it is DEVICE-AUTH-INDEPENDENT by construction (AC1/AC2), the sibling of `ccctl revoke-all` (#88). The
 // CLI arms it at the daemon composition root; the seams are injectable for deterministic tests (no real
-// process-global handler, no real process.exit). Defined and unit-tested in shutdown-signal.ts.
+// process-global handler, no real process.exit). It also RELEASES the daemon's tunnel after closing the
+// server (#242) — the daemon owns the tunnel's lifetime, so it owns its teardown, and without it a
+// provisioned ACL grant outlived the session that asked for it. The close goes first because it is what
+// ends reach, so this floor never waits on the Tailscale API; the revert is time-boxed after it. The
+// tunnel rides a narrow structural port (`ReleasableTunnel`), so the server never depends on
+// `@ccctl/tunnel-adapters`. Defined and unit-tested in shutdown-signal.ts.
 export {
+  DEFAULT_TUNNEL_TEARDOWN_TIMEOUT_MS,
   installShutdownSignalHandler,
   SHUTDOWN_SIGNALS,
   type ExitFn,
+  type ReleasableTunnel,
   type ShutdownableServer,
   type ShutdownSignalDeps,
 } from "./shutdown-signal.js";

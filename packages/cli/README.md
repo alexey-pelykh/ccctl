@@ -20,7 +20,8 @@ Three verbs stand up the local setup:
   runs, so a "New session" spawns the **patched** `claude` worker; the binary defaults to
   `claude` on `PATH` and is pinned to an absolute path via `CCCTL_CLAUDE_BIN`.
 - **`ccctl tunnel <kind>`** — establish a [`@ccctl/tunnel-adapters`](../tunnel-adapters)
-  tunnel exposing an already-running loopback server.
+  tunnel exposing an already-running loopback server; `--off` takes it back down (releasing
+  the mapping and any ACL grant it provisioned).
 
 Composed, they are the working local setup: `patch` the worker, `serve` the daemon,
 and expose it via a `tunnel`.
@@ -62,23 +63,56 @@ nothing: your policy needs a [`tagOwners`](https://tailscale.com/kb/1068/acl-tag
 (that declares _who may apply_ the tag — it does not apply it), **and the node must actually carry
 the tag** (`tailscale login --advertise-tags=tag:ccctl`, the admin console, or the API).
 
-> **Known limitation — `ccctl` does not revert the grant yet ([#242]).** The adapter removes the
-> grant on tunnel teardown, but **no CLI verb tears a tunnel down**: `tailscale serve --bg` is a
-> detached mapping that deliberately outlives `ccctl tunnel`, and `serve --tunnel`'s shutdown path
-> closes the daemon without touching the tunnel. So today the grant is appended and left in place.
-> Consequences while this stands: a repeated `ccctl tunnel tailscale` appends **another copy** of
-> the grant each run, and a grant **outlives** a tunnel you turn off by hand
-> (`tailscale serve … off`). What is left behind is exactly the grant _you_ declared — nothing
-> `ccctl` chose, and no rule of yours is touched — but remove stale copies from your policy by hand
-> until [#242] lands.
-
 > **The token is visible to launched workers.** `ccctl serve` passes its environment to the
 > `claude` workers it launches, so anything in it — including this token — is readable by a
 > session. That is true of your whole environment, not something `ccctl` adds, but an `acl`-scoped
 > tailnet credential is worth the thought: prefer a short-lived OAuth token, and export it only for
 > the `ccctl tunnel` invocation if you would rather workers never see it.
 
-[#242]: https://github.com/alexey-pelykh/ccctl/issues/242
+#### Taking the grant back down
+
+The grant is bracketed to the tunnel: it goes in as the tunnel comes up, and comes back out when the
+tunnel goes down. **Which verb takes it down depends on which one put it up**, because the two have
+different lifetimes:
+
+| You brought it up with   | It comes down when                      | Because                                                                                                                                                    |
+| ------------------------ | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ccctl serve --tunnel …` | you stop the daemon (`Ctrl-C` / `kill`) | The daemon owns the tunnel's lifetime, so its shutdown reverts the grant and releases the mapping — nothing extra to run.                                  |
+| `ccctl tunnel …`         | you run `ccctl tunnel … --off`          | `tailscale serve --bg` is a **detached** mapping meant to outlive the command, so this verb stays fire-and-forget: it exits, and the tunnel keeps serving. |
+
+```bash
+ccctl tunnel tailscale --off                      # release the mapping + remove the grant
+ccctl tunnel tailscale --off --port 9999          # same --host/--port you served it on
+```
+
+`--off` takes the **same `--host`/`--port`** you established with — that is what names the mapping to
+release, exactly as `tailscale serve … off` does. Repeated establishes are safe: `ccctl` appends its
+grant only if an equal one is not already in your policy, so `ccctl tunnel tailscale` twice leaves
+**one** copy, not two.
+
+**Treat `CCCTL_TAILSCALE_ACL_GRANT` as ccctl-managed and ephemeral — do not also hand-author that same
+grant into your policy as a permanent rule.** Grants are compared by value, so `ccctl` cannot tell its
+own copy from an identical one you wrote by hand, and the two verbs resolve that ambiguity in opposite
+directions **on purpose**:
+
+- **`establish` is conservative** — it is an implicit side effect of bringing a tunnel up, so finding an
+  equal grant already present, it leaves it alone and does **not** claim it for revert.
+- **`--off` is literal** — you typed a verb whose entire job is "remove the declared grant", so it
+  removes one copy of `CCCTL_TAILSCALE_ACL_GRANT` **whether or not `ccctl` is the one that added it**.
+
+The consequence to know: if that grant is also a permanent hand-authored rule, `--off` deletes it, and
+`ccctl tunnel … && ccctl tunnel … --off` is then a **net removal** rather than a clean round-trip. It
+only ever removes access (never widens), and only the one grant you declared — but it is a policy edit
+you did not separately ask for. Keep the declared grant ephemeral and this cannot arise.
+
+Two more boundaries. **One grant, many daemons**: if several `ccctl serve --tunnel` daemons share one
+env config, only the one that **established** first actually appends the grant — and so only _its_ shutdown
+removes it, while the others are still serving (the others appended nothing, so their shutdowns remove
+nothing). Staggering shutdowns does not help; give each daemon its own grant. And **a failed revert
+changes nothing rather than pretending**: if the API is down or your token expired, `ccctl` leaves the
+tunnel up and the grant in place, says so, and exits non-zero — re-running `--off` completes it. A daemon
+shutdown gives the revert a few seconds and no more (it will not hold your shutdown open on an
+unreachable API); if it times out, the grant is still there and `--off` is how you clear it.
 
 ## Session launch/attach
 

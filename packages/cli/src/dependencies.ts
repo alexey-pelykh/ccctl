@@ -28,6 +28,7 @@ import {
   startServer,
   type CcctlServer,
   type ISessionLauncher,
+  type ReleasableTunnel,
   type ServerConfig,
 } from "@ccctl/server";
 import { ADAPTERS, type Tunnel, type TunnelKind } from "@ccctl/tunnel-adapters";
@@ -104,8 +105,18 @@ export interface CliDependencies {
    * (either would leak across / kill the test process), the same determinism discipline as the seams
    * above. Takes the bound {@link https://ccctl | CcctlServer} to close and the daemon's structured-log
    * sink so a FAILED shutdown rides the daemon's #61 trail.
+   *
+   * Also takes the daemon's tunnel, to RELEASE after closing the server (#242) — the daemon owns the
+   * tunnel's lifetime, so its shutdown is where any ACL grant the adapter provisioned gets removed. A
+   * thunk, because `serve` arms this BEFORE it establishes the tunnel (so a Ctrl-C mid-establish still
+   * shuts down gracefully); it is resolved when the signal lands. `@ccctl/server` types it as the narrow
+   * structural {@link https://ccctl | ReleasableTunnel} port, which `Tunnel` satisfies.
    */
-  readonly installShutdownHandler: (options: { readonly server: CcctlServer; readonly logger: Logger }) => () => void;
+  readonly installShutdownHandler: (options: {
+    readonly server: CcctlServer;
+    readonly logger: Logger;
+    readonly tunnel: () => ReleasableTunnel | null;
+  }) => () => void;
   /**
    * Render a scannable terminal QR of `text` — the QR-pair onboarding block `serve` / `tunnel`
    * print after a tunnel is up (#74) — {@link defaultRenderQr} (a zero-dependency `qrcode-terminal`)
