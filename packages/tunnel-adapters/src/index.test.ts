@@ -309,6 +309,17 @@ describe("stub backends (AC: only Tailscale establish is in scope for this slice
       await expect(tunnel.teardown()).resolves.toBeUndefined();
     }
   });
+
+  // Rule (#242): `adopt` keeps the lifecycle TOTAL across backends, as status/teardown already are —
+  // a backend that never establishes left no mapping behind, so adopting one is an honest no-op
+  // rather than a rejection or a claim of being up.
+  it("a stub's adopt is a no-op: still down, and teardown stays a no-op", async () => {
+    for (const tunnel of [new CloudflareTunnel(), new HeadscaleTunnel()]) {
+      expect(() => tunnel.adopt(LOOPBACK)).not.toThrow();
+      expect(await tunnel.status()).toEqual({ kind: tunnel.kind, up: false });
+      await expect(tunnel.teardown()).resolves.toBeUndefined();
+    }
+  });
 });
 
 describe("ADAPTERS registry (consumed by @ccctl/cli)", () => {
@@ -503,6 +514,149 @@ describe("TailscaleTunnel ACL provisioning (AC: opt-in, additive, non-destructiv
     expect(acl.current()).toEqual(OPERATOR_POLICY);
     expect(calls.some((c) => c.args.join(" ") === "serve --bg http://127.0.0.1:4321 off")).toBe(true);
     expect(await tunnel.status()).toEqual({ kind: "tailscale", up: false });
+  });
+
+  // Rule (#242 AC3): repeated establishes must not accumulate duplicate grants. Each `ccctl tunnel`
+  // run is a fresh process AND a fresh tunnel instance, and the mapping it makes is detached — so
+  // without an idempotent append the same grant piles up one copy per run, forever.
+  it("appends at most one copy: a second establish finds its grant already there and adds nothing", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const provisioning = { client: acl.client, grant: CCCTL_GRANT };
+
+    // Two independent establishes against one tailnet — i.e. `ccctl tunnel tailscale` run twice.
+    await new TailscaleTunnel(runner, provisioning).establish(LOOPBACK);
+    await new TailscaleTunnel(runner, provisioning).establish(LOOPBACK);
+
+    expect(acl.current().grants).toEqual([CCCTL_GRANT]);
+    // Only the FIRST establish wrote; the second read the policy, saw its grant, and skipped.
+    expect(acl.saveCount()).toBe(1);
+    expect(acl.fetchCount()).toBe(2);
+  });
+
+  // Rule (#242): an equal grant already in the policy is value-indistinguishable from one the operator
+  // hand-authored — so an establish that did not append it must not claim it for revert either. The
+  // adapter's managed scope stays exactly "the grant THIS instance added".
+  it("does not revert a grant it did not add — teardown of a skipped establish leaves the policy alone", async () => {
+    const acl = fakeAclClient({ ...OPERATOR_POLICY, grants: [CCCTL_GRANT] });
+    const { runner, calls } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const tunnel = new TailscaleTunnel(runner, { client: acl.client, grant: CCCTL_GRANT });
+
+    await tunnel.establish(LOOPBACK);
+    await tunnel.teardown();
+
+    // The pre-existing grant survives — it was never ours …
+    expect(acl.current().grants).toEqual([CCCTL_GRANT]);
+    expect(acl.saveCount()).toBe(0);
+    // … while the mapping this instance DID make is still released.
+    expect(calls.some((c) => c.args.join(" ") === "serve --bg http://127.0.0.1:4321 off")).toBe(true);
+  });
+
+  // Rule (#242 AC2): `tailscale serve --bg` is detached, so the grant outlives the process that
+  // appended it. A LATER process (the `ccctl tunnel <kind> --off` down-verb) rebuilds the release
+  // handles from the same operator-supplied endpoint + declared grant and reverts it — with no
+  // establish of its own, which is exactly the state a fresh process is in.
+  it("adopt lets a fresh instance revert a grant a previous establish left behind", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const provisioning = { client: acl.client, grant: CCCTL_GRANT };
+
+    // Process 1: establish, then vanish (fire-and-forget) — the grant is left in the policy.
+    await new TailscaleTunnel(runner, provisioning).establish(LOOPBACK);
+    expect(acl.current().grants).toEqual([CCCTL_GRANT]);
+
+    // Process 2: a brand-new instance that never established anything.
+    const { runner: downRunner, calls: downCalls } = fakeRunner(() => ({ stdout: "", stderr: "" }));
+    const down = new TailscaleTunnel(downRunner, provisioning);
+    down.adopt(LOOPBACK);
+    await down.teardown();
+
+    // The grant is gone …
+    expect(acl.current().grants).toEqual([]);
+    // … and the detached mapping is turned off — the same targeted off-command establish's own
+    // teardown would have run.
+    expect(downCalls.map((c) => c.args.join(" "))).toEqual(["serve --bg http://127.0.0.1:4321 off"]);
+  });
+
+  // Rule (#242): adopt seeds RELEASE HANDLES, not a claim about reachability. An adopting instance
+  // never resolved a public host, and an `up` TunnelStatus must carry one — so it stays `down`, the
+  // same rule that makes a served-but-unresolved establish "not a usable up".
+  it("adopt does not report up: it seeds what teardown needs, not a reachable base", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    const { runner } = fakeRunner(() => ({ stdout: "", stderr: "" }));
+    const tunnel = new TailscaleTunnel(runner, { client: acl.client, grant: CCCTL_GRANT });
+
+    tunnel.adopt(LOOPBACK);
+
+    expect(await tunnel.status()).toEqual({ kind: "tailscale", up: false });
+  });
+
+  // Rule (#242): adopt honours the opt-in. With no provisioning configured the establish wrote no
+  // policy, so there is no grant to remove and the down path must not reach for the API at all.
+  it("adopt with no provisioning releases only the mapping — no policy read, no write", async () => {
+    const { runner, calls } = fakeRunner(() => ({ stdout: "", stderr: "" }));
+    const tunnel = new TailscaleTunnel(runner);
+
+    tunnel.adopt(LOOPBACK);
+    await tunnel.teardown();
+
+    expect(calls.map((c) => c.args.join(" "))).toEqual(["serve --bg http://127.0.0.1:4321 off"]);
+  });
+
+  // Rule (#242): an adopting process cannot know whether the establish created the `grants` key, so it
+  // must not delete it — that would be an edit to the operator's policy beyond the managed scope. It
+  // leaves `grants: []`, which is strictly "only our own grant was removed". Every operator rule is
+  // still carried verbatim, exactly as on the establish-side revert.
+  it("adopt's revert never deletes the grants key it cannot claim, and disturbs no operator rule", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    const provisioning = { client: acl.client, grant: CCCTL_GRANT };
+    await new TailscaleTunnel(runner, provisioning).establish(LOOPBACK);
+
+    const down = new TailscaleTunnel(fakeRunner(() => ({ stdout: "", stderr: "" })).runner, provisioning);
+    down.adopt(LOOPBACK);
+    await down.teardown();
+
+    const after = acl.current();
+    expect(after.grants).toEqual([]);
+    expect(after.acls).toEqual(OPERATOR_POLICY.acls);
+    expect(after.groups).toEqual(OPERATOR_POLICY.groups);
+    expect(after.tagOwners).toEqual(OPERATOR_POLICY.tagOwners);
+    expect(after.ssh).toEqual(OPERATOR_POLICY.ssh);
+  });
+
+  // Rule (#242 AC4, on the adopt path too): a failed revert must leave the tunnel established and
+  // retryable — the mapping is NOT released and the grant is NOT abandoned, so the operator can just
+  // run the down-verb again.
+  it("adopt's teardown stays retryable when the revert write fails: the mapping is not released", async () => {
+    const acl = fakeAclClient(OPERATOR_POLICY);
+    const { runner } = fakeRunner(tailscaleHandler(statusJson({ DNSName: "host.ts.net." })));
+    await new TailscaleTunnel(runner, { client: acl.client, grant: CCCTL_GRANT }).establish(LOOPBACK);
+
+    let failOnce = true;
+    const flaky: TailscaleAclClient = {
+      fetchPolicy: () => acl.client.fetchPolicy(),
+      savePolicy: (next, etag) => {
+        if (failOnce) {
+          failOnce = false;
+          return Promise.reject(new Error("ccctl-test: adopt revert boom"));
+        }
+        return acl.client.savePolicy(next, etag);
+      },
+    };
+    const { runner: downRunner, calls: downCalls } = fakeRunner(() => ({ stdout: "", stderr: "" }));
+    const down = new TailscaleTunnel(downRunner, { client: flaky, grant: CCCTL_GRANT });
+    down.adopt(LOOPBACK);
+
+    await expect(down.teardown()).rejects.toThrow(/adopt revert boom/);
+    // Revert failed → the serve is NOT turned off, and the grant is still there to retry against.
+    expect(downCalls).toHaveLength(0);
+    expect(acl.current().grants).toEqual([CCCTL_GRANT]);
+
+    // Retry completes both halves.
+    await down.teardown();
+    expect(acl.current().grants).toEqual([]);
+    expect(downCalls.map((c) => c.args.join(" "))).toEqual(["serve --bg http://127.0.0.1:4321 off"]);
   });
 
   it("keeps the credential off the tunnel's outputs: establish / status carry only kind + publicHost", async () => {

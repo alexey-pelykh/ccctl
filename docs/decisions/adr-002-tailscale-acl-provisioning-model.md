@@ -3,7 +3,8 @@ type: architecture-decision-record
 number: 2
 title: "Tailscale ACL provisioning: opt-in, additive, non-destructive grants behind an injected API seam"
 date: 2026-07-13
-status: approved
+status: superseded
+superseded_by: 4
 decision_makers: [ccctl maintainer]
 related_issues: [148, 56]
 impact: medium
@@ -13,8 +14,22 @@ impact: medium
 
 ## Status
 
-**Approved** — 2026-07-13. Implemented by [#148] (the `TailscaleAclClient` seam,
-non-destructive provisioning in `TailscaleTunnel`, and the credential-hygiene tests).
+**Superseded** — 2026-07-17, by
+[ADR-004](adr-004-tailscale-acl-grant-lifecycle-from-the-cli.md), which drives this
+model's lifecycle from the CLI (the wiring that § Risks below deferred) and, in doing so,
+amends two clauses of it. **Read ADR-004 for the current model**; most of this record
+carries forward there unchanged, but two statements below are no longer accurate:
+
+- § (1) "on `establish` it appends that one grant" — provisioning is now idempotent:
+  it appends only if no equal grant is already present (ADR-004 § (5)).
+- § (1) "a duplicate operator grant of the same shape is **never** collaterally
+  dropped" — still true of `establish`/`teardown`, but the `ccctl tunnel <kind> --off`
+  down-verb asserts ownership it cannot verify, so it CAN remove an identical grant
+  `ccctl` did not add (ADR-004 § (6)).
+
+Originally **approved** — 2026-07-13, implemented by [#148] (the `TailscaleAclClient`
+seam, non-destructive provisioning in `TailscaleTunnel`, and the credential-hygiene
+tests).
 
 ## Decision Makers
 

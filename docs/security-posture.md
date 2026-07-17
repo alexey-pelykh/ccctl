@@ -213,18 +213,55 @@ so a session can read it, as it can any environment variable. That is inherited
 ambient state rather than a sink `ccctl` writes to, but an `acl`-scoped tailnet
 credential is worth siting deliberately (see the [`@ccctl/cli` README](../packages/cli/README.md)).
 
-**The revert half is not yet reachable from the CLI — [#242].** The adapter removes
-its grant on tunnel teardown, but no `ccctl` verb tears a tunnel down today
-(`tailscale serve --bg` is a detached mapping that outlives `ccctl tunnel` by
-design, and `serve --tunnel`'s shutdown path closes the daemon without touching the
-tunnel), so a provisioned grant is currently appended and left in place: repeated
-establishes append duplicate copies, and a grant outlives a hand-stopped tunnel.
-This is policy **cruft, not a privilege escalation** — what is left behind is exactly
-the grant the operator declared (`ccctl` authors none), no operator-authored rule is
-touched, and nothing widens beyond it — and it is reachable only by opting in with
-both variables. It is a deliberate, recorded boundary (mirroring how [#139] deferred
-ACL provisioning itself), tracked at [#242] and documented in the
-[`@ccctl/cli` README](../packages/cli/README.md).
+**The grant is bracketed to the tunnel's lifetime, from the CLI — [#242].**
+[ADR-004](decisions/adr-004-tailscale-acl-grant-lifecycle-from-the-cli.md) (superseding
+ADR-002) brackets the scoped grant to the session (`establish` appends, `teardown`
+reverts), and both CLI paths now reach that `teardown`. Which one does depends on who
+owns the tunnel's lifetime:
+
+- **`ccctl serve --tunnel <kind>`** — the daemon owns it, so the local-shutdown floor
+  below reverts the grant and releases the mapping as it stops. Nothing extra to run.
+  The floor closes the server **first** and reverts **after**, best-effort within a
+  short budget: closing the server is what ends reach (nothing is listening after it),
+  so the floor is never gated on a round-trip to `api.tailscale.com` — unreachable
+  exactly when a termination signal tends to fire.
+- **`ccctl tunnel <kind>`** — deliberately still **fire-and-forget**: a detached
+  `tailscale serve --bg` mapping is meant to outlive the command, and bracketing the
+  verb's own lifetime would make it a blocking verb instead. Its revert is
+  **`ccctl tunnel <kind> --off`**, which rebuilds what it needs to release from the
+  same operator-supplied endpoint and declared grant, then reverts.
+
+Provisioning is also **idempotent**: an establish appends its grant only when no equal
+grant is present, so repeated establishes leave one copy rather than accumulating one
+per run. A revert that fails leaves the tunnel established and the grant in place rather
+than half-reverting; the daemon reports it on the structured log trail
+(`tunnel-teardown-failed`, #61) and exits non-zero rather than claiming a clean stop over
+a grant it did not remove.
+
+The two verbs resolve one ambiguity in **opposite directions, deliberately** (ADR-004
+§ (5)/(6)). Grants are compared by value, so `ccctl` cannot distinguish its own copy from
+an identical operator-authored rule. An `establish` — an implicit side effect of bringing
+a tunnel up — is conservative: finding an equal grant, it appends nothing and claims
+nothing to revert. `--off` is an explicit operator instruction, so it removes the declared
+grant whether or not `ccctl` added it; it asserts an ownership it cannot verify. The
+bounded cost: an operator who _also_ hand-authors their declared grant as a permanent rule
+loses it to `--off`. Removal-only (grants are allow-only, so this can never widen), scoped
+to the single declared grant, and mitigated by a documented usage rule — keep
+`CCCTL_TAILSCALE_ACL_GRANT` ccctl-managed and ephemeral.
+
+What can still outlive a session is bounded and operator-visible: a grant survives a
+tunnel stopped **outside** `ccctl` (a bare `tailscale serve … off`, or a `SIGKILL` that
+runs no handler), and a shutdown whose revert outran its budget. `--off` clears the
+residue in either case. Whatever is left behind is exactly the grant the operator
+declared (`ccctl` authors none), no operator-authored rule is touched, and nothing widens
+beyond it — policy **cruft, not a privilege escalation** — and it is reachable only by
+opting in with both variables.
+
+The converse case, where several daemons share one env config: idempotence means only the
+daemon that **established first** appends and records the grant, so only its shutdown
+revokes it — while the others are still serving. That is fail-closed (access is only ever
+removed, never widened), and the remedy is operator-side rather than `--off`: give each
+daemon its own grant.
 
 ### Local control floor
 
@@ -442,7 +479,6 @@ still forward-looking:
 [#66]: https://github.com/alexey-pelykh/ccctl/issues/66
 [#67]: https://github.com/alexey-pelykh/ccctl/issues/67
 [#133]: https://github.com/alexey-pelykh/ccctl/issues/133
-[#139]: https://github.com/alexey-pelykh/ccctl/pull/139
 [#242]: https://github.com/alexey-pelykh/ccctl/issues/242
 [pr #104]: https://github.com/alexey-pelykh/ccctl/pull/104
 [`full-flow-gate.ts`]: ../packages/e2e/src/full-flow-gate.ts

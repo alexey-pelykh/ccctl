@@ -13,10 +13,14 @@
  *   - `ccctl serve` — start the loopback-bound {@link https://ccctl | @ccctl/server}
  *     daemon, optionally exposing it through a tunnel in one step (`--tunnel`).
  *   - `ccctl tunnel <kind>` — establish a {@link https://ccctl | @ccctl/tunnel-adapters}
- *     tunnel to an already-running loopback server.
+ *     tunnel to an already-running loopback server, or take one back down (`--off`).
  *
  * Composed, they are the working local setup: `patch` the worker, `serve` the daemon,
- * and expose it via a `tunnel`. `serve` still enforces the baseline startup guards
+ * and expose it via a `tunnel`. Each tunnel path also brackets the ACL grant the adapter
+ * may provision to the tunnel's lifetime (#242), which is what makes the grant revertible:
+ * `serve --tunnel` retains its tunnel so the daemon's shutdown releases it, while the
+ * fire-and-forget `tunnel` verb (whose `--bg` mapping is meant to outlive it) is reverted
+ * out-of-band by `--off`. `serve` still enforces the baseline startup guards
  * (refuse-start-without-auth + localhost-bind, #14) BEFORE anything binds; completing
  * each guard to spec is tracked separately (the auth credential boundary is #57, the
  * full localhost-bind guarantee is #58).
@@ -73,7 +77,7 @@ import {
   type SessionStopOptions,
   type StopAcceptedWire,
 } from "@ccctl/server";
-import type { TunnelKind } from "@ccctl/tunnel-adapters";
+import type { Tunnel, TunnelKind } from "@ccctl/tunnel-adapters";
 import { defaultDependencies, type CliDependencies } from "./dependencies.js";
 import type { SteerCommand } from "./session-client.js";
 
@@ -117,9 +121,17 @@ function serverUrl(host: string, port: number): string {
  * the raw token is never logged in plaintext. The single place that reports a freshly-exposed
  * tunnel, shared by `serve --tunnel` and the standalone `tunnel` verb — both make the loopback
  * server reachable off-box, so both are device-onboarding moments.
+ *
+ * RETURNS the tunnel it brought up rather than dropping it (#242): the instance owns the
+ * lifecycle state `teardown` needs (the serve mapping, and any ACL grant the adapter
+ * provisioned), so a caller that outlives the establish — the `serve` daemon — must retain it
+ * to have a revert path at all. `serve --tunnel` hands it to the shutdown path; the
+ * fire-and-forget `tunnel` verb has nothing to retain it FOR and discards it deliberately
+ * (see that verb).
  */
-async function establishAndReport(deps: CliDependencies, kind: TunnelKind, local: HostEndpoint): Promise<void> {
-  const established = await deps.adapters[kind]().establish(local);
+async function establishAndReport(deps: CliDependencies, kind: TunnelKind, local: HostEndpoint): Promise<Tunnel> {
+  const tunnel = deps.adapters[kind]();
+  const established = await tunnel.establish(local);
   console.log(`ccctl: reachable via ${established.kind} at ${established.publicHost}`);
 
   // Mint a fresh per-device token and print it as a QR the phone scans to open the UI already
@@ -134,6 +146,33 @@ async function establishAndReport(deps: CliDependencies, kind: TunnelKind, local
   // Print the URL redacted — the QR is the token's only intended exit surface, so the plaintext
   // token never lands in the terminal scrollback or a captured log.
   console.log(`ccctl: pairing URL — ${loggablePairingUrl(pairingUrl)}`);
+  return tunnel;
+}
+
+/**
+ * Take a previously-established tunnel down (`ccctl tunnel <kind> --off`, #242) — the revert half of
+ * the fire-and-forget `tunnel` verb, and the one the ACL grant needs: turn the mapping off and remove
+ * the grant the establish appended.
+ *
+ * Works ACROSS processes, which is the whole point. `tailscale serve --bg` is detached and outlives the
+ * `ccctl tunnel` that created it, so this runs with none of that establish's in-process lifecycle state
+ * — it rebuilds the release handles via {@link https://ccctl | Tunnel.adopt} from the same two
+ * operator-supplied inputs the establish used: the endpoint (the same `--host`/`--port`, which is why
+ * they live on the one verb) and the declared grant (the same `CCCTL_TAILSCALE_ACL_GRANT`, resolved by
+ * the same composition root). Give it a different endpoint than you served and it targets a different
+ * mapping — the adapter tears down what it is told to, exactly as `tailscale serve … off` does.
+ *
+ * No QR / pairing block, unlike {@link establishAndReport}: nothing has been exposed, so there is no
+ * device to onboard. A rejected teardown propagates (the adapter leaves the tunnel established and
+ * retryable, so a retry is the operator's next move) and `cli.ts` turns it into a non-zero exit.
+ */
+async function tearDownAndReport(deps: CliDependencies, kind: TunnelKind, local: HostEndpoint): Promise<void> {
+  const tunnel = deps.adapters[kind]();
+  tunnel.adopt(local);
+  await tunnel.teardown();
+  console.log(
+    `ccctl: ${kind} tunnel for ${serverUrl(local.host, local.port)} is down — any ACL grant it provisioned is removed.`,
+  );
 }
 
 /**
@@ -329,6 +368,11 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
         launcher: deps.launcher,
         logger,
       });
+      // The tunnel this daemon owns, once it is up (#242). Retained — rather than dropped the moment
+      // `establish` returned, which left nothing able to call `teardown` — because the daemon owns the
+      // tunnel's lifetime and so owns its teardown: the shutdown handler below reads this on its way
+      // out to release the mapping AND remove any ACL grant the adapter provisioned for it.
+      let tunnel: Tunnel | null = null;
       // Arm the on-demand heap-snapshot trigger (#62): SIGUSR2 dumps a LIVE snapshot without a restart,
       // reachable only by a same-uid local process (OS-enforced local auth — unreachable off-box). The
       // disposer is intentionally not held: the handler lives for the daemon's lifetime and process exit
@@ -343,12 +387,17 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       // lifetime and process exit tears it down, which disposes the census with it).
       deps.installInspectorDiagnosticsHandler({ logger });
       // Arm the local-shutdown floor (#82): SIGTERM/SIGINT gracefully closes the daemon — releasing
-      // every session this server owns — and exits, an OS-signal control unreachable over the tunnel
-      // and needing no device token (the "stop the server from the local machine" half of the floor,
-      // sibling to `ccctl revoke-all`). Armed AFTER the server binds so there is a bound server to
-      // close; the disposer is intentionally not held (the handler lives for the daemon's lifetime and
-      // process exit tears it down), matching the two diagnostic handlers above.
-      deps.installShutdownHandler({ server, logger });
+      // every session this server owns, then releasing the tunnel that exposed it (#242, best-effort and
+      // time-boxed so the floor is never gated on a third-party API) — and exits, an OS-signal control
+      // unreachable over the tunnel and needing no device token (the "stop the server from the local
+      // machine" half of the floor, sibling to `ccctl revoke-all`). Armed AFTER the server binds so there
+      // is a bound server to close, but deliberately BEFORE the tunnel is established, so a Ctrl-C during
+      // a slow establish still shuts down gracefully — hence the tunnel is passed as a thunk the handler
+      // resolves at SIGNAL time, when `tunnel` holds whatever the daemon actually owns (the established
+      // tunnel, or still `null` if the establish never finished). The disposer is intentionally not held
+      // (the handler lives for the daemon's lifetime and process exit tears it down), matching the two
+      // diagnostic handlers above.
+      deps.installShutdownHandler({ server, logger, tunnel: () => tunnel });
       // Report the address actually bound (`server.address` carries the resolved port,
       // which matters when `--port 0` selects an ephemeral one).
       console.log(`ccctl: serving on ${serverUrl(server.address.host, server.address.port)}`);
@@ -381,7 +430,9 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
         // listening socket would otherwise keep the process alive with the exit code set but never
         // applied. `--tunnel` is atomic: both come up, or it fails clean.
         try {
-          await establishAndReport(deps, kind, server.address);
+          // Retained for the shutdown handler armed above — assigned only on success, so a failed
+          // establish leaves the thunk answering `null` (there is no usable tunnel to release).
+          tunnel = await establishAndReport(deps, kind, server.address);
         } catch (error) {
           await server.close();
           throw error;
@@ -391,18 +442,34 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       // The listening socket keeps the process alive; there is nothing more to do here.
     });
 
-  // --- tunnel: establish a tunnel to an already-running server ----------------------
+  // --- tunnel: establish a tunnel to an already-running server (or take one down) ---
+  //
+  // The verb stays FIRE-AND-FORGET (#242): `tailscale serve --bg` is a DETACHED mapping that is meant
+  // to outlive the command, so `ccctl tunnel` establishes it and exits — it does not hold the tunnel
+  // open and tear it down on Ctrl-C. Bracketing its own lifetime would make it a blocking verb, which
+  // is a different verb with different semantics (and `serve --tunnel` is already the one that holds a
+  // tunnel for as long as something is being served). The revert half is `--off` instead: the same verb
+  // with the SAME `--host`/`--port`, because the off-target must name the mapping the establish made —
+  // which is also why the two share one option surface rather than living in a separate `tunnel down`.
   program
     .command("tunnel")
-    .description("Establish a tunnel exposing an already-running loopback server")
+    .description("Establish a tunnel exposing an already-running loopback server, or take one down (--off)")
     .argument("<kind>", `tunnel backend (${tunnelChoices})`)
     .option("-p, --port <port>", "loopback port the server is on", "4321")
     .option("--host <host>", "loopback host the server is on", DEFAULT_HOST)
-    .action(async (kindArg: string, options: { port: string; host: string }) => {
+    .option("--off", "take the tunnel down instead: release the mapping and remove the ACL grant it provisioned")
+    .action(async (kindArg: string, options: { port: string; host: string; off?: boolean }) => {
       const kind = requireTunnelKind(deps.adapters, kindArg);
       const host = resolveBindHost(options.host);
       const port = parsePort(options.port);
 
+      if (options.off === true) {
+        await tearDownAndReport(deps, kind, { host, port });
+        return;
+      }
+      // Fire-and-forget: the mapping is detached and outlives this process, so the tunnel instance is
+      // deliberately not retained — `--off` (above) rebuilds what it needs to release it. Nothing here
+      // could hold it anyway: the verb has no listening socket and the process exits on return.
       await establishAndReport(deps, kind, { host, port });
     });
 
