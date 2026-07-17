@@ -263,3 +263,64 @@ describe("UI command ingress — per-session fetch POST /api/sessions/{id}/comma
     expect(res.headers.get("allow")).toBe("POST");
   });
 });
+
+describe("UI answer verb — POST /api/sessions/{id}/command { subtype: 'answer' } (#264, #78 Option A)", () => {
+  it("relays a well-formed AnswerEnvelope as a control_request carrying the normalized envelope", async () => {
+    const server = await startTestServer();
+    const { sessionId, frames } = await readyWorker(server);
+
+    const res = await postCommand(server, sessionId, { subtype: "answer", payload: { answers: { q0: ["Yes"] } } });
+    expect(res.status).toBe(202);
+    const { id } = (await res.json()) as { id: string };
+
+    await waitFor(() => frames().length === 1);
+    const payload = frames()[0].data.payload as Record<string, unknown>;
+    expect(payload).toEqual({ type: "control_request", id, subtype: "answer", payload: { answers: { q0: ["Yes"] } } });
+  });
+
+  it("normalizes the answer at the boundary — no control character rides down to the worker (#261 trust boundary)", async () => {
+    const server = await startTestServer();
+    const { sessionId, frames } = await readyWorker(server);
+
+    // A BEL smuggled into a label: the boundary must strip it, so nothing hostile reaches the worker.
+    const res = await postCommand(server, sessionId, {
+      subtype: "answer",
+      payload: { answers: { q0: ["Ap\u0007prove"] } },
+    });
+    expect(res.status).toBe(202);
+
+    await waitFor(() => frames().length === 1);
+    const relayed = frames()[0].data.payload as { payload: { answers: Record<string, string[]> } };
+    expect(relayed.payload.answers.q0[0]).not.toContain("\u0007");
+  });
+
+  it("rejects a malformed answer envelope BEFORE any relay (400), and never opens the worker frame", async () => {
+    const server = await startTestServer();
+    const { sessionId, frames } = await readyWorker(server);
+
+    // A bare-string selection (not the uniform array `AnswerEnvelope` demands) fails the #261 shape guard.
+    expect(
+      (await postCommand(server, sessionId, { subtype: "answer", payload: { answers: { q0: "Yes" } } })).status,
+    ).toBe(400);
+    // An empty `answers` map answers nothing.
+    expect((await postCommand(server, sessionId, { subtype: "answer", payload: { answers: {} } })).status).toBe(400);
+    // A key outside the minted `q<index>` grammar core validates against.
+    expect(
+      (await postCommand(server, sessionId, { subtype: "answer", payload: { answers: { nope: ["x"] } } })).status,
+    ).toBe(400);
+    // No payload at all.
+    expect((await postCommand(server, sessionId, { subtype: "answer" })).status).toBe(400);
+
+    // A rejected answer is never relayed — nothing reached the worker.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(frames()).toHaveLength(0);
+  });
+
+  it("fails closed when the addressed session has no live worker channel, even for a valid answer (409)", async () => {
+    const server = await startTestServer();
+    const sessionId = await registerSession(server);
+    // Registered, but the worker never opened its downstream: a well-formed answer still cannot land.
+    const res = await postCommand(server, sessionId, { subtype: "answer", payload: { answers: { q0: ["Yes"] } } });
+    expect(res.status).toBe(409);
+  });
+});

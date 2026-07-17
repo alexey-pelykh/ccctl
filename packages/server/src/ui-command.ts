@@ -17,6 +17,11 @@
  *
  *   - `prompt` (send input) → a `{ type: "user" }` turn ({@link injectUserTurn}) — the
  *     user's text becomes a user message, the load-bearing turn injection (#130).
+ *   - `answer` (an `AskUserQuestion` reply, #264) → a `{ type: "control_request" }` carrying a
+ *     `@ccctl/core` `AnswerEnvelope` ({@link dispatchControlRequest}). The envelope is shape-validated
+ *     and NORMALIZED at this boundary (a malformed one is a 400, and label normalization keeps any
+ *     control character from riding an answer back to the worker); #86 layers the stateful freshness
+ *     check (nonce / TTL, against the #264 buffer) on top of this transport.
  *   - any other verb (`approve` / `interrupt`) → a `{ type: "control_request" }`
  *     ({@link dispatchControlRequest}), the server MINTING the correlation id (the id is
  *     the server's handle, not the browser's to choose).
@@ -30,12 +35,15 @@
 
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { ControlRequest } from "@ccctl/core";
+import { answerEnvelopeFromValue, type ControlRequest } from "@ccctl/core";
 import { writeError, writeJson } from "./http-response.js";
 import { dispatchControlRequest, injectUserTurn, type WorkerChannelState } from "./worker-channel.js";
 
 /** The "send input" steer verb — mapped to a `{ type: "user" }` turn injection (mirrors `@ccctl/web-ui`). */
 const INPUT_SUBTYPE = "prompt";
+
+/** The "answer an AskUserQuestion" steer verb (#264) — its payload is a `@ccctl/core` `AnswerEnvelope`. */
+const ANSWER_SUBTYPE = "answer";
 
 /**
  * Hard ceiling on a command body (1 MiB). Generous for a UI steer — even a large
@@ -141,6 +149,13 @@ export function handleUiCommand(
         return;
       }
     }
+    // An `answer` steer (#264) needs a well-formed `AnswerEnvelope` payload before anything is relayed
+    // (400) — the same fail-closed shape guard `@ccctl/core` mints, which #86 later extends with its
+    // stateful nonce/TTL check against the buffered enrichment.
+    if (command.subtype === ANSWER_SUBTYPE && answerEnvelopeFromValue(command.payload) === null) {
+      writeError(res, 400, "ccctl: an `answer` command requires a well-formed `payload` AnswerEnvelope");
+      return;
+    }
     // The server owns the correlation id; the browser does not choose it.
     const id = randomUUID();
     try {
@@ -171,6 +186,21 @@ export function handleUiCommand(
 function relayCommand(state: WorkerChannelState, sessionId: string, id: string, command: UiCommand): void {
   if (command.subtype === INPUT_SUBTYPE) {
     injectUserTurn(state, sessionId, command.payload?.text as string);
+    return;
+  }
+  if (command.subtype === ANSWER_SUBTYPE) {
+    // The handler already rejected a malformed answer (400), so this re-parse is non-null. Dispatching the
+    // NORMALIZED envelope rather than the raw `command.payload` is the point: `answerEnvelopeFromValue`
+    // strips control characters from every label, so nothing hostile rides the answer down to the worker.
+    const answer = answerEnvelopeFromValue(command.payload);
+    if (answer !== null) {
+      dispatchControlRequest(state, sessionId, {
+        type: "control_request",
+        id,
+        subtype: ANSWER_SUBTYPE,
+        payload: { ...answer },
+      });
+    }
     return;
   }
   const request: ControlRequest =

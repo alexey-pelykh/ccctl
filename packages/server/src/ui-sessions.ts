@@ -35,7 +35,13 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Session, SessionActivity, SessionStatus } from "@ccctl/core";
+import {
+  isInputAwaited,
+  type RequiresActionEnrichment,
+  type Session,
+  type SessionActivity,
+  type SessionStatus,
+} from "@ccctl/core";
 import { sessionMessageCursor, type SessionEventRelays } from "./event-stream.js";
 import { writeError, writeJson } from "./http-response.js";
 
@@ -95,6 +101,15 @@ export interface UiSessionsState {
    * the server's {@link SessionEventRelays}, so this module stays decoupled from the HTTP wiring.
    */
   readonly eventRelays: SessionEventRelays;
+  /**
+   * The per-session `AskUserQuestion` enrichment buffer (#264), keyed by ccctl session id — read (never
+   * mutated) so the list surfaces the outstanding question + tappable options for a session blocked in
+   * `requires_action` (#87 renders it; #86 validates the answer against it). Present ONLY while the block
+   * stands: the worker channel buffers it on the §5 `input_request` frame and drops it on transition out.
+   * The verbatim SSE relay carries the raw frame LIVE; this read is what a UI that connected afterwards
+   * reads instead of missing it. A structural subset of the server's map, so this module stays decoupled.
+   */
+  readonly requiresActionEnrichments: ReadonlyMap<string, RequiresActionEnrichment>;
 }
 
 /** One session's projection on the `GET /api/sessions` list wire: its id + own state. */
@@ -129,6 +144,16 @@ export interface SessionSummaryWire {
    * every session (including one it is not viewing, whose offline-queued steer must still be guarded).
    */
   readonly cursor: number;
+  /**
+   * The session's outstanding `AskUserQuestion` enrichment ({@link RequiresActionEnrichment}, #264), or
+   * OMITTED when the session is not blocking on a decorated `requires_action` block. The buffered
+   * question + tappable options a UI renders (#87) and validates an answer against (#86); it rides the
+   * list the picker already polls, exactly as {@link cursor} does, so a client that connected after the
+   * §5 `input_request` frame was relayed still learns of the block. DISPLAY data only — its presence NEVER
+   * implies needs-you (that is `activity.kind === "requires_action"`, the sole #40 signal); a
+   * `requires_action` with no enrichment still blocks, and this field is simply absent.
+   */
+  readonly enrichment?: RequiresActionEnrichment;
 }
 
 /**
@@ -140,14 +165,29 @@ export interface SessionSummaryWire {
  * `relays` parameter. An explicit wire projection, matching the codebase's explicit-DTO
  * discipline (session-create-wire, bridge-wire).
  */
-function sessionSummary(session: Session, relays: SessionEventRelays): SessionSummaryWire {
-  return {
+function sessionSummary(
+  session: Session,
+  relays: SessionEventRelays,
+  enrichments: ReadonlyMap<string, RequiresActionEnrichment>,
+): SessionSummaryWire {
+  const summary: SessionSummaryWire = {
     id: session.id,
     status: session.status,
     activity: session.activity,
     notificationsDegraded: session.notificationsDegraded,
     cursor: sessionMessageCursor(relays, session.id),
   };
+  // Serve the buffered enrichment ONLY while the session is genuinely blocking on `requires_action`
+  // ({@link isInputAwaited}) — so a decoration never surfaces on a session with no live block at all (a
+  // lone `input_request` a misbehaving worker sent without a `requires_action` stays buffered but
+  // unserved). The gate is blocking-PRESENCE only: it does NOT match the buffered `sequenceNum` against
+  // the live block's, so it cannot guarantee this enrichment decorates the CURRENT block rather than a
+  // superseded one — that per-block correlation (join-on-`sequence_num` / discard-on-mismatch) is #87's
+  // job, not #264's. OMIT the key otherwise rather than emit a literal `undefined`, matching the
+  // codebase's absent-optional discipline (a present key means a real, outstanding payload). Reading
+  // needs-you off `activity`, never off this field, stays the sole #40 contract.
+  const enrichment = isInputAwaited(session.activity) ? enrichments.get(session.id) : undefined;
+  return enrichment === undefined ? summary : { ...summary, enrichment };
 }
 
 /**
@@ -162,6 +202,8 @@ export function handleSessionsList(req: IncomingMessage, res: ServerResponse, st
     writeError(res, 405, `ccctl: ${req.method ?? "?"} not allowed on ${UI_SESSIONS_PATH}`);
     return;
   }
-  const sessions = [...state.sessions.values()].map((session) => sessionSummary(session, state.eventRelays));
+  const sessions = [...state.sessions.values()].map((session) =>
+    sessionSummary(session, state.eventRelays, state.requiresActionEnrichments),
+  );
   writeJson(res, 200, { sessions });
 }

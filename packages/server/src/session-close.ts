@@ -63,7 +63,14 @@
  * TTL nobody has a number for, and none of that is what "reflected to clients" asks for.
  */
 
-import { markSessionClosed, type JsonValue, type Logger, type Session, type SessionStatus } from "@ccctl/core";
+import {
+  markSessionClosed,
+  type JsonValue,
+  type Logger,
+  type RequiresActionEnrichment,
+  type Session,
+  type SessionStatus,
+} from "@ccctl/core";
 import { broadcastEvent, closeSessionRelay, type SessionEventRelays } from "./event-stream.js";
 
 /**
@@ -132,6 +139,13 @@ export interface SessionCloseState {
   readonly sessions: Map<string, Session>;
   /** The per-session UI event relays — the ending session's watchers are told (#196), then it is reaped (#176). */
   readonly eventRelays: SessionEventRelays;
+  /**
+   * The per-session `AskUserQuestion` enrichment buffer (#264) — the ending session's entry is dropped here
+   * too. A session that closes while still in `requires_action` never fires the transition-out drop (close
+   * moves `status`, not `activity`), so without this the decoration would outlive the session's row: a
+   * bounded but real per-closed-session leak, exactly the kind {@link closeSessionRelay} exists to prevent.
+   */
+  readonly requiresActionEnrichments: Map<string, RequiresActionEnrichment>;
   /** The structured-log sink (#61) — every session death is emitted here, so a created-but-never-closed leak is diagnosable. */
   readonly logger: Logger;
 }
@@ -186,6 +200,10 @@ export function closeSession(state: SessionCloseState, sessionId: string): Sessi
   // exactly what should be thrown away.
   broadcastEvent(state.eventRelays, sessionId, sessionClosedEvent(sessionId, closed.status));
   closeSessionRelay(state.eventRelays, sessionId);
+  // Drop any buffered `AskUserQuestion` enrichment (#264) — a session closing WHILE in `requires_action`
+  // never trips the transition-out drop (close moves `status`, not `activity`), so this is where that
+  // decoration is reaped. A no-op when nothing is buffered (`Map.delete` of an absent key).
+  state.requiresActionEnrichments.delete(sessionId);
   // The one terminal-transition log (#61): every session death — a #173 eviction or a #76 stop —
   // funnels through here, so a `created` with no matching `closed` is a leaked slot the trail exposes.
   // `markSessionClosed` preserves an `errored` status, so the terminal `status` here is the diagnosis

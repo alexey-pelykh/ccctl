@@ -104,11 +104,13 @@ import {
   isWorkerStatus,
   markSessionReady,
   recordHeartbeat,
+  requiresActionEnrichmentFromFrame,
   workerStatusSequenceFromFrame,
   type ControlFrame,
   type ControlRequest,
   type JsonValue,
   type Logger,
+  type RequiresActionEnrichment,
   type Session,
 } from "@ccctl/core";
 import { broadcastEvent, type SessionEventRelays } from "./event-stream.js";
@@ -364,6 +366,17 @@ export interface WorkerChannelState extends WorkerChannelReapState {
    * same per-session stream ({@link fireIdleEvent}).
    */
   readonly eventRelays: SessionEventRelays;
+  /**
+   * The per-session `AskUserQuestion` enrichment buffer (#264, #78 Option A), keyed by ccctl session id.
+   * The §5 `input_request` frame (#261) is a worker emission decorating a `requires_action` block; the
+   * server buffers its {@link RequiresActionEnrichment} here on arrival ({@link bufferInputRequestEnrichment})
+   * so the per-session read serves the outstanding question + tappable options to a UI that connected AFTER
+   * the frame was relayed live. Dropped on transition OUT of `requires_action` ({@link reconcileEnrichmentBuffer},
+   * both status legs) — mirroring the {@link capturedRequiresActionDetail} lifecycle in `@ccctl/core` — and on
+   * teardown ({@link closeSession}). It is DISPLAY state ONLY: writing / dropping it never touches
+   * {@link Session.activity}, so it structurally cannot set or clear the #40 needs-you signal.
+   */
+  readonly requiresActionEnrichments: Map<string, RequiresActionEnrichment>;
   /**
    * The structured-log sink (#61) — the worker channel is where the daemon's stall signals live:
    * `ready` transitions, `worker_status` activity changes, staleness, and the needs-you / idle
@@ -689,6 +702,44 @@ function recordStatusSequence(record: WorkerChannelRecord, sequence: number | nu
 }
 
 /**
+ * Buffer the `AskUserQuestion` enrichment a §5 `input_request` frame carries (#264, #78 Option A), keyed
+ * by session id, when the payload IS a well-formed one. The single seam that populates
+ * {@link WorkerChannelState.requiresActionEnrichments}: a decoded relay payload is `unknown`, so it is
+ * narrowed to a plain object and handed to `@ccctl/core`'s {@link requiresActionEnrichmentFromFrame} — the
+ * SAME fail-closed shape guard the browser will re-read the raw frame through, which returns `null` for
+ * anything that is not an `input_request` or whose payload is malformed.
+ *
+ * **Fail-safe toward blocking (#40 / SRV-C-002).** A malformed or non-enrichment frame buffers NOTHING and
+ * touches nothing else: the `requires_action` block a `worker_status` frame set stands bare, never cleared.
+ * And buffering is PURELY additive — it writes only this display map, never {@link Session.activity} — so an
+ * enrichment can neither set nor clear the needs-you signal, by construction rather than by convention.
+ */
+function bufferInputRequestEnrichment(state: WorkerChannelState, sessionId: string, payload: unknown): void {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return;
+  }
+  const enrichment = requiresActionEnrichmentFromFrame(payload as ControlFrame);
+  if (enrichment !== null) {
+    state.requiresActionEnrichments.set(sessionId, enrichment);
+  }
+}
+
+/**
+ * Drop a session's buffered enrichment (#264) once it is no longer in `requires_action`. The inverse of the
+ * {@link capturedRequiresActionDetail} carry-forward in `@ccctl/core`: the detail is KEPT across a
+ * `requires_action` re-affirmation and lost when the session moves on, and the enrichment decorating that
+ * same block follows the same lifecycle. Level-based on the RESULTING activity (reusing `@ccctl/core`'s
+ * {@link isInputAwaited} predicate, never re-derived), so it holds through a re-affirmation and is a no-op
+ * when nothing is buffered — `Map.delete` of an absent key. Never reads or writes {@link Session.activity},
+ * so the #40 signal is untouched.
+ */
+function reconcileEnrichmentBuffer(state: WorkerChannelState, sessionId: string, next: Session): void {
+  if (!isInputAwaited(next.activity)) {
+    state.requiresActionEnrichments.delete(sessionId);
+  }
+}
+
+/**
  * Fold a §5 payload into the session's classification when it is a `worker_status` frame
  * (#39). This is the leg that carries the RICH frame — `payload: { status, detail }` — so it
  * is the ONLY place the human-ready tool description enters the session model; the §4 gate
@@ -755,6 +806,10 @@ function foldWorkerStatus(
     // The blocking sibling (#43): raise the "needs input" notification on a transition INTO
     // `requires_action`. `session` is the PRIOR state, so the transition is decided against it.
     reconcileNeedsInput(state, sessionId, session, next);
+    // Drop the buffered enrichment (#264) when the session leaves `requires_action` — the decorated block
+    // is gone, so its question must not be re-served against whatever it moved to. A no-op while the block
+    // persists (a re-affirmation) and when there is nothing buffered.
+    reconcileEnrichmentBuffer(state, sessionId, next);
   }
   return false;
 }
@@ -791,6 +846,11 @@ export function handleWorkerEvents(
         // {@link foldWorkerStatus} pins; everything else relays verbatim (#13/#15).
         const refused = foldWorkerStatus(state, record, sessionId, payload);
         if (!refused) {
+          // Buffer an `input_request` enrichment (#264) ALONGSIDE the verbatim relay, never as a
+          // substitute: `foldWorkerStatus` already no-op'd on this non-`worker_status` frame (the session
+          // model is untouched), and the browser still decodes the raw frame off the relay. This only
+          // retains the decoration so the per-session READ can serve it to a UI that connected afterwards.
+          bufferInputRequestEnrichment(state, sessionId, payload);
           broadcastEvent(state.eventRelays, sessionId, payload);
         }
       }
@@ -837,6 +897,9 @@ export function handleWorkerStatus(
       // ... and the same for the blocking needs-input notification (#43): one derivation, both legs.
       // `session` is the PRIOR state, so a bare `requires_action` re-affirmation is not a transition.
       reconcileNeedsInput(state, sessionId, session, next);
+      // ... and drop the buffered enrichment (#264) if this bare status moved the session off
+      // `requires_action` — one derivation governs both legs, exactly as the reconciles above.
+      reconcileEnrichmentBuffer(state, sessionId, next);
     }
     writeJson(res, 200, {});
   });
