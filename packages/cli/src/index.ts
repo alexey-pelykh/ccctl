@@ -452,6 +452,12 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       // tunnel's lifetime and so owns its teardown: the shutdown handler below reads this on its way
       // out to release the mapping AND remove any ACL grant the adapter provisioned for it.
       let tunnel: Tunnel | null = null;
+      // The establish while it is IN FLIGHT, and only then (#259) — the one state `tunnel` alone cannot
+      // express. "No tunnel yet" and "no tunnel ever" both read as `null` on that variable, but only the
+      // first has something to release: `TailscaleTunnel.establish` records its serve mapping the moment
+      // `tailscale serve --bg` lands, BEFORE the slow `tailscale status --json` and any ACL write. This
+      // tells the two apart, so the shutdown thunk below can answer "wait and see" instead of "nothing".
+      let establishing: Promise<void> | null = null;
       // Arm the on-demand heap-snapshot trigger (#62): SIGUSR2 dumps a LIVE snapshot without a restart,
       // reachable only by a same-uid local process (OS-enforced local auth — unreachable off-box). The
       // disposer is intentionally not held: the handler lives for the daemon's lifetime and process exit
@@ -472,11 +478,44 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       // machine" half of the floor, sibling to `ccctl revoke-all`). Armed AFTER the server binds so there
       // is a bound server to close, but deliberately BEFORE the tunnel is established, so a Ctrl-C during
       // a slow establish still shuts down gracefully — hence the tunnel is passed as a thunk the handler
-      // resolves at SIGNAL time, when `tunnel` holds whatever the daemon actually owns (the established
-      // tunnel, or still `null` if the establish never finished). The disposer is intentionally not held
-      // (the handler lives for the daemon's lifetime and process exit tears it down), matching the two
-      // diagnostic handlers above.
-      deps.installShutdownHandler({ server, logger, tunnel: () => tunnel });
+      // resolves at SIGNAL time. The disposer is intentionally not held (the handler lives for the
+      // daemon's lifetime and process exit tears it down), matching the two diagnostic handlers above.
+      //
+      // The thunk answers WHAT THE DAEMON OWNS — and, while an establish is IN FLIGHT, a releaser that
+      // WAITS TO FIND OUT (#259, the window `establishing` above describes). A signal there released
+      // nothing and exited `0`, stranding the mapping on the port it had just closed.
+      //
+      // It WAITS rather than releasing the half-up instance directly, because the establish is still
+      // WRITING the state a teardown must read. `teardown` decides the ACL revert from a synchronous
+      // read of the grant the adapter records only AFTER its policy write lands — so a teardown racing a
+      // provision reads `null`, skips the revert, and lets the write it never saw survive as an orphaned
+      // grant, a worse leak than the mapping this closes. Waiting orders the two: the establish finishes
+      // recording, THEN the teardown reads. #82's floor is not gated on it — the shutdown races this
+      // whole releaser against its own teardown budget, so a wedged establish is reported as
+      // `tunnel-teardown-failed` and the daemon still exits.
+      deps.installShutdownHandler({
+        server,
+        logger,
+        tunnel: () => {
+          const inFlight = establishing;
+          if (inFlight === null) {
+            return tunnel;
+          }
+          return {
+            teardown: async () => {
+              // SETTLEMENT, not success: a rejected establish leaves a half-up serve just as releasable
+              // (#255's whole point), and the establish error is that path's to report, never this
+              // one's — so it is swallowed here and the release runs on both outcomes.
+              await inFlight.catch(() => undefined);
+              // Whatever the establish turned out to own: the tunnel it landed, or nothing when it
+              // failed. Nothing is the RIGHT answer there rather than a gap — the `catch` below is
+              // already releasing that instance inline (#255), so `tunnel` staying `null` is exactly
+              // what keeps this from becoming a second concurrent `serve … off` on the same mapping.
+              await tunnel?.teardown();
+            },
+          };
+        },
+      });
       // Report the address actually bound (`server.address` carries the resolved port,
       // which matters when `--port 0` selects an ephemeral one).
       console.log(`ccctl: serving on ${serverUrl(server.address.host, server.address.port)}`);
@@ -515,8 +554,11 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
         // tunnel's lifetime, and a handle that only arrives on the success path cannot release a
         // failure.
         const exposing = deps.adapters[kind]();
+        // Published BEFORE it is awaited, so the thunk armed above can see an establish is running from
+        // its first tick (#259) — the window the signal races is open the moment this starts.
+        establishing = establishAndReport(deps, exposing, server.address);
         try {
-          await establishAndReport(deps, exposing, server.address);
+          await establishing;
           // Retained for the shutdown handler armed above — assigned only on success, so a failed
           // establish leaves the thunk answering `null`. Nothing is lost by that: the daemon never owns a
           // tunnel it could not establish, because the catch below releases it inline and the process is
@@ -536,6 +578,13 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
           await releaseFailedEstablish(exposing, kind);
           await closeFailedServe(server);
           throw error;
+        } finally {
+          // The establish is settled either way, so the thunk goes back to answering `tunnel` directly
+          // (#259) — a releaser that waits on a promise already settled would only add a tick. Clearing
+          // it cannot strand a signal that arrived mid-establish: that thunk call already CAPTURED the
+          // promise, and its continuation was registered after this block's, so `tunnel` is assigned
+          // before the waiter resumes to read it.
+          establishing = null;
         }
       }
 

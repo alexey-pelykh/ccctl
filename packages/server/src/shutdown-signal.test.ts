@@ -321,8 +321,9 @@ describe("installShutdownSignalHandler — tunnel release (#242)", () => {
     expect(codes).toEqual([0]);
   });
 
-  // Rule: a loopback-only daemon has no tunnel — the close path is exactly as it was, with nothing to
-  // release. Covers both the `null` thunk (establish never finished / failed) and an absent seam.
+  // Rule: a daemon with nothing to release — the close path is exactly as it was. Covers both the
+  // `null` thunk and an absent seam. `null` means NOTHING TO RELEASE (a loopback-only daemon, or an
+  // establish that settled without landing anything) — narrower than "no tunnel" (#259, see the seam).
   it("releases nothing and closes normally when there is no tunnel", async () => {
     for (const deps of [{ tunnel: () => null }, {}]) {
       const source = new EventEmitter();
