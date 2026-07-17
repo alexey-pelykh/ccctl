@@ -73,6 +73,7 @@ import {
   resolveHeapSnapshotDir,
   revokeAllPairedDevices,
   SHUTDOWN_SIGNALS,
+  type CcctlServer,
   type SessionLaunchOptions,
   type SessionStopOptions,
   type StopAcceptedWire,
@@ -122,15 +123,17 @@ function serverUrl(host: string, port: number): string {
  * tunnel, shared by `serve --tunnel` and the standalone `tunnel` verb — both make the loopback
  * server reachable off-box, so both are device-onboarding moments.
  *
- * RETURNS the tunnel it brought up rather than dropping it (#242): the instance owns the
- * lifecycle state `teardown` needs (the serve mapping, and any ACL grant the adapter
- * provisioned), so a caller that outlives the establish — the `serve` daemon — must retain it
- * to have a revert path at all. `serve --tunnel` hands it to the shutdown path; the
- * fire-and-forget `tunnel` verb has nothing to retain it FOR and discards it deliberately
- * (see that verb).
+ * TAKES the tunnel rather than constructing one (#255). The instance owns the lifecycle state
+ * `teardown` needs (the serve mapping, and any ACL grant the adapter provisioned), so a caller
+ * that outlives the establish — the `serve` daemon — must hold it to have a revert path at all.
+ * #242 had this RETURN it for that, but a return only reaches the caller on SUCCESS: a rejected
+ * establish still dropped the instance, and with it the only handle to the half-up serve
+ * underneath. Constructing it in the caller is what makes the failure path releasable — whoever
+ * owns the tunnel's lifetime holds it from the start, across both exits. `serve --tunnel` retains
+ * it for the shutdown path AND releases it on a failed establish; the fire-and-forget `tunnel`
+ * verb has nothing to retain it FOR and discards it deliberately (see that verb).
  */
-async function establishAndReport(deps: CliDependencies, kind: TunnelKind, local: HostEndpoint): Promise<Tunnel> {
-  const tunnel = deps.adapters[kind]();
+async function establishAndReport(deps: CliDependencies, tunnel: Tunnel, local: HostEndpoint): Promise<void> {
   const established = await tunnel.establish(local);
   console.log(`ccctl: reachable via ${established.kind} at ${established.publicHost}`);
 
@@ -146,7 +149,83 @@ async function establishAndReport(deps: CliDependencies, kind: TunnelKind, local
   // Print the URL redacted — the QR is the token's only intended exit surface, so the plaintext
   // token never lands in the terminal scrollback or a captured log.
   console.log(`ccctl: pairing URL — ${loggablePairingUrl(pairingUrl)}`);
-  return tunnel;
+}
+
+/** Describe a thrown value for a cleanup report — an `Error`'s message, else the value itself. */
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Release whatever a FAILED {@link Tunnel.establish} left behind (#255) — the missing half of
+ * `serve --tunnel`'s atomicity claim.
+ *
+ * `TailscaleTunnel.establish` records its serve mapping the moment `tailscale serve --bg` lands —
+ * BEFORE it verifies auth and resolves the host — precisely so a half-up serve stays releasable.
+ * Nothing ever called the `teardown` that releasability was for, so `ccctl serve --tunnel tailscale`
+ * against a node that is not an authenticated tailnet member left a detached mapping pointing at the
+ * port it then closed. `teardown` is total (a clean no-op when the serve never landed), so this is
+ * safe however far the establish got and needs no guess about which step failed.
+ *
+ * NEVER masks the establish error — which is the whole reason this is not a bare `teardown()` in the
+ * catch. The operator's question is *why the tunnel could not be established*; a release failure is a
+ * footnote to it, not an answer. So a failed release is reported here and swallowed, leaving the
+ * caller to rethrow the original untouched: `cli.ts` prints `error.message` and nothing else, so any
+ * wrapper ({@link AggregateError}, `{ cause }`) would REPLACE that answer with a summary rather than
+ * add to it. The report names what may still be out there and the verb that clears it, exactly as the
+ * shutdown path's `tunnel-teardown-failed` does (`@ccctl/server`'s `shutdown-signal.ts`).
+ *
+ * Names only the MAPPING, unhedged — unlike that shutdown report, which must also hedge about the ACL
+ * grant. On the leak this closes, a rejected `establish` cannot have left one: provisioning is its last
+ * fallible step and records only after its write succeeds, so `teardown` skips the revert entirely and
+ * drives a purely local `tailscale serve … off`. That is also why this is not time-boxed the way the
+ * shutdown release is — no third-party API round-trip on this path to budget against.
+ *
+ * That precision is a property of WHAT can reject, though, not of this function — worth stating because
+ * the caller's `try` spans `establishAndReport`, the establish PLUS the reporting after it. A step that
+ * threw AFTER a successful establish would arrive here with a grant already recorded: `teardown` would
+ * revert it over the API, unbudgeted, and this message would name half of what was left behind. No such
+ * step exists today — the reporting is string concatenation and a QR encode whose only failure mode is a
+ * payload orders of magnitude past a ~96-char pairing URL — and releasing there would still be RIGHT
+ * (the daemon is coming down either way, so a fully-up tunnel pointing at a closed port is the worse
+ * outcome). But a fallible step added later inherits both gaps: give this the budget
+ * `shutdown-signal.ts` gives its own release, and hedge this message about the grant.
+ */
+async function releaseFailedEstablish(tunnel: Tunnel, kind: TunnelKind): Promise<void> {
+  try {
+    await tunnel.teardown();
+  } catch (error) {
+    console.error(
+      `ccctl: could not release the half-up ${kind} tunnel — its serve mapping may still be in place; ` +
+        `clear it with \`ccctl tunnel ${kind} --off\`: ${reasonOf(error)}`,
+    );
+  }
+}
+
+/**
+ * Close the daemon a failed `serve --tunnel` establish is abandoning — the second half of that
+ * unwind, and {@link releaseFailedEstablish}'s sibling in every respect that matters.
+ *
+ * Reports rather than throws, for the identical reason: `close` is a cleanup step, and a cleanup
+ * failure must not become the answer to "why could the tunnel not be established". It is the SAME
+ * masking #255's AC names for the release — reached one step later, through `close` rather than
+ * `teardown` — so it gets the same treatment rather than a careful non-masking release two lines
+ * above a silent one. `@ccctl/server`'s shutdown floor already settles this shape the same way: each
+ * step reported and survived independently, neither failure skipping or standing in for the other.
+ *
+ * A rejected `close` is worth naming loudly, which is why it is reported and not swallowed silently:
+ * the process was relying on that close to stop the listening socket from holding it open, so a
+ * failure here is exactly when `ccctl` exits non-zero and then does not exit at all.
+ */
+async function closeFailedServe(server: CcctlServer): Promise<void> {
+  try {
+    await server.close();
+  } catch (error) {
+    console.error(
+      `ccctl: could not close the daemon after the tunnel failed — it may still be listening; ` +
+        `stop it with ${SHUTDOWN_SIGNALS.join(" / ")} (Ctrl-C, or \`kill ${process.pid}\`): ${reasonOf(error)}`,
+    );
+  }
 }
 
 /**
@@ -425,16 +504,37 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       );
 
       if (kind !== undefined) {
-        // Expose the bound endpoint through the chosen tunnel. If it cannot be established, tear
-        // the daemon back down rather than leave a half-up, loopback-only server running — its
-        // listening socket would otherwise keep the process alive with the exit code set but never
-        // applied. `--tunnel` is atomic: both come up, or it fails clean.
+        // Expose the bound endpoint through the chosen tunnel. If it cannot be established, release
+        // whatever the half-up establish left behind AND tear the daemon back down, rather than leave
+        // either behind: the server's listening socket would otherwise keep the process alive with the
+        // exit code set but never applied, and the serve mapping would outlive the port it points at.
+        // `--tunnel` is atomic — both come up, or it fails clean — and #255 is what made the mapping
+        // half of that claim true.
+        //
+        // Constructed HERE rather than inside `establishAndReport` (#255): the daemon owns this
+        // tunnel's lifetime, and a handle that only arrives on the success path cannot release a
+        // failure.
+        const exposing = deps.adapters[kind]();
         try {
+          await establishAndReport(deps, exposing, server.address);
           // Retained for the shutdown handler armed above — assigned only on success, so a failed
-          // establish leaves the thunk answering `null` (there is no usable tunnel to release).
-          tunnel = await establishAndReport(deps, kind, server.address);
+          // establish leaves the thunk answering `null`. Nothing is lost by that: the daemon never owns a
+          // tunnel it could not establish, because the catch below releases it inline and the process is
+          // on its way out. Handing the shutdown path a released instance would be harmless — a teardown
+          // no-ops once its state is cleared — but it would claim an ownership that never existed.
+          tunnel = exposing;
         } catch (error) {
-          await server.close();
+          // Unwind in reverse, then rethrow the establish error UNTOUCHED. Release BEFORE closing is
+          // plain LIFO, and free here: the shutdown path closes FIRST only because ITS teardown is a
+          // network round-trip #82's floor must not be gated on (`shutdown-signal.ts`), while this
+          // release is purely local (see `releaseFailedEstablish`). Neither order is a safety question —
+          // a mapping pointing at a closed port authorizes nobody, as that same header settles. What
+          // matters is that BOTH steps run even if the other failed — a broken close is no reason to
+          // strand a mapping, and vice versa — and that NEITHER throws: each reports its own failure, so
+          // what propagates is always the establish error, the operator's actual answer, never a cleanup
+          // failure standing in for it.
+          await releaseFailedEstablish(exposing, kind);
+          await closeFailedServe(server);
           throw error;
         }
       }
@@ -469,8 +569,11 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       }
       // Fire-and-forget: the mapping is detached and outlives this process, so the tunnel instance is
       // deliberately not retained — `--off` (above) rebuilds what it needs to release it. Nothing here
-      // could hold it anyway: the verb has no listening socket and the process exits on return.
-      await establishAndReport(deps, kind, { host, port });
+      // could hold it anyway: the verb has no listening socket and the process exits on return. Hence
+      // no `releaseFailedEstablish` here, unlike `serve --tunnel` (#255): that verb releases because it
+      // is tearing its own daemon back down and promises atomicity; this one exposes a server it does
+      // not own and cannot assume the operator wants a mapping cleared on its way out.
+      await establishAndReport(deps, deps.adapters[kind](), { host, port });
     });
 
   // --- launch: drive a UC2 "New session" launch on a running daemon -----------------
