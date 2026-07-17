@@ -1587,6 +1587,11 @@ export interface JsonObject {
 // not directly assignable to `JsonObject`), so it checks JSON-safety per property
 // and rejects method-bearing class instances such as `AccountBearer`.
 type Assert<T extends true> = T;
+// The mirror of `Assert`, for stating what must NOT hold — a proof that a check REJECTS something is
+// as load-bearing as one that it accepts (a detector that always answered "yes" would pass every
+// `Assert` and fail here). Spelled as its own helper so a refutation reads like its assertion rather
+// than as a double-negative conditional.
+type Refute<T extends false> = T;
 type IsJson<T> = [T] extends [JsonValue]
   ? true
   : [T] extends [(...args: never[]) => unknown]
@@ -1598,6 +1603,14 @@ type IsJson<T> = [T] extends [JsonValue]
           ? true
           : false
         : false;
+// Set equality for two unions: assignable BOTH ways, hence the same members. One direction is too
+// generous on its own — a union that grew a member still satisfies `["a"] extends ["a" | "b"]` — so a
+// widened union is caught only by also checking the reverse. The tuple wrappers are load-bearing, not
+// noise (same idiom as `IsJson` above): a NAKED `A extends B` distributes over A's members and would
+// answer `boolean` for a partial match, reporting a widened union as an unreadable "not exactly true"
+// rather than a clean `false`. Members here are string literals, where mutual assignability IS set
+// equality — this is deliberately not a general-purpose type-equality operator.
+type SetEquals<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 
 /**
  * The compile-time credential-omission contract, exported so it has a referent
@@ -1749,6 +1762,42 @@ export interface ErrorLogEvent {
 }
 
 /**
+ * Every DIAGNOSTIC event name (#253), as a value-level list — the SINGLE source of truth the
+ * {@link DiagnosticLogEventName} union is DERIVED from, so a name cannot exist in the type without
+ * existing here. Exported for two reasons, one structural and one to close a real gap:
+ *
+ * - The union is `(typeof DIAGNOSTIC_LOG_EVENTS)[number]`, so adding a diagnostic action means adding
+ *   it HERE — and `logging.test.ts` round-trips whatever this list holds. The type and its coverage
+ *   therefore cannot drift: they are the same eight strings, read twice.
+ * - Before #253 the round-trip test asserted a rule over "every diagnostic event name" from a
+ *   HAND-MAINTAINED copy of these names. #238 demonstrated the gap: `timer-census` /
+ *   `timer-census-failed` landed in the union, the test's copy did not notice, and the suite stayed
+ *   GREEN while covering strictly less than it claimed. The list could not simply move into the test
+ *   file — `tsconfig` excludes every `.test.ts`, so nothing there is ever compiled (measured: `tsc`
+ *   exits 0 with a deliberate type error planted in a test file). A compile-time contract only binds
+ *   from a COMPILED file, which is why the list lives here rather than beside its assertions.
+ *
+ * @see DiagnosticLogEventNameProofs — the compile-time gate that keeps the union honest to this list.
+ */
+export const DIAGNOSTIC_LOG_EVENTS = [
+  "heap-snapshot",
+  "heap-snapshot-failed",
+  "inspector-open",
+  "inspector-open-failed",
+  "handle-report",
+  "handle-report-failed",
+  "timer-census",
+  "timer-census-failed",
+] as const;
+
+/**
+ * A DIAGNOSTIC event's name (#253) — DERIVED from {@link DIAGNOSTIC_LOG_EVENTS} rather than spelled
+ * out a second time, so the union and the list a test can iterate are the same eight strings by
+ * construction. Widening this beyond the list is a `tsc` error ({@link DiagnosticLogEventNameProofs}).
+ */
+export type DiagnosticLogEventName = (typeof DIAGNOSTIC_LOG_EVENTS)[number];
+
+/**
  * A DIAGNOSTIC event (#62, #63): an operator-triggered runtime diagnostic action the daemon
  * performed on demand — taken live (no restart) when the daemon is signalled, for chasing a long-run
  * leak. Unlike the five AUTOMATIC surfaces above, a diagnostic event fires ONLY when an operator
@@ -1784,16 +1833,10 @@ export interface DiagnosticLogEvent {
    * `inspector-open-failed` (the Node inspector attach, #63); `handle-report` / `handle-report-failed`
    * (the FD/handle-count report, #63); `timer-census` / `timer-census-failed` (the live unref'd-timer
    * census the ref'd tally cannot see, #238).
+   *
+   * DERIVED from {@link DIAGNOSTIC_LOG_EVENTS} (#253) — add a name there, not here.
    */
-  readonly event:
-    | "heap-snapshot"
-    | "heap-snapshot-failed"
-    | "inspector-open"
-    | "inspector-open-failed"
-    | "handle-report"
-    | "handle-report-failed"
-    | "timer-census"
-    | "timer-census-failed";
+  readonly event: DiagnosticLogEventName;
   readonly sessionId: null;
   readonly detail: string;
 }
@@ -1848,6 +1891,40 @@ export type LogEventJsonProofs = [
   Assert<IsJson<ErrorLogEvent>>,
   Assert<IsJson<DiagnosticLogEvent>>,
   Assert<IsJson<LogEvent>>,
+];
+
+/**
+ * The compile-time membership contract for the diagnostic surface (#253) — the same idea as
+ * {@link LogEventJsonProofs}, applied to the union's MEMBERSHIP rather than its JSON-safety, and
+ * exported to sit beside it as a visible part of the logging contract. (Unlike a value, a type alias
+ * needs no referent to be checked: `tsc` evaluates these constraints on declaration, and
+ * `noUnusedLocals` does not fire on an unused one — measured. The `export` publishes the proof; it is
+ * not what makes it bite.)
+ *
+ * `logging.test.ts` asserts a rule over "EVERY diagnostic event name", and that quantifier is only
+ * as true as the list it iterates. Deriving {@link DiagnosticLogEventName} from
+ * {@link DIAGNOSTIC_LOG_EVENTS} makes the honest case automatic — a new name reaches the test by
+ * existing — but leaves one escape hatch: hand-widening the field ({@link DiagnosticLogEvent}'s
+ * `event`) past the list, which would put a name in the type that no test can reach. This pair
+ * closes it, and must live beside the list rather than beside the assertions it protects, for the
+ * reason {@link DIAGNOSTIC_LOG_EVENTS} records. (The union is erased at runtime besides, so a test
+ * could not compare it against the list even if it wanted to — compile time is the only place this
+ * check can exist at all.)
+ *
+ * Read as a matched pair — a detector that always answered "equal" would satisfy the gate and fail
+ * the refutation:
+ *
+ * 1. **The gate.** The event field is EXACTLY the exported list's members. Widening it (say to
+ *    `DiagnosticLogEventName | "new-thing"`) makes this a `tsc` error, naming the fix: add the name
+ *    to {@link DIAGNOSTIC_LOG_EVENTS} instead.
+ * 2. **The negative control.** The same check, aimed at the corpse — the field carrying a name the
+ *    list lacks, i.e. exactly the #238 shape that slipped through — which must be REFUTED. This is
+ *    what proves the gate discriminates rather than passing vacuously: the corpse fails the
+ *    detector, not merely the fix passing it.
+ */
+export type DiagnosticLogEventNameProofs = [
+  Assert<SetEquals<DiagnosticLogEvent["event"], DiagnosticLogEventName>>,
+  Refute<SetEquals<DiagnosticLogEvent["event"] | "not-a-real-diagnostic", DiagnosticLogEventName>>,
 ];
 
 // ---------------------------------------------------------------------------

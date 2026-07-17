@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  DIAGNOSTIC_LOG_EVENTS,
   NO_OP_LOGGER,
   type DetectionLogEvent,
   type DiagnosticLogEvent,
@@ -115,25 +116,19 @@ describe("LogEvent JSON-safety (runtime complement to LogEventJsonProofs)", () =
   // #238 timer census) shares the one all-string/null shape and round-trips unchanged — so a new
   // diagnostic action never smuggles a non-JSON (credential-shaped) field onto the trail.
   //
-  // The list is HAND-MAINTAINED, and the rule's load-bearing word — "every" — is therefore a convention
-  // rather than a guarantee: a name added to the union but not here leaves this suite GREEN while it
-  // covers strictly less than it claims. Keying a `Record<DiagnosticLogEvent["event"], true>` would not
-  // fix that either — `tsconfig` excludes `**/*.test.ts`, so no compile-time proof placed in a test file
-  // is ever evaluated. Closing it properly means deriving the union FROM an exported value-level list in
-  // `index.ts` (which IS compiled), which changes the package's public surface — filed as #253 rather
-  // than folded in here.
-  it("round-trips every diagnostic event name unchanged (#62, #63, #238)", () => {
-    const diagnosticEventNames: readonly DiagnosticLogEvent["event"][] = [
-      "heap-snapshot",
-      "heap-snapshot-failed",
-      "inspector-open",
-      "inspector-open-failed",
-      "handle-report",
-      "handle-report-failed",
-      "timer-census",
-      "timer-census-failed",
-    ];
-    for (const event of diagnosticEventNames) {
+  // "Every" is now load-bearing rather than aspirational (#253): the names are ITERATED from the
+  // exported DIAGNOSTIC_LOG_EVENTS, which `DiagnosticLogEvent["event"]` is derived from — so a new
+  // diagnostic action reaches this assertion by existing, and the hand-maintained copy that #238's
+  // `timer-census` silently escaped is gone. The other half of the guarantee cannot live here:
+  // `tsconfig` excludes `**/*.test.ts` (nothing in this file is ever compiled) and the union is
+  // erased at runtime anyway, so the proof that the union never widens PAST that list is
+  // `DiagnosticLogEventNameProofs` in `index.ts`, which `tsc` does evaluate.
+  it("round-trips every diagnostic event name unchanged (#62, #63, #238, #253)", () => {
+    // Cardinality first: an empty list would make the loop below vacuously green — a passing
+    // assertion over nothing is not evidence of coverage.
+    expect(DIAGNOSTIC_LOG_EVENTS.length).toBeGreaterThan(0);
+
+    for (const event of DIAGNOSTIC_LOG_EVENTS) {
       const logged: DiagnosticLogEvent = { category: "diagnostic", level: "info", event, sessionId: null, detail: "d" };
       expect(JSON.parse(JSON.stringify(logged))).toEqual(logged);
     }
@@ -152,6 +147,29 @@ describe("LogEvent JSON-safety (runtime complement to LogEventJsonProofs)", () =
         expect(keys).not.toContain(forbidden);
       }
     }
+  });
+});
+
+describe("DIAGNOSTIC_LOG_EVENTS (#253 — the derived-union source of truth)", () => {
+  // Rule: the list the round-trip above iterates IS what `DiagnosticLogEvent["event"]` is derived
+  // from, so "every name" cannot quietly mean "every name someone remembered to copy". Derivation
+  // is invisible at runtime (types are erased) and `DiagnosticLogEventNameProofs` covers the
+  // type-level half; what remains observable here is the list's own hygiene — and each assertion
+  // below catches a defect BOTH type-level gates are blind to.
+  it("holds only non-empty strings — a non-string name is invisible to the type gates (#253)", () => {
+    // `as const` admits a number, and a number survives a JSON round-trip, so neither SetEquals nor
+    // the round-trip test would notice one. This is the only thing that would.
+    for (const event of DIAGNOSTIC_LOG_EVENTS) {
+      expect(typeof event).toBe("string");
+      expect(event.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("holds no duplicates — a repeat silently inflates the round-trip's coverage count (#253)", () => {
+    // A duplicated entry is invisible to the union (it dedupes) while making the round-trip loop
+    // iterate more times than there are distinct names — coverage that looks broader than it is,
+    // which is the exact illusion #253 exists to remove.
+    expect(new Set(DIAGNOSTIC_LOG_EVENTS).size).toBe(DIAGNOSTIC_LOG_EVENTS.length);
   });
 });
 
