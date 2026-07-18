@@ -71,6 +71,7 @@ import {
   requireLocalServerAuth,
   resolveBindHost,
   resolveHeapSnapshotDir,
+  resolveHookStateDir,
   revokeAllPairedDevices,
   SHUTDOWN_SIGNALS,
   type CcctlServer,
@@ -440,12 +441,21 @@ export function buildProgram(deps: CliDependencies = defaultDependencies): Comma
       // JSON-safe by construction, so no credential (account Bearer, session-ingress token) can ride it.
       // One structured-log sink for the whole daemon: the server's diagnostic trail (#61) AND the
       // on-demand heap-snapshot events (#62) ride the same JSON-lines stdout, so both are `… | jq`-able.
+      //
+      // Inject the hook state directory (#275, ADR-008) so the daemon actually SWEEPS orphaned
+      // `AskUserQuestion` hook files (#262) at startup — the ones a previous daemon's SIGKILL/OOM
+      // stranded, which its in-memory `hookInstalls` map took with it. `startServer` deliberately does
+      // NOT resolve this path itself: the sweep DELETES, so leaving it un-injected would make every
+      // bare `startServer()` in the test suite mutate the developer's real `$XDG_STATE_HOME`. The
+      // daemon is the composition root that owns the real state directory, so it is the one that names
+      // it — the same stance it takes for the log sink above and the session store.
       const logger = createJsonLineLogger();
       const server = await deps.startServer({
         host,
         port,
         launcher: deps.launcher,
         logger,
+        hookStateDir: resolveHookStateDir(),
       });
       // The tunnel this daemon owns, once it is up (#242). Retained — rather than dropped the moment
       // `establish` returned, which left nothing able to call `teardown` — because the daemon owns the

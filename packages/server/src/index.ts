@@ -73,6 +73,7 @@ import {
   type WorkerChannelRecord,
 } from "./worker-channel.js";
 import { type HookInstall } from "./hook-settings-installer.js";
+import { sweepOrphanedHookInstalls } from "./hook-install-sweep.js";
 import {
   closeEventStreams,
   createSessionEventRelays,
@@ -147,6 +148,14 @@ export {
   resolveHookStateDir,
   type HookInstall,
 } from "./hook-settings-installer.js";
+
+// The startup hook-install sweep (#275, ADR-008) stays INTERNAL, deliberately. `startServer` runs it
+// off {@link ServerConfig.hookStateDir} and nothing outside calls it — exactly as the sibling reaper
+// keeps `reconcileRecordedLaunches`/`rehydrateRetainedSessions` off this surface, and for the same
+// stated reason: a later need can add an export; un-shipping one is breaking. Exporting it now would
+// also publish a footgun — the sweep reaps its OWN pid's installs unconditionally, which is safe only
+// under `startServer`'s "sequenced before the listener, so we hold no installs yet" invariant. A
+// caller that installed a hook and THEN swept would delete its own live install.
 
 // The concrete structured-log sink (#61): the Node-adjacent writer half of the `@ccctl/core`
 // {@link Logger} contract. The daemon injects `createJsonLineLogger()` via {@link ServerConfig.logger}
@@ -565,6 +574,22 @@ export interface ServerConfig {
    * live process (AC4). Absent (the default): the reaper does not run, and no recorded handle is rehydrated.
    */
   livenessProbe?: ProcessLivenessProbe;
+  /**
+   * Where the startup hook-install sweep (#275, ADR-008) reaps orphaned `AskUserQuestion` hook files —
+   * the per-launch settings + handoff files (#262) whose owning daemon died before it could clean them
+   * up. Injected, not resolved internally, for the same reason {@link ISessionStore} is: it is a
+   * host-touching edge that MUTATES the operator's real `$XDG_STATE_HOME`, and a server that reached
+   * for that path itself would make every `startServer` call — including the ~20 unit tests that
+   * construct one to exercise something else entirely — delete files in the developer's actual `$HOME`.
+   * (Measured, not reasoned: a canary planted in the real state dir was reaped by `ui-sessions.test.ts`,
+   * a suite with nothing to do with hooks.)
+   *
+   * Absent (the default): the sweep does not run and NOTHING is deleted — the fail-closed default, and
+   * the only safe one for an operation whose whole job is destructive. The `ccctl serve` composition
+   * root passes `resolveHookStateDir()`, so the shipped daemon does sweep; a test that wants to exercise
+   * the sweep passes a temp directory, and one that does not simply omits this.
+   */
+  hookStateDir?: string;
   /**
    * The structured-log sink (#61) the daemon injects to turn on the diagnostic trail — session
    * lifecycle, bridge registration, worker-status detection, notification dispatch, and refusals,
@@ -996,6 +1021,38 @@ export function startServer(config: ServerConfig): Promise<CcctlServer> {
   if (config.livenessProbe !== undefined) {
     const { retained } = reconcileRecordedLaunches(config.recordedLaunches ?? [], config.livenessProbe);
     rehydrateRetainedSessions(state, retained);
+  }
+
+  // Hook-install sweep (#275): the disk-hygiene sibling of the reaper above — reap per-launch
+  // `AskUserQuestion` hook files (#262) whose owning daemon is gone. Those two cleanup paths both read
+  // `state.hookInstalls`, an in-memory map a SIGKILL/OOM/restart erases, so a launch that was live at
+  // the moment of a crash leaves files NO later daemon could otherwise know about, let alone delete.
+  //
+  // Placed HERE, beside the #34 reaper and ahead of createServer/listen, for the same reason and for
+  // one more of its own: sequencing the sweep before the listener is half of what makes it race-safe.
+  // This process cannot yet have installed anything (no request has been served), so its own PID's
+  // leftovers are unambiguously a PREVIOUS daemon's and always safe to reap. The other half is the
+  // owner-PID stamp itself, which keeps a concurrently-running daemon's live installs off the
+  // candidate list entirely (`hook-install-sweep.ts`, ADR-008).
+  //
+  // GATED on an injected directory, exactly like the reaper above is gated on an injected probe, and
+  // for a sharper reason: this operation DELETES. A server that resolved the real `$XDG_STATE_HOME`
+  // itself would make every bare `startServer()` — including the ~20 unit tests that construct one to
+  // exercise something unrelated — mutate the developer's actual `$HOME`. Absent the config it does
+  // not run and nothing is deleted; `ccctl serve` passes `resolveHookStateDir()`, so the shipped
+  // daemon sweeps. Best-effort within that: it fails closed to "retain", reports counts, and throws
+  // nothing, so a boot is never refused over stale state.
+  //
+  // Deliberately UNLOGGED, and that is a real (if small) cost worth naming rather than hiding. None of
+  // the six #61 categories fits: this is not a `session` event — writing one would inject a row with no
+  // session behind it into the very trail whose job is to answer "was this session leaked?", corrupting
+  // a diagnostic surface to decorate a disk sweep — and it is not an `error` either, since the ordinary
+  // outcome is success. The honest home is a `diagnostic` event name, but those are pinned by
+  // `DIAGNOSTIC_LOG_EVENTS` in `@ccctl/core` (#253), so adding one is a core change with its own
+  // round-trip coverage: correct, and correctly NOT smuggled into this issue. The counts are returned
+  // instead, which is what `hook-install-sweep.test.ts` asserts against.
+  if (config.hookStateDir !== undefined) {
+    sweepOrphanedHookInstalls({ stateDir: config.hookStateDir });
   }
 
   const httpServer = createServer((req, res) => {

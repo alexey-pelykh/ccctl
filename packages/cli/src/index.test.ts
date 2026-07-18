@@ -9,6 +9,7 @@ import { DEVICE_STORE_SNAPSHOT_VERSION, deviceTokenHash, pairedDevice } from "@c
 import type { DeviceStoreSnapshot, HostEndpoint, IDeviceStore, Logger } from "@ccctl/core";
 import {
   LOCAL_SERVER_AUTH_ENV,
+  resolveHookStateDir,
   XDG_CONFIG_HOME_ENV,
   type CcctlServer,
   type ISessionLauncher,
@@ -405,6 +406,22 @@ describe("ccctl serve — starts the daemon (AC2)", () => {
     await buildProgram(deps).parseAsync(["serve"], { from: "user" });
     expect(startServer).toHaveBeenCalledTimes(1);
     expect(startServer.mock.calls[0][0]).toHaveProperty("launcher", launcher);
+  });
+
+  it("injects the hook state directory so the daemon actually SWEEPS orphaned hook files (#275)", async () => {
+    // `startServer` deliberately does not resolve this path itself — the sweep DELETES, so leaving it
+    // un-injected would make every bare `startServer()` in the test suites mutate the developer's real
+    // `$XDG_STATE_HOME`. The consequence is that the sweep runs ONLY if the composition root passes
+    // the directory, which makes this wiring the difference between a live reaper and a dead seam —
+    // exactly the trap `session-reconcile.ts` documents about its own never-configured `livenessProbe`.
+    // A weaker `objectContaining({host, port, launcher})` assertion passes with the wiring deleted, so
+    // this names the property directly.
+    const { deps, startServer } = makeDeps();
+    await buildProgram(deps).parseAsync(["serve"], { from: "user" });
+    expect(startServer).toHaveBeenCalledTimes(1);
+    const { hookStateDir } = startServer.mock.calls[0][0] as { hookStateDir?: string };
+    expect(hookStateDir).toBe(resolveHookStateDir());
+    expect(hookStateDir).toMatch(/[/\\]hooks$/);
   });
 
   it("arms the on-demand heap-snapshot trigger (#62) with the SAME sink it gives the daemon, and prints how to trigger it", async () => {
