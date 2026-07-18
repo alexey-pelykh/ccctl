@@ -349,7 +349,7 @@ export async function driveLiveAskOracle(options: DriveAskOracleOptions): Promis
   try {
     // §1/§2/§3 — the bridge legs, PLUMBING here (not the leg under test — that is #133's oracle): get a
     // `bypassPermissions` session + its ingress token to hand the worker. The session MUST be created
-    // with `bypassPermissions` so the server derives the same `notificationsDegraded` a real headless
+    // with `bypassPermissions` so the server derives the same `autoResolvesPermissions` a real headless
     // worker would (`environments-bridge.ts`), and so the session genuinely IS the mode #266 observes.
     const { environmentId } = await registerEnvironment(server, bearer);
     const { sessionId } = await createSession(server, bearer, undefined, ASK_ORACLE_PERMISSION_MODE);

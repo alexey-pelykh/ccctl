@@ -39,7 +39,7 @@
       }
       /* Always-visible connection-health indicator for the phone↔server transport (#75): a small
          pill whose colour tracks the live / reconnecting / offline state. The hues reuse the page's
-         status language — running-green and requires_action/degraded-amber — plus a red for offline. */
+         status language — running-green and the requires_action / auto-resolves amber — plus a red for offline. */
       #connection {
         display: inline-block;
         padding: 0.05rem 0.4rem;
@@ -186,10 +186,10 @@
         font-weight: 700;
         border-color: #1d4ed8;
       }
-      /* A non-prompting session's notifications-degraded badge (#26/#27); amber, the same
+      /* A non-prompting session's auto-resolves-permissions badge (#26/#27); amber, the same
          attention hue as the requires_action activity. The full-width row button pushes it
          onto its own line; the left margin matches the button's own text inset. */
-      #session-list [data-badge="notifications-degraded"] {
+      #session-list [data-badge="auto-resolves-permissions"] {
         display: inline-block;
         margin: 0.2rem 0 0 0.6rem;
         padding: 0.05rem 0.4rem;
@@ -201,7 +201,7 @@
         border-radius: 0.25rem;
       }
       /* A session with an un-acked reconciled "needs-you" event (#53). Red — the page's attention hue
-         (as offline / error) — a STRONGER signal than the amber degraded marker: this is an active
+         (as offline / error) — a STRONGER signal than the amber auto-resolves marker: this is an active
          call to view the session, not a standing property. Same sibling-of-the-button layout so it
          survives a poll's relabel; it clears when the operator views the session (which acks it). */
       #session-list [data-badge="needs-you"] {
@@ -358,7 +358,7 @@
       }
       /* The optimistic offline-steer queue (#79): each row is a steer the operator submitted while the
          connection was offline, held to fire in order on reconnect. Amber — the page's "in-flight /
-         attention" hue (as the reconnecting indicator and the degraded badge) — because it is a decision
+         attention" hue (as the reconnecting indicator and the auto-resolves badge) — because it is a decision
          waiting on the link. A row the stale-guard held (W5-21 / #80: the session moved on) turns red,
          the stronger attention hue, and carries a "Send anyway" (the "still send?" confirm) beside Cancel. */
       #steer-queue {

@@ -8,7 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { startServer, XDG_STATE_HOME_ENV, type CcctlServer } from "@ccctl/server";
 import type { ISessionLauncher, LaunchedSession, SessionLaunchOptions } from "@ccctl/server/src/session-launcher.js";
 import { describeLaunchAccepted, launchFailure, launchRequest } from "@ccctl/web-ui/src/launch.js";
-import { notificationsDegraded, sessionLabel } from "@ccctl/web-ui/src/sessions.js";
+import { autoResolvesPermissions, sessionLabel } from "@ccctl/web-ui/src/sessions.js";
 
 // The "New session" launch flow (#37, `UI-B-004`) driven END TO END: the REAL browser module
 // (`@ccctl/web-ui/src/launch.js`) against the REAL wired server ingress (`POST /api/sessions`, #31)
@@ -176,8 +176,8 @@ describe("the launched session appears in the list (#37 AC2)", () => {
     // …and it renders through the REAL picker, rather than merely existing on the wire: a row the
     // list could not label would satisfy "is in the response" while failing "appears in the list".
     expect(sessionLabel(sessions[0])).toBe(`${(accepted as { sessionId: string }).sessionId} — registering · idle`);
-    // A `default` launch is prompting, so its notifications are not degraded — no spurious badge (#27).
-    expect(notificationsDegraded(sessions[0])).toBe(false);
+    // A `default` launch is prompting, so it does not auto-resolve permissions — no spurious badge (#27).
+    expect(autoResolvesPermissions(sessions[0])).toBe(false);
   });
 
   it("surfaces a degraded surface's own note — the fallback backend is not dressed up as tmux", async () => {

@@ -308,7 +308,7 @@ export async function registerEnvironment(server: CcctlServer, bearer: string): 
  * (`live-ask-oracle.ts`), which needs a `bypassPermissions` session: `launchSession` STRUCTURALLY refuses
  * a non-prompting mode (`ui-session-launch.ts` § `non-prompting-mode`), so the only way a
  * `bypassPermissions` session comes up is over the bridge, right here — and the session's `permission_mode`
- * is what the server derives its `notificationsDegraded` marker from (`environments-bridge.ts`), so the
+ * is what the server derives its `autoResolvesPermissions` marker from (`environments-bridge.ts`), so the
  * §2 body must carry it. Both absent (every other caller), the pinned body is POSTed verbatim, so the
  * golden's own conformance run is untouched.
  *

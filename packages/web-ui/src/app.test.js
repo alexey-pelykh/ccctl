@@ -52,7 +52,7 @@ const INDEX_HTML = readFileSync(join(import.meta.dirname, "..", "index.html"), "
 
 /** A `SessionSummaryWire` row — the `GET /api/sessions` shape, as `sessions.test.js` fixtures it. */
 function summary(id) {
-  return { id, status: "ready", activity: { kind: "running" }, notificationsDegraded: false };
+  return { id, status: "ready", activity: { kind: "running" }, autoResolvesPermissions: false };
 }
 
 /**

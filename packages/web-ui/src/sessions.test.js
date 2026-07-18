@@ -6,16 +6,16 @@ import {
   ACTIVITY_LABELS,
   activityLabel,
   sessionLabel,
-  notificationsDegraded,
+  autoResolvesPermissions,
   sessionCursor,
   laterCursor,
   diffSessionList,
   nextSelection,
 } from "./sessions.js";
 
-/** A `SessionSummaryWire` fixture — the `GET /api/sessions` row shape; a prompting (non-degraded) row. */
+/** A `SessionSummaryWire` fixture — the `GET /api/sessions` row shape; a prompting (unmarked) row. */
 function summary(id, status, activity) {
-  return { id, status, activity, notificationsDegraded: false };
+  return { id, status, activity, autoResolvesPermissions: false };
 }
 
 describe("activityLabel", () => {
@@ -59,25 +59,25 @@ describe("sessionLabel", () => {
   });
 });
 
-describe("notificationsDegraded", () => {
-  it("degrades only on a literal true — the #26 life-long marker the badge (#27) surfaces", () => {
-    expect(notificationsDegraded({ id: "s", notificationsDegraded: true })).toBe(true);
-    expect(notificationsDegraded({ id: "s", notificationsDegraded: false })).toBe(false);
+describe("autoResolvesPermissions", () => {
+  it("marks only on a literal true — the #26 life-long marker the badge (#27) surfaces", () => {
+    expect(autoResolvesPermissions({ id: "s", autoResolvesPermissions: true })).toBe(true);
+    expect(autoResolvesPermissions({ id: "s", autoResolvesPermissions: false })).toBe(false);
   });
 
-  it("reads a missing / non-boolean marker as not-degraded, so a partial or pre-#26 row shows no badge", () => {
+  it("reads a missing / non-boolean marker as unmarked, so a partial or pre-#26 row shows no badge", () => {
     // A row that predates #26 (or any partial projection) omits the field entirely.
-    expect(notificationsDegraded({ id: "s" })).toBe(false);
+    expect(autoResolvesPermissions({ id: "s" })).toBe(false);
     // Strictly boolean: a truthy non-boolean must not light the badge.
-    expect(notificationsDegraded({ id: "s", notificationsDegraded: "true" })).toBe(false);
-    expect(notificationsDegraded({ id: "s", notificationsDegraded: 1 })).toBe(false);
+    expect(autoResolvesPermissions({ id: "s", autoResolvesPermissions: "true" })).toBe(false);
+    expect(autoResolvesPermissions({ id: "s", autoResolvesPermissions: 1 })).toBe(false);
   });
 
   it("never throws on a shapeless value", () => {
-    expect(notificationsDegraded(undefined)).toBe(false);
-    expect(notificationsDegraded(null)).toBe(false);
-    expect(notificationsDegraded("nope")).toBe(false);
-    expect(notificationsDegraded(["notificationsDegraded"])).toBe(false);
+    expect(autoResolvesPermissions(undefined)).toBe(false);
+    expect(autoResolvesPermissions(null)).toBe(false);
+    expect(autoResolvesPermissions("nope")).toBe(false);
+    expect(autoResolvesPermissions(["autoResolvesPermissions"])).toBe(false);
   });
 });
 

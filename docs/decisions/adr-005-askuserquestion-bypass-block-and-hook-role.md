@@ -173,7 +173,7 @@ Two facts to carry forward for the build items:
   **informational** class that `foldWorkerStatus` no-ops on — never `worker_status`.
 - [#264] (transport): the enriched frame is a **worker** emission on the authenticated §5
   channel (SD-1), inheriting the `session_ingress_token` + [#59] pin.
-- [#265] (`notificationsDegraded`): unaffected by the block finding, but see the [#78]
+- [#265] (`autoResolvesPermissions`): unaffected by the block finding, but see the [#78]
   thread — the native-block result means bypass is **not** a degraded path for the
   needs-you moment.
 - [#266] (live-worker e2e): owns the [#78]-AC4 end-to-end `requires_action` proof this

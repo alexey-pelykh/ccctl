@@ -32,7 +32,7 @@ const T0 = 1_000_000;
 /**
  * A representative session registry spanning the lifecycle/activity dimensions —
  * plus a non-prompting (`bypassPermissions`) session, so the REAL file store's JSON
- * round-trip exercises the life-long `notificationsDegraded: true` marker (#26).
+ * round-trip exercises the life-long `autoResolvesPermissions: true` marker (#26).
  */
 const sessions: readonly Session[] = [
   { ...createSession("sess-running", "bypassPermissions", T0), status: "ready", activity: { kind: "running" } },

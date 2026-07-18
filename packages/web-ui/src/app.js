@@ -58,7 +58,7 @@ import {
   submitsOnTap,
   answerFromSelections,
 } from "./enrichment.js";
-import { diffSessionList, nextSelection, notificationsDegraded, sessionCursor, laterCursor } from "./sessions.js";
+import { diffSessionList, nextSelection, autoResolvesPermissions, sessionCursor, laterCursor } from "./sessions.js";
 import { connectionHealth } from "./connection.js";
 import { applyPairingToken, authHeader } from "./pairing.js";
 import { DEVICES_PATH, deviceLabel, deviceRevokePath, isCurrentDevice, isRenderableDevice } from "./devices.js";
@@ -670,13 +670,14 @@ function insertShortcut(phrase) {
  * prompt you" would be a fresh falsehood for `acceptEdits` — the very kind #265 exists to remove.
  *
  * The `data-badge` value and the element id are internal hooks (the CSS selector in `index.html`,
- * and `aria-describedby`) — no operator reads them, so they stay put; only the strings a human
- * actually reads are restated.
+ * and `aria-describedby`) — no operator reads them; they track the field identifier
+ * ({@link autoResolvesPermissions}) so a grep stays coherent, while the human-read strings above
+ * state what the mode does.
  */
-function createDegradedBadge(sessionId) {
+function createAutoResolvesBadge(sessionId) {
   const badge = document.createElement("span");
-  badge.id = `degraded-${sessionId}`;
-  badge.dataset.badge = "notifications-degraded";
+  badge.id = `auto-resolves-${sessionId}`;
+  badge.dataset.badge = "auto-resolves-permissions";
   badge.textContent = "auto-approves permissions";
   badge.title =
     "This session runs in a non-prompting mode: bypassPermissions approves every tool call without asking; acceptEdits auto-accepts file edits and still prompts for other tools. It can still raise a needs-you notification when the agent asks you a question.";
@@ -685,12 +686,12 @@ function createDegradedBadge(sessionId) {
 
 /**
  * Build one "needs you" badge for a session with an un-acked reconciled blocking event (#53). A sibling
- * of {@link createDegradedBadge}, and OUTSIDE the row button for the same reason (a poll relabels the
- * button, which would wipe a nested child) — but unlike the life-long degraded marker this one is
+ * of {@link createAutoResolvesBadge}, and OUTSIDE the row button for the same reason (a poll relabels the
+ * button, which would wipe a nested child) — but unlike the life-long auto-resolves marker this one is
  * TRANSIENT: it is added on reconnect-reconcile and removed when the operator views the session (which
  * acks it). It carries NO `aria-describedby`, deliberately: sitting in the `aria-live` picker list, its
  * INSERTION is announced once — which is the right reading for news ("this session needs you"), unlike
- * the degraded marker's standing property. The `title` carries the block's human detail.
+ * the auto-resolves marker's standing property. The `title` carries the block's human detail.
  */
 function createNeedsYouBadge(detail) {
   const badge = document.createElement("span");
@@ -729,14 +730,14 @@ function renderNeedsYouBadges() {
  * for a session carrying the non-prompting marker (#26) — a standing badge (#27).
  *
  * The badge must sit OUTSIDE the button to survive a poll's relabel (see
- * {@link createDegradedBadge}), which also keeps it out of the button's accessible NAME — so a
+ * {@link createAutoResolvesBadge}), which also keeps it out of the button's accessible NAME — so a
  * screen-reader user tabbing the picker would hear the row but never the badge, and the
  * `aria-live` list would announce it only once at insertion. That is the one-time-transient
  * reading the marker is meant NOT to have, so the button points at the badge via
  * `aria-describedby`: focusing the row announces name + description, every time, for as long as
  * the session lives. (Session ids are server-minted UUIDs — valid, unique `id` tokens.)
  */
-function createSessionRow(sessionId, label, degraded) {
+function createSessionRow(sessionId, label, autoResolves) {
   const li = document.createElement("li");
   li.dataset.sessionId = sessionId;
   const button = document.createElement("button");
@@ -744,8 +745,8 @@ function createSessionRow(sessionId, label, degraded) {
   button.textContent = label;
   button.addEventListener("click", () => selectSession(sessionId));
   li.appendChild(button);
-  if (degraded) {
-    const badge = createDegradedBadge(sessionId);
+  if (autoResolves) {
+    const badge = createAutoResolvesBadge(sessionId);
     li.appendChild(badge);
     button.setAttribute("aria-describedby", badge.id);
   }
@@ -786,7 +787,7 @@ function applySessionList(sessions) {
     emptyPlaceholderShown = false;
   }
   const diff = diffSessionList(renderedSessions, sessions);
-  // The degraded marker is per-session and life-long, so it is read at row birth (below),
+  // The auto-resolves marker is per-session and life-long, so it is read at row birth (below),
   // not carried through the label diff — a status/activity change never toggles the badge.
   const byId = new Map(sessions.map((session) => [session.id, session]));
   // Advance each session's head cursor from the poll (#80). Monotonic, so it never regresses the
@@ -806,7 +807,7 @@ function applySessionList(sessions) {
     viewedCursors.delete(id);
   }
   for (const { id, label } of diff.added) {
-    const li = createSessionRow(id, label, notificationsDegraded(byId.get(id)));
+    const li = createSessionRow(id, label, autoResolvesPermissions(byId.get(id)));
     sessionRows.set(id, li);
     sessionListEl.appendChild(li);
   }

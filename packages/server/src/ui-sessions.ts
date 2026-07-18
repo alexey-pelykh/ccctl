@@ -23,9 +23,9 @@
  *
  * The list is the "list" half of the walking skeleton's multi-session AC ("list + view
  * + steer each"): it surfaces each session's OWN already-modelled state (its id,
- * transport `status`, derived `activity`, and its life-long `notificationsDegraded`
+ * transport `status`, derived `activity`, and its life-long `autoResolvesPermissions`
  * marker — #26) so a client can enumerate the sessions it is carrying, pick one to view
- * / steer, and see which ones run non-prompting (they auto-approve some class of permission
+ * / steer, and see which ones run non-prompting (they auto-resolve some class of permission
  * decision rather than prompting on it; advisory only — #265).
  * Per-session STATUS-tracking hardening beyond this surface is a sibling item
  * (#21); this handler only projects the state the session model already holds.
@@ -121,21 +121,22 @@ export interface SessionSummaryWire {
   /** The session's derived activity ({@link SessionActivity}) — running / requires_action / idle. */
   readonly activity: SessionActivity;
   /**
-   * The session's life-long notifications-degraded marker ({@link Session.notificationsDegraded},
-   * #26): `true` for a non-prompting session (it auto-approves some class of permission decision
-   * rather than prompting the operator on it), `false` otherwise. A persistent badge the attach
-   * flow surfaces — ccctl derives it once and never re-reads the mode, so it never clears (it can
-   * therefore go stale if the operator changes mode mid-run, which ccctl does not track — #272).
+   * The session's life-long auto-resolves-permissions marker ({@link Session.autoResolvesPermissions},
+   * #26): `true` for a non-prompting session — one that auto-resolves some class of permission decision
+   * (by approving, denying, or classifying) rather than prompting the operator on it — `false`
+   * otherwise. A persistent badge the attach flow surfaces — ccctl derives it once and never re-reads
+   * the mode, so it never clears (it can therefore go stale if the operator changes mode mid-run, which
+   * ccctl does not track — #272).
    *
-   * ADVISORY, and narrower than its name (#265). A marked session still emits `requires_action`
-   * and still raises needs-you when the agent asks a question — `AskUserQuestion` blocks natively
-   * even in bypass (ADR-005 / #263). It carries FEWER triggers, not none. Nor does `true` mean the
-   * session never prompts: that holds for `bypassPermissions`, but `acceptEdits` auto-accepts only
-   * file edits and still prompts for other tools — and this one boolean cannot tell them apart.
-   * Clients render it as a standing property of how the session was launched; they must NOT read
-   * it as "this session cannot notify you" nor use it to suppress a needs-you.
+   * ADVISORY, never a suppression input (#265). A marked session still emits `requires_action` and
+   * still raises needs-you when the agent asks a question — `AskUserQuestion` blocks natively even
+   * under `bypassPermissions` (ADR-005 / #263). It carries FEWER triggers, not none. Nor does `true`
+   * mean the session never prompts: that holds for `bypassPermissions`, but `acceptEdits` auto-accepts
+   * only file edits and still prompts for other tools — and this one boolean cannot tell the modes
+   * apart. Clients render it as a standing property of how the session was launched; they must NOT
+   * read it as "this session cannot notify you" nor use it to suppress a needs-you.
    */
-  readonly notificationsDegraded: boolean;
+  readonly autoResolvesPermissions: boolean;
   /**
    * The session's monotonic message cursor ({@link sessionMessageCursor}, #80): the last event id
    * emitted on its stream, 0 when it has emitted nothing yet. The stale-guard's authority — the UI
@@ -158,7 +159,7 @@ export interface SessionSummaryWire {
 
 /**
  * Project a {@link Session} to its {@link SessionSummaryWire} — the intentional list
- * face (id + status + activity + the notifications-degraded marker + the message cursor),
+ * face (id + status + activity + the auto-resolves-permissions marker + the message cursor),
  * not the whole internal snapshot (the createdAt / heartbeat timing fields stay
  * server-internal). The cursor is read from the session's SSE relay ({@link
  * sessionMessageCursor}, #80), which lives outside the {@link Session} model — hence the
@@ -174,7 +175,7 @@ function sessionSummary(
     id: session.id,
     status: session.status,
     activity: session.activity,
-    notificationsDegraded: session.notificationsDegraded,
+    autoResolvesPermissions: session.autoResolvesPermissions,
     cursor: sessionMessageCursor(relays, session.id),
   };
   // Serve the buffered enrichment ONLY while the session is genuinely blocking on `requires_action`

@@ -30,11 +30,11 @@
  *              store keeps only the token HASH — so only the server can hash a presented
  *              Bearer and match it to a device. That server-side verification is a later
  *              credentialed-wave item, so `current` rides the wire as a boolean the client
- *              READS (mirroring `sessions.js`'s server-set `notificationsDegraded`), and the
+ *              READS (mirroring `sessions.js`'s server-set `autoResolvesPermissions`), and the
  *              marker lights up once the server sets it.
  *
  * Casing is camelCase per ADR-001: snake_case governs only the foreign-owned register wire;
- * ccctl's own browser API stays camelCase (as `/api/sessions` → `notificationsDegraded` does),
+ * ccctl's own browser API stays camelCase (as `/api/sessions` → `autoResolvesPermissions` does),
  * matching `@ccctl/core`'s `PairedDevice`.
  *
  * Server-side, `GET /api/devices` is not yet wired (#84 built the device STORE, not an HTTP
@@ -134,7 +134,7 @@ export function deviceLabel(device, now = Date.now()) {
 
 /**
  * Whether a device row is THIS device — the server-set `current` marker the list indicates
- * clearly (AC2). Strict and defensive, exactly like `sessions.js`'s `notificationsDegraded`:
+ * clearly (AC2). Strict and defensive, exactly like `sessions.js`'s `autoResolvesPermissions`:
  * only a literal `true` marks current (a truthy non-boolean does not), and a missing / shapeless
  * value reads as not-current — so a partial row, or a pre-`current` wire (before the server
  * computes it), never spuriously flags a device as the current one, and this never throws.

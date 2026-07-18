@@ -143,13 +143,13 @@ describe("session identity (AC: identity is the register-response session id)", 
     expect(createSession("sess-1", "default", T0).id).toBe("sess-1");
   });
 
-  it("a fresh session starts idle with the heartbeat clock at `now` (prompting mode ⇒ notifications not degraded)", () => {
+  it("a fresh session starts idle with the heartbeat clock at `now` (prompting mode ⇒ no auto-resolves marker)", () => {
     const session = createSession("sess-1", "default", T0);
     expect(session).toEqual({
       id: "sess-1",
       status: "connecting",
       activity: { kind: "idle" },
-      notificationsDegraded: false,
+      autoResolvesPermissions: false,
       createdAt: T0,
       lastActivityAt: T0,
       lastHeartbeatAt: T0,
@@ -158,26 +158,26 @@ describe("session identity (AC: identity is the register-response session id)", 
 
   // #33: a UC2 launch places its session in the registry BEFORE the worker has ever spoken — up on
   // its terminal, not yet checked in. It is a normal session in every other respect, so it lists,
-  // and carries its life-long degraded marker from birth; only its lifecycle entry point differs.
+  // and carries its life-long auto-resolves marker from birth; only its lifecycle entry point differs.
   it("createRegisteringSession is a fresh session that enters the lifecycle at `registering`", () => {
     const session = createRegisteringSession("sess-1", "default", T0);
     expect(session).toEqual({
       id: "sess-1",
       status: "registering",
       activity: { kind: "idle" },
-      notificationsDegraded: false,
+      autoResolvesPermissions: false,
       createdAt: T0,
       lastActivityAt: T0,
       lastHeartbeatAt: T0,
     });
   });
 
-  it("createRegisteringSession derives the SAME life-long degraded marker as createSession", () => {
+  it("createRegisteringSession derives the SAME life-long auto-resolves marker as createSession", () => {
     // Identical birth, one step earlier in the lifecycle: the only difference is `status`.
     for (const mode of PERMISSION_MODES) {
       const registering = createRegisteringSession("sess-1", mode, T0);
       const connecting = createSession("sess-1", mode, T0);
-      expect(registering.notificationsDegraded).toBe(connecting.notificationsDegraded);
+      expect(registering.autoResolvesPermissions).toBe(connecting.autoResolvesPermissions);
       expect({ ...registering, status: "connecting" }).toEqual(connecting);
     }
   });
@@ -518,7 +518,7 @@ describe("requires_action detail capture (#39 AC2: the session carries the human
   });
 });
 
-describe("isNonPromptingPermissionMode (AC: non-prompting modes → notifications degraded)", () => {
+describe("isNonPromptingPermissionMode (AC: non-prompting modes → auto-resolves marker set)", () => {
   it("classifies acceptEdits, bypassPermissions, auto, and dontAsk as non-prompting (they auto-resolve, not prompt)", () => {
     // Triaged from the 2.1.214 permission path (#271), never the name/color: bypass approves-all,
     // acceptEdits accepts-edits, auto defers to the classifier, dontAsk auto-DENIES — all resolve
@@ -546,39 +546,39 @@ describe("isNonPromptingPermissionMode (AC: non-prompting modes → notification
   });
 });
 
-describe("createSession notifications-degraded marker (AC: set at attach from the observed mode, life-long)", () => {
-  it("marks a session created under a non-prompting mode notifications-degraded", () => {
+describe("createSession auto-resolves-permissions marker (AC: set at attach from the observed mode, life-long)", () => {
+  it("marks a session created under a non-prompting mode as auto-resolving", () => {
     for (const mode of NON_PROMPTING_PERMISSION_MODES) {
-      expect(createSession("sess-np", mode, T0).notificationsDegraded).toBe(true);
+      expect(createSession("sess-np", mode, T0).autoResolvesPermissions).toBe(true);
     }
   });
 
-  it("leaves a session created under a prompting mode NOT degraded — it carries no marker", () => {
+  it("leaves a session created under a prompting mode unmarked — it carries no marker", () => {
     for (const mode of ["default", "plan"] as const) {
-      expect(createSession("sess-p", mode, T0).notificationsDegraded).toBe(false);
+      expect(createSession("sess-p", mode, T0).autoResolvesPermissions).toBe(false);
     }
   });
 
   it("derives the marker for EVERY pinned mode from isNonPromptingPermissionMode", () => {
     for (const mode of PERMISSION_MODES) {
-      expect(createSession("sess-x", mode, T0).notificationsDegraded).toBe(isNonPromptingPermissionMode(mode));
+      expect(createSession("sess-x", mode, T0).autoResolvesPermissions).toBe(isNonPromptingPermissionMode(mode));
     }
   });
 
-  it("keeps the marker life-long: no ccctl transition clears a degraded session's marker", () => {
-    // A non-prompting session marked at birth stays degraded through EVERY transition —
+  it("keeps the marker life-long: no ccctl transition clears a marked session's marker", () => {
+    // A non-prompting session marked at birth stays marked through EVERY transition —
     // activity, heartbeat, ready, close — because ccctl derives the marker once and each
     // transition spreads the session forward unchanged on this axis (NOT because the mode is
     // immutable — the worker can change it mid-run, which ccctl does not track; #272). This
     // pins ccctl's own no-clear invariant, which is what the marker's life-long-ness rests on.
     const born = createSession("sess-np", "bypassPermissions", T0);
-    expect(born.notificationsDegraded).toBe(true);
+    expect(born.autoResolvesPermissions).toBe(true);
     const running = applyWorkerStatusFrame(born, statusFrame({ status: "running" }), T0 + 1);
     const beaten = recordHeartbeat(running, T0 + 2);
     const ready = markSessionReady(beaten);
     const closed = markSessionClosed(ready);
     for (const s of [running, beaten, ready, closed]) {
-      expect(s.notificationsDegraded).toBe(true);
+      expect(s.autoResolvesPermissions).toBe(true);
     }
   });
 
@@ -586,12 +586,12 @@ describe("createSession notifications-degraded marker (AC: set at attach from th
     const born = createSession("sess-p", "default", T0);
     const acted = applyWorkerStatusFrame(born, statusFrame({ status: "requires_action" }), T0 + 1);
     const ready = markSessionReady(acted);
-    expect(born.notificationsDegraded).toBe(false);
-    expect(ready.notificationsDegraded).toBe(false);
+    expect(born.autoResolvesPermissions).toBe(false);
+    expect(ready.autoResolvesPermissions).toBe(false);
   });
 });
 
-describe("notificationsDegraded reconciliation (#265: a marked session is NOT silenced)", () => {
+describe("autoResolvesPermissions reconciliation (#265: a marked session is NOT silenced)", () => {
   // #26 derived the marker from an inference that ADR-005 (#263) falsified by observation:
   // "a non-prompting mode never emits requires_action". `AskUserQuestion` is an INTERACTION
   // tool, not a permission decision, so `bypassPermissions` — which suppresses permission
@@ -607,7 +607,7 @@ describe("notificationsDegraded reconciliation (#265: a marked session is NOT si
       statusFrame({ status: "requires_action", detail: "Which approach should I take?" }),
       T0 + 10,
     );
-    expect(session.notificationsDegraded).toBe(true); // marked at birth …
+    expect(session.autoResolvesPermissions).toBe(true); // marked at birth …
     expect(isInputAwaited(session.activity)).toBe(true); // … and STILL input-awaited.
   });
 
@@ -628,7 +628,7 @@ describe("notificationsDegraded reconciliation (#265: a marked session is NOT si
     // not a Session, so it CANNOT reach the marker — the type signature already guarantees this,
     // and this test cannot fail while that holds. The guard that actually bites lives at the
     // emitter (`@ccctl/server` § worker-channel.test.ts "#265"), which is mutation-proven: adding
-    // `if (next.notificationsDegraded) return;` to reconcileNeedsInput kills it and nothing else.
+    // `if (next.autoResolvesPermissions) return;` to reconcileNeedsInput kills it and nothing else.
     const marked = applyWorkerStatusFrame(
       createSession("sess-np", "bypassPermissions", T0),
       statusFrame({ status: "requires_action", detail: "Same detail" }),
@@ -639,7 +639,7 @@ describe("notificationsDegraded reconciliation (#265: a marked session is NOT si
       statusFrame({ status: "requires_action", detail: "Same detail" }),
       T0 + 10,
     );
-    expect(marked.notificationsDegraded).not.toBe(unmarked.notificationsDegraded); // they DIFFER on the marker …
+    expect(marked.autoResolvesPermissions).not.toBe(unmarked.autoResolvesPermissions); // they DIFFER on the marker …
     expect(marked.activity).toEqual(unmarked.activity); // … and are IDENTICAL on the trigger's only input.
     expect(isInputAwaited(marked.activity)).toBe(isInputAwaited(unmarked.activity));
   });
@@ -647,13 +647,13 @@ describe("notificationsDegraded reconciliation (#265: a marked session is NOT si
   // Rule: the marker and the signal are orthogonal — neither moves the other.
   it("the marker does not move when the session enters or leaves requires_action", () => {
     // Birth-fact vs live-state: reaching (and clearing) the blocking signal leaves the marker put,
-    // so a bypass session that just asked a question is not thereby "un-degraded".
+    // so a bypass session that just asked a question is not thereby "unmarked".
     let session = createSession("sess-np", "acceptEdits", T0);
-    expect(session.notificationsDegraded).toBe(true);
+    expect(session.autoResolvesPermissions).toBe(true);
     session = applyWorkerStatusFrame(session, statusFrame({ status: "requires_action", detail: "?" }), T0 + 10);
-    expect(session.notificationsDegraded).toBe(true);
+    expect(session.autoResolvesPermissions).toBe(true);
     session = applyWorkerStatusFrame(session, statusFrame({ status: "idle" }), T0 + 20);
-    expect(session.notificationsDegraded).toBe(true);
+    expect(session.autoResolvesPermissions).toBe(true);
   });
 
   it("is independent of the #78 hook — a hook event moves neither the marker nor the signal", () => {
@@ -663,7 +663,7 @@ describe("notificationsDegraded reconciliation (#265: a marked session is NOT si
     const hook: ControlFrame = { type: "control_event", subtype: "message", payload: { text: "AskUserQuestion" } };
     const afterHook = applyWorkerStatusFrame(born, hook, T0 + 10);
     expect(afterHook).toBe(born); // structural no-op: same object.
-    expect(afterHook.notificationsDegraded).toBe(true); // the hook did not clear the marker …
+    expect(afterHook.autoResolvesPermissions).toBe(true); // the hook did not clear the marker …
     expect(isInputAwaited(afterHook.activity)).toBe(false); // … nor raise the signal.
   });
 });

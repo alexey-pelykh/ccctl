@@ -200,13 +200,13 @@ describe("trackPendingLaunch", () => {
     });
   });
 
-  it("carries the launch's permission mode onto the registering session's life-long degraded marker", () => {
+  it("carries the launch's permission mode onto the registering session's life-long auto-resolves marker", () => {
     const state = makeState();
-    // `plan` is prompting → notifications are NOT degraded. (A non-prompting mode never reaches here:
+    // `plan` is prompting → no auto-resolves marker. (A non-prompting mode never reaches here:
     // the ingress refuses it before any launch — SRV-C-003 launch half, #32.)
     trackPendingLaunch(state, "sess-1", { cwd: "/w", permissionMode: "plan" }, fakeLaunched().launched);
 
-    expect(state.sessions.get("sess-1")?.notificationsDegraded).toBe(false);
+    expect(state.sessions.get("sess-1")?.autoResolvesPermissions).toBe(false);
   });
 
   it("records the CANONICAL cwd — the form the worker will report, not the form the operator typed", () => {
