@@ -202,11 +202,15 @@ describe("trackPendingLaunch", () => {
 
   it("carries the launch's permission mode onto the registering session's life-long auto-resolves marker", () => {
     const state = makeState();
-    // `plan` is prompting → no auto-resolves marker. (A non-prompting mode never reaches here:
-    // the ingress refuses it before any launch — SRV-C-003 launch half, #32.)
+    // `plan` is prompting → no auto-resolves marker.
     trackPendingLaunch(state, "sess-1", { cwd: "/w", permissionMode: "plan" }, fakeLaunched().launched);
-
     expect(state.sessions.get("sess-1")?.autoResolvesPermissions).toBe(false);
+
+    // A non-prompting mode now reaches here too — ADR-007 removed the launch refusal — and sets the
+    // marker true at launch, exactly as the attach half (#26) does. Asserting the true branch at the
+    // server layer, where the state became reachable (per-mode derivation is covered in `@ccctl/core`).
+    trackPendingLaunch(state, "sess-2", { cwd: "/w", permissionMode: "bypassPermissions" }, fakeLaunched().launched);
+    expect(state.sessions.get("sess-2")?.autoResolvesPermissions).toBe(true);
   });
 
   it("records the CANONICAL cwd — the form the worker will report, not the form the operator typed", () => {

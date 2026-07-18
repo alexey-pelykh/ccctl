@@ -137,9 +137,10 @@ export { toSessionCreateResponseWire, type SessionCreateResponseWire } from "./s
 // #266 credentialed live-worker gate (`@ccctl/e2e` § `live-ask-oracle.ts`) installs the SAME hook the
 // daemon does — the real `ask-user-question-hook.js`, whose path `installAskUserQuestionHookSettings`
 // resolves relative to THIS module, never a re-implemented copy that would resolve elsewhere and let the
-// gate confirm a fake hook. `launchSession` installs this internally for a server-LAUNCHED (prompting-mode)
-// session; the gate drives a `bypassPermissions` session over the bridge (which `launchSession` refuses),
-// so it must install + wire the hook itself and clean the install files up on teardown.
+// gate confirm a fake hook. `launchSession` installs this internally for a server-LAUNCHED session; the
+// gate drives a `bypassPermissions` session over the bridge (a §2 attach registration, which carries no
+// `hookInstalls` entry — that map is populated only on the launch path), so it must install + wire the
+// hook itself and clean the install files up on teardown.
 export {
   cleanupHookInstall,
   installAskUserQuestionHookSettings,

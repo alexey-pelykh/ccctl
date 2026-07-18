@@ -40,7 +40,7 @@ import {
  * would have failed on ANY backend, so reporting "no backend was available" instead would blame the
  * host for the caller's mistake and send them off installing tmux to fix a missing binary.
  */
-const CALLER_FAULT_CODES: readonly LaunchFailureCode[] = ["invalid-cwd", "worker-not-found", "non-prompting-mode"];
+const CALLER_FAULT_CODES: readonly LaunchFailureCode[] = ["invalid-cwd", "worker-not-found"];
 
 /**
  * Compose an ordered list of {@link ISessionLauncher} backends into one fallback launcher.

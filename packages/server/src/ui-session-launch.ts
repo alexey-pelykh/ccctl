@@ -32,11 +32,17 @@
  * typed {@link LaunchFailureCode} — never a silent drop, and never an opaque 502 the UI can only
  * show as prose: a wrong method (405), no launcher configured (501 `launcher-absent`), the
  * `maxSessions` cap already full (429 `at-capacity`, #36), a
- * malformed body (400 `malformed-request`), a non-prompting permission-mode that could never
- * raise the "awaiting input" signal a remotely-driven UC2 session needs (400
- * `non-prompting-mode`, SRV-C-003 launch half), a working directory that does not exist (400
+ * malformed body (400 `malformed-request`), a working directory that does not exist (400
  * `invalid-cwd`), or a launcher that could bring up no surface at all (502
  * `backend-unavailable` / `worker-not-found` / `spawn-failed`, as the backend classified it).
+ *
+ * A launch is NO LONGER refused for its permission mode. The old `non-prompting-mode` refusal
+ * (SRV-C-003 launch half, #32) rested on the premise ADR-005 falsified — that a non-prompting
+ * mode "could never raise the awaiting-input signal" — and every non-prompting mode CAN block
+ * awaiting input (`@ccctl/core` § `NON_PROMPTING_PERMISSION_MODES`). ADR-007 removed it, aligning
+ * launch with the attach path (#26), which already carries every mode; the advisory
+ * `autoResolvesPermissions` marker (#265/#270) is the surface that INFORMS about a non-prompting
+ * session, in place of a refusal.
  *
  * **Bounded, because a launch is remotely triggerable (#36).** Every `POST /api/sessions` spawns a
  * REAL terminal on the operator's host, and the caller is a phone across a tunnel — so a stuck
@@ -64,7 +70,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { isNonPromptingPermissionMode, isPermissionMode } from "@ccctl/core";
+import { isPermissionMode } from "@ccctl/core";
 import { cleanupHookInstall, installAskUserQuestionHookSettings, type HookInstall } from "./hook-settings-installer.js";
 import { readJsonBody, writeJson } from "./http-response.js";
 import {
@@ -117,16 +123,6 @@ export const DEFAULT_MAX_SESSIONS = 8;
  * two entry points describe the one condition identically (single source of truth).
  */
 const NO_LAUNCHER_CONFIGURED = "ccctl: no session launcher is configured — this server cannot launch sessions";
-
-/**
- * The "non-prompting mode refused" reason, shared by the HTTP 400 and the programmatic throw so the
- * two entry points describe the one condition identically (single source of truth, mirroring
- * {@link NO_LAUNCHER_CONFIGURED}). Names the two prompting modes so the operator knows how to re-launch.
- */
-const NON_PROMPTING_MODE_REFUSED =
-  "ccctl: a launched session must run under a prompting permission-mode (`default` or `plan`) so it can block " +
-  'on decisions and raise the "awaiting input" signal — `acceptEdits` / `bypassPermissions` never block, so a ' +
-  "session launched under them could never ask for you";
 
 /** The "malformed launch body" reason — the shape a launch must take, named so the caller can fix it. */
 const MALFORMED_LAUNCH_BODY =
@@ -264,14 +260,14 @@ export interface LaunchFailureWire {
  * without `tsc` demanding its status here) rather than scattered across the branches that answer.
  *
  * The split follows who must act: a request the operator can fix is a `4xx` — a body we cannot
- * parse, a mode we refuse, a directory that does not exist; a server that was never wired to
+ * parse, a directory that does not exist; a server that was never wired to
  * launch is `501` (not implemented HERE, which is exactly true); and a host that could bring no
  * surface up is `502` — the launch was well-formed and we could not honor it.
  *
  * `at-capacity` is `429` (#36), and the reasoning is worth pinning because the obvious alternative
  * is `503`. It is a `4xx` by this map's own rule: the launch is REFUSED BY POLICY, not failed by the
- * host — the same shape as `non-prompting-mode` (also a well-formed request this server declines),
- * and the operator is the one who acts (end a session, or raise the cap). A `503` would say the
+ * host — a well-formed request this server declines, where the operator is the one who acts (end a
+ * session, or raise the cap). It is the only policy-refusal the map still carries. A `503` would say the
  * service is unavailable, which is false in the way that matters: the server is healthy, the other
  * 8 sessions are live and steerable, and only this one verb is declining. Within `4xx`, `429` is the
  * member that means "you may not have more of this right now" — its RFC 6585 gloss says "rate
@@ -285,7 +281,6 @@ const LAUNCH_FAILURE_STATUS: Record<LaunchFailureCode, number> = {
   "launcher-absent": 501,
   "at-capacity": 429,
   "malformed-request": 400,
-  "non-prompting-mode": 400,
   "invalid-cwd": 400,
   "worker-not-found": 502,
   "backend-unavailable": 502,
@@ -405,11 +400,11 @@ function liveSessionCount(state: SessionLaunchState): number {
  * skipped the pending-launch bookkeeping would leave exactly the ghost #33 exists to prevent).
  *
  * Every refusal is a typed {@link SessionLaunchError}: no launcher configured (`launcher-absent`),
- * every slot under the `maxSessions` cap already held by a live session (`at-capacity`, #36), a
- * non-prompting permission-mode (`non-prompting-mode` — `acceptEdits` / `bypassPermissions`, a
- * session that could never raise the "awaiting input" signal a remotely-driven UC2 session needs;
- * the sibling attach half, #26, can only MARK such a session as auto-resolving, but the launch half CONTROLS
- * the mode, so it enforces prompting), or a working directory that does not exist (`invalid-cwd`).
+ * every slot under the `maxSessions` cap already held by a live session (`at-capacity`, #36), or a
+ * working directory that does not exist (`invalid-cwd`). The permission mode is NOT a refusal reason
+ * (ADR-007): a launch under any mode — including the once-refused `acceptEdits` / `bypassPermissions`
+ * / `dontAsk` / `auto` — is carried exactly as the attach half (#26) already carries it, the advisory
+ * `autoResolvesPermissions` marker informing in place of the removed refusal.
  * A launcher reject propagates with the code the BACKEND classified it as. The HTTP handler maps
  * each code to its status; a programmatic caller reads `error.code` directly.
  *
@@ -440,9 +435,6 @@ export async function launchSession(state: SessionLaunchState, options: SessionL
   const live = liveSessionCount(state);
   if (live >= state.maxSessions) {
     throw new SessionLaunchError("at-capacity", atCapacityReason(live, state.maxSessions));
-  }
-  if (isNonPromptingPermissionMode(options.permissionMode)) {
-    throw new SessionLaunchError("non-prompting-mode", NON_PROMPTING_MODE_REFUSED);
   }
   // Pre-flight, not post-mortem: a directory that does not exist is the operator's mistake, and
   // naming it here means no backend ever spawns a process that was doomed to fail — so an invalid

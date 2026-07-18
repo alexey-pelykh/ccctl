@@ -23,7 +23,6 @@ const SERVER_FAILURE_CODES = [
   "launcher-absent",
   "at-capacity",
   "malformed-request",
-  "non-prompting-mode",
   "invalid-cwd",
   "worker-not-found",
   "backend-unavailable",
@@ -31,9 +30,10 @@ const SERVER_FAILURE_CODES = [
 ];
 
 describe("LAUNCH_PERMISSION_MODE", () => {
-  it("is a PROMPTING mode, so the server never refuses this control's launch as non-prompting", () => {
-    // The server refuses `acceptEdits` / `bypassPermissions` (SRV-C-003, #32): a session that can
-    // never block on a decision can never raise the "awaiting input" signal a remote steer needs.
+  it("is a PROMPTING mode — the sensible default posture for a launched session", () => {
+    // `default` blocks on each decision and raises the "awaiting input" signal the operator steers
+    // by. The server no longer refuses non-prompting modes (ADR-007) — this pin is a UI choice, not
+    // a constraint — but a prompting default is the right posture for a fresh session from a phone.
     expect(["default", "plan"]).toContain(LAUNCH_PERMISSION_MODE);
   });
 

@@ -79,10 +79,13 @@ zero-build transport pair:
   optional **project** label and **initial prompt** — and the server runs its
   injected launcher to bring up a real headful terminal running the patched
   `claude`. `src/launch.js` owns the body-building and the answer-reading; the
-  `permissionMode` is pinned to `default` rather than offered as a control, because
-  the server requires the field and refuses the non-prompting modes (a session that
-  never blocks could never raise the "awaiting input" signal a remote steer needs —
-  SRV-C-003 / #32). The launched session is `registering` **from birth** (#33), so
+  `permissionMode` is pinned to `default` — a UI choice, not a server constraint:
+  the server requires the field but no longer refuses any mode (ADR-007 removed the
+  `non-prompting-mode` refusal, whose premise ADR-005 falsified), and this control
+  simply offers no mode picker (a separate item, not #37's scope). `default` is the
+  standard prompting mode, so a fresh session brought up from a phone blocks on each
+  decision and raises the "awaiting input" signal the operator steers it by. The
+  launched session is `registering` **from birth** (#33), so
   an accepted launch simply refreshes the list above and the new session appears
   there. The launch itself selects nothing; the picker's ordinary first-load rule
   still applies, so launching into an empty list auto-selects the new row and opens

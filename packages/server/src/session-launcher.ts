@@ -256,8 +256,9 @@ export interface ISessionLauncher {
  * The set partitions the failures by WHO must act:
  *
  *   - the OPERATOR's request is wrong — `invalid-cwd` (the working directory does not exist, or
- *     is not a directory), `non-prompting-mode` (a mode that could never raise the awaiting-input
- *     signal, SRV-C-003), `malformed-request` (an unparseable body);
+ *     is not a directory), `malformed-request` (an unparseable body). The permission mode is NOT
+ *     among them: ADR-007 removed the `non-prompting-mode` refusal (its premise — that a
+ *     non-prompting mode could never raise the awaiting-input signal — was falsified by ADR-005);
  *   - this SERVER cannot launch at all — `launcher-absent` (no launcher was wired into it);
  *   - this SERVER will not launch RIGHT NOW — `at-capacity` (#36): every slot under the
  *     `maxSessions` cap is held by a live session, so a further launch is refused until one ends.
@@ -282,7 +283,6 @@ export type LaunchFailureCode =
   | "launcher-absent"
   | "at-capacity"
   | "malformed-request"
-  | "non-prompting-mode"
   | "invalid-cwd"
   | "worker-not-found"
   | "backend-unavailable"
@@ -293,7 +293,6 @@ export const LAUNCH_FAILURE_CODES: readonly LaunchFailureCode[] = [
   "launcher-absent",
   "at-capacity",
   "malformed-request",
-  "non-prompting-mode",
   "invalid-cwd",
   "worker-not-found",
   "backend-unavailable",
