@@ -44,7 +44,12 @@ zero-build transport pair:
   without flicker or losing focus / the current selection. A session carrying the
   life-long non-prompting marker (#26 — it auto-approves some class of permission
   decision rather than asking you) stands a persistent badge on its row (#27); a
-  prompting session shows none. The badge is **advisory** (#265): a marked session still
+  prompting session shows none. The badge reflects the mode the session was **launched**
+  under, not its current mode: ccctl reads the mode once at launch and does not fold a
+  mid-run Shift+Tab / `set_permission_mode` change — a deliberate deferral (tracking is
+  feasible, since the worker emits the change on a §5 frame ccctl ingests, but is not
+  adopted; ADR-006 / #272), so the badge can go stale. It stays **advisory**
+  (#265): a marked session still
   raises needs-you when the agent asks a question, because `AskUserQuestion` blocks
   natively even under bypass (ADR-005) — fewer triggers, not none. It does not mean the
   session never prompts either: `bypassPermissions` approves every tool call, while

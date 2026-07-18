@@ -125,8 +125,8 @@ export interface SessionSummaryWire {
    * #26): `true` for a non-prompting session — one that auto-resolves some class of permission decision
    * (by approving, denying, or classifying) rather than prompting the operator on it — `false`
    * otherwise. A persistent badge the attach flow surfaces — ccctl derives it once and never re-reads
-   * the mode, so it never clears (it can therefore go stale if the operator changes mode mid-run, which
-   * ccctl does not track — #272).
+   * the mode, so it never clears (the marker is LAUNCH-TIME and can therefore go stale if the operator
+   * changes mode mid-run, which ccctl does not track by decision — ADR-006 / #272).
    *
    * ADVISORY, never a suppression input (#265). A marked session still emits `requires_action` and
    * still raises needs-you when the agent asks a question — `AskUserQuestion` blocks natively even

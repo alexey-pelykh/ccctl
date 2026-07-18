@@ -232,8 +232,9 @@ export function handleSessionCreate(req: IncomingMessage, res: ServerResponse, s
     // The session is marked at birth from its OBSERVED permission mode (a non-prompting mode
     // auto-resolves some class of permission decision rather than prompting on it); the marker
     // is life-long because ccctl derives it once here and never re-reads the mode — not because
-    // the mode is immutable (the worker exposes a mid-run `set_permission_mode`, which ccctl does
-    // not track, so the marker can go stale — #272). ADVISORY only — it does NOT mean the session
+    // the mode is immutable (the worker exposes a mid-run `set_permission_mode`, and an interactive
+    // Shift+Tab cycle, which ccctl does not track by decision, so the marker is LAUNCH-TIME and can
+    // go stale — ADR-006 / #272). ADVISORY only — it does NOT mean the session
     // cannot emit `requires_action`, and nothing gates a notification on it (#265;
     // `@ccctl/core` § `Session.autoResolvesPermissions`).
     state.sessions.set(sessionId, createSession(sessionId, body.permissionMode));

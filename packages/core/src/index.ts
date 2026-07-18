@@ -538,8 +538,10 @@ export interface Session {
    * unchanged, so no ccctl code path clears it. Life-long by ccctl's CONSTRUCTION, not
    * because the underlying mode is immutable — the worker exposes a mid-run
    * `set_permission_mode` control (and an interactive Shift+Tab cycle), so an operator who
-   * changes mode mid-session leaves this marker STALE; ccctl does not observe the change
-   * today (#272). A prompting session (`default` / `plan`) carries `false`.
+   * changes mode mid-session leaves this marker STALE. ccctl does not track the change, by
+   * decision: the marker is LAUNCH-TIME. Tracking is FEASIBLE — the worker emits its mode on a
+   * §5 `system/status` frame ccctl already ingests — but deferred, not adopted (ADR-006 / #272).
+   * A prompting session (`default` / `plan`) carries `false`.
    *
    * One boolean over the whole non-prompting set, so it cannot say HOW MUCH — or in which
    * DIRECTION — a marked session auto-resolves: `bypassPermissions` approves every tool call
@@ -571,8 +573,9 @@ export interface Session {
  * mark does and does not claim), and the heartbeat clock
  * started at `now` (registration is its first liveness signal). `permissionMode`
  * is the mode the session is created under — a birth parameter ccctl reads once and
- * does not track thereafter (the worker CAN change it mid-run via `set_permission_mode`,
- * which ccctl does not observe — #272). `now` is injectable so liveness/heartbeat timing
+ * does not re-read thereafter (the worker CAN change it mid-run via `set_permission_mode`
+ * or a local Shift+Tab, which ccctl does not track by decision — the marker is launch-time,
+ * ADR-006 / #272). `now` is injectable so liveness/heartbeat timing
  * is deterministic under test — never a baked-in ambient clock.
  */
 export function createSession(id: string, permissionMode: PermissionMode, now: number = Date.now()): Session {
