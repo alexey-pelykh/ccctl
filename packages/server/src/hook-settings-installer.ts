@@ -29,6 +29,14 @@
  * launch leaves at most a pair of harmless orphaned files (best-effort cleaned up by the caller),
  * never a half-registered session.
  *
+ * **Ownership is in the filename, because the map is not durable (#275, ADR-008).** Both files an
+ * install produces are named `{ownerPid}_{token}.{kind}.json`. The two cleanup paths that normally
+ * remove them — a graceful close (`session-close.ts`) and a failed launch (below) — both read
+ * `ServerState.hookInstalls`, an in-memory map a `SIGKILL`/OOM/restart erases outright, taking with
+ * it any knowledge that these files exist. The PID stamp is what survives that: it lets a LATER
+ * daemon's startup sweep (`hook-install-sweep.ts`) tell a dead daemon's leftovers from a
+ * concurrently-running one's live installs, using nothing but a directory listing.
+ *
  * **What the installed settings say, and don't.** The hook is enrich-only (ADR-005): it must
  * NEVER return `permissionDecision: "ask"` (that would stack a redundant prompt in front of the
  * native block), so nothing in this installed settings file grants it that power — the hook
@@ -50,6 +58,30 @@ export const HOOK_STATE_DIR_MODE = 0o700;
 
 /** Owner-read/write-only (`0600`) — every file this installer writes, forced regardless of umask. */
 export const HOOK_STATE_FILE_MODE = 0o600;
+
+/**
+ * The separator between a hook install's OWNER PID and its token in the on-disk filename (#275,
+ * ADR-008) — `_`, deliberately a character a `randomUUID()` token can never contain (`[0-9a-f-]`
+ * only). That is what makes the prefix unambiguously parseable: a legacy pre-#275 file is named for
+ * its bare token, and a UUID whose first group happens to be all digits (`12345678-…`) would be
+ * indistinguishable from a PID prefix under a `-` separator. With `_`, "has an owner" and "is a
+ * legacy orphan" are decidable from the name alone — which is exactly what
+ * `hook-install-sweep.ts` has to decide, with nothing but a directory listing to go on.
+ */
+export const HOOK_INSTALL_OWNER_SEPARATOR = "_";
+
+/** The two files one install produces, by role — `{ownerPid}_{token}.{kind}.json`. */
+export type HookInstallFileKind = "settings" | "handoff";
+
+/**
+ * Compose one install file's name: `{ownerPid}_{token}.{kind}.json`. The SINGLE source of truth for
+ * the on-disk naming, shared with `hook-install-sweep.ts` § `classifyHookInstallFileName` — the
+ * writer and the reaper must agree on the format or the reaper either misses real orphans or, worse,
+ * fails to recognize a LIVE daemon's file as owned.
+ */
+export function hookInstallFileName(ownerPid: number, token: string, kind: HookInstallFileKind): string {
+  return `${String(ownerPid)}${HOOK_INSTALL_OWNER_SEPARATOR}${token}.${kind}.json`;
+}
 
 /**
  * Resolve the hook state directory: `$XDG_STATE_HOME/ccctl/hooks`, falling back to
@@ -130,6 +162,15 @@ function writeStateFileAtomic(path: string, content: string): void {
  * settings file wiring the hook at a fresh-token path, and return both that settings path (for
  * `--settings`) and the handoff path the hook will write to (for later server-side correlation).
  *
+ * **Both files are STAMPED with the installing daemon's PID** (`{ownPid}_{token}.…`, #275 / ADR-008).
+ * That stamp is the ONLY durable record of who owns an install: {@link HookInstall} itself lives in
+ * `ServerState.hookInstalls`, an in-memory map a `SIGKILL`/OOM/restart erases completely — after
+ * which nothing on disk would say whether a given file belongs to a daemon that is still running or
+ * to one that died mid-session. The stamp lets a starting daemon's sweep
+ * (`hook-install-sweep.ts`) tell those apart from a directory listing alone, and is deliberately
+ * written by the INSTALLER rather than tracked separately, so an install and its ownership record
+ * cannot drift apart: they are the same `rename(2)`.
+ *
  * Deliberately synchronous — this runs once, briefly, ahead of a launcher call that is already
  * about to shell out (tmux) or fork (pty); adding an async boundary here buys nothing and would
  * only complicate `launchSession`'s existing synchronous-until-the-launcher-call reservation
@@ -138,10 +179,11 @@ function writeStateFileAtomic(path: string, content: string): void {
 export function installAskUserQuestionHookSettings(
   token: string,
   stateDir: string = resolveHookStateDir(),
+  ownPid: number = process.pid,
 ): HookInstall {
   mkdirSync(stateDir, { recursive: true, mode: HOOK_STATE_DIR_MODE });
-  const settingsPath = join(stateDir, `${token}.settings.json`);
-  const handoffPath = join(stateDir, `${token}.handoff.json`);
+  const settingsPath = join(stateDir, hookInstallFileName(ownPid, token, "settings"));
+  const handoffPath = join(stateDir, hookInstallFileName(ownPid, token, "handoff"));
   const settings = buildAskUserQuestionHookSettings(resolveHookScriptPath(), handoffPath);
   writeStateFileAtomic(settingsPath, JSON.stringify(settings));
   return { settingsPath, handoffPath };

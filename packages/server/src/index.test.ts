@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Oleksii PELYKH
 
-import { afterEach, describe, expect, it } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createRegisteringSession, createSession } from "@ccctl/core";
 import { asLaunchMarker, DEFAULT_HOST, startServer, type CcctlServer } from "./index.js";
+import { HOOK_STATE_SUBDIR, hookInstallFileName } from "./hook-settings-installer.js";
+import { CCCTL_STATE_DIR, XDG_STATE_HOME_ENV } from "./session-store-file.js";
 
 // Every started server is tracked and closed in afterEach so no listener leaks
 // across tests (each binds an ephemeral port, so parallel tests never collide).
@@ -171,5 +176,116 @@ describe("startServer", () => {
     const res = await fetch(`http://${host}:${port}/api/sessions`);
     const body = (await res.json()) as { sessions: readonly { id: string }[] };
     expect(body.sessions.map((session) => session.id)).toEqual(["sess-real"]);
+  });
+
+  // The hook-install sweep (#275, ADR-008) — `hook-install-sweep.test.ts` proves WHAT it reaps in
+  // isolation; these prove startServer actually RUNS it, runs it before the listener opens, and does
+  // NOT run it when no directory was injected. The directory is passed via `hookStateDir` rather than
+  // by redirecting `XDG_STATE_HOME`, which is the point of that config existing: the sweep DELETES, so
+  // a server that resolved the real path itself would make every bare `startServer()` in this suite
+  // mutate the developer's own `$HOME`.
+  describe("startup hook-install sweep (#275)", () => {
+    let stateHome: string;
+    let hookDir: string;
+    let priorStateHome: string | undefined;
+
+    /** Start a server that sweeps `hookDir`, tracked for teardown like every other test server here. */
+    async function startSweepingServer(): Promise<CcctlServer> {
+      const server = await startServer({ port: 0, host: DEFAULT_HOST, hookStateDir: hookDir });
+      started.push(server);
+      return server;
+    }
+
+    beforeEach(() => {
+      // `XDG_STATE_HOME` is redirected so that `hookDir` is EXACTLY where an un-gated `startServer`
+      // would fall back to (`resolveHookStateDir()`). That is what lets the "does NOT sweep" test
+      // below actually observe the gate's removal: without this, an un-gated server would sweep the
+      // developer's real `$HOME` while the test watched a temp directory nothing had touched — a
+      // green assertion over the wrong directory, on the one test guarding the whole fix.
+      priorStateHome = process.env[XDG_STATE_HOME_ENV];
+      stateHome = mkdtempSync(join(tmpdir(), "ccctl-index-sweep-"));
+      process.env[XDG_STATE_HOME_ENV] = stateHome;
+      hookDir = join(stateHome, CCCTL_STATE_DIR, HOOK_STATE_SUBDIR);
+      mkdirSync(hookDir, { recursive: true });
+    });
+
+    afterEach(() => {
+      if (priorStateHome === undefined) {
+        Reflect.deleteProperty(process.env, XDG_STATE_HOME_ENV);
+      } else {
+        process.env[XDG_STATE_HOME_ENV] = priorStateHome;
+      }
+      rmSync(stateHome, { recursive: true, force: true });
+    });
+
+    it("reaps a dead daemon's orphaned hook files on startup (AC1)", async () => {
+      // The exact #275 scenario: a daemon was SIGKILLed mid-session, so its in-memory `hookInstalls`
+      // died with it and BOTH of its files became unreachable to every #262 cleanup path.
+      const settings = join(hookDir, hookInstallFileName(4242, "dead-token", "settings"));
+      const handoff = join(hookDir, hookInstallFileName(4242, "dead-token", "handoff"));
+      writeFileSync(settings, "{}");
+      writeFileSync(handoff, "{}");
+
+      await startSweepingServer();
+
+      expect(existsSync(settings)).toBe(false);
+      expect(existsSync(handoff)).toBe(false);
+    });
+
+    it("spares an install owned by a live daemon that is not this one (AC2)", async () => {
+      // PID 1 is always alive and is never this process — the cleanest stand-in for "another daemon".
+      // (It also exercises the EPERM-means-alive branch: `process.kill(1, 0)` throws EPERM here.)
+      const otherDaemon = join(hookDir, hookInstallFileName(1, "other-token", "settings"));
+      writeFileSync(otherDaemon, "{}");
+
+      await startSweepingServer();
+
+      expect(existsSync(otherDaemon)).toBe(true);
+    });
+
+    it("sweeps BEFORE the listener opens — observed synchronously, ahead of the await (#34-style pin)", async () => {
+      // Asserting AFTER the promise resolves cannot discriminate WHERE the sweep ran: it passes just as
+      // well with the sweep moved into the listen() callback (measured — all four of these tests still
+      // passed under that placement). This captures the observation BEFORE the await instead, exactly as
+      // the #34 reaper's ordering test above captures `probedBeforeReturn`. startServer's sweep is a
+      // synchronous step in its prologue, so the file is already gone by the time the call RETURNS its
+      // promise — strictly before any listener exists. Move it into the listen callback and
+      // `goneBeforeReturn` is false.
+      const orphan = join(hookDir, hookInstallFileName(4242, "ordering-token", "handoff"));
+      writeFileSync(orphan, "{}");
+
+      const pending = startSweepingServer();
+      const goneBeforeReturn = !existsSync(orphan);
+
+      await pending;
+
+      expect(goneBeforeReturn).toBe(true);
+    });
+
+    it("does NOT sweep when no hookStateDir is injected — the fail-closed default (AC2)", async () => {
+      // The guarantee the ~20 other startServer callers in this suite depend on: a bare startServer
+      // deletes nothing, anywhere. Without it, every one of them would reap the developer's real
+      // `$XDG_STATE_HOME/ccctl/hooks` as a side effect of testing something unrelated (measured — a
+      // canary planted there was deleted by `ui-sessions.test.ts` before the gate existed).
+      //
+      // This DISCRIMINATES because of the `XDG_STATE_HOME` redirect in `beforeEach`: `hookDir` is
+      // precisely where an un-gated server's `resolveHookStateDir()` fallback would land, so removing
+      // the `if (config.hookStateDir !== undefined)` gate makes this orphan disappear and the test go
+      // red — rather than sweeping some other directory the assertion cannot see.
+      const orphan = join(hookDir, hookInstallFileName(4242, "untouched-token", "settings"));
+      writeFileSync(orphan, "{}");
+
+      await startTestServer();
+
+      expect(existsSync(orphan)).toBe(true);
+    });
+
+    it("boots normally when the hook state directory does not exist at all", async () => {
+      rmSync(hookDir, { recursive: true, force: true });
+
+      const server = await startSweepingServer();
+
+      expect(server.address.port).toBeGreaterThan(0);
+    });
   });
 });

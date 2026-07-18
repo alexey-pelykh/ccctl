@@ -154,6 +154,11 @@ export interface SessionCloseState {
    * was asked but never correlated before the session ended) would otherwise leave its settings + handoff
    * files on disk for the daemon's life — the same per-closed-session leak {@link requiresActionEnrichments}
    * above exists to prevent for its own map.
+   *
+   * This path covers the GRACEFUL close only, and cannot cover more: it reads a map that dies with the
+   * process, so a `SIGKILL`/OOM/restart strands every file a then-live launch had written. That
+   * across-restart half is `hook-install-sweep.ts` (#275), which reaps by the owner-PID stamp in the
+   * filename — the one record of an install that outlives this map.
    */
   readonly hookInstalls: Map<string, HookInstall>;
   /** The structured-log sink (#61) — every session death is emitted here, so a created-but-never-closed leak is diagnosable. */

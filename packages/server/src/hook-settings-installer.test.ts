@@ -3,7 +3,7 @@
 
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   buildAskUserQuestionHookSettings,
@@ -11,6 +11,7 @@ import {
   HOOK_STATE_DIR_MODE,
   HOOK_STATE_FILE_MODE,
   HOOK_STATE_SUBDIR,
+  hookInstallFileName,
   installAskUserQuestionHookSettings,
   resolveHookScriptPath,
   resolveHookStateDir,
@@ -144,6 +145,29 @@ describe("installAskUserQuestionHookSettings / cleanupHookInstall", () => {
 
     expect(first.settingsPath).not.toBe(second.settingsPath);
     expect(first.handoffPath).not.toBe(second.handoffPath);
+  });
+
+  it("STAMPS both files with the installing daemon's pid (#275, ADR-008)", () => {
+    // The ownership stamp is the sweep's ONLY durable input: `ServerState.hookInstalls` is in-memory,
+    // so after a SIGKILL the filename is all that says who wrote these. `hook-install-sweep.ts` reads
+    // it back — this pins the writing half of that contract.
+    const install = installAskUserQuestionHookSettings("token-1", dir, 4242);
+
+    expect(basename(install.settingsPath)).toBe("4242_token-1.settings.json");
+    expect(basename(install.handoffPath)).toBe("4242_token-1.handoff.json");
+  });
+
+  it("defaults the stamp to THIS process's pid — a real launch records its own daemon", () => {
+    const install = installAskUserQuestionHookSettings("token-1", dir);
+
+    expect(basename(install.settingsPath)).toBe(`${String(process.pid)}_token-1.settings.json`);
+  });
+
+  it("hookInstallFileName is the single source of truth the sweep reads back", () => {
+    const install = installAskUserQuestionHookSettings("token-1", dir, 4242);
+
+    expect(basename(install.settingsPath)).toBe(hookInstallFileName(4242, "token-1", "settings"));
+    expect(basename(install.handoffPath)).toBe(hookInstallFileName(4242, "token-1", "handoff"));
   });
 
   it("cleanupHookInstall removes both files", () => {
