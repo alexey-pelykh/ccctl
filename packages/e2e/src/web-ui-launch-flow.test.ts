@@ -130,12 +130,13 @@ describe("the New session control's launch body (#37 AC1)", () => {
     ]);
   });
 
-  it("launches with a PROMPTING mode — the pinned mode is one the server does not refuse", async () => {
+  it("launches with the pinned mode — a real end-to-end 201 through the live ingress", async () => {
     const { launcher } = fakeLauncher();
     const server = await serve({ port: 0, launcher });
 
-    // The pin is only correct while the server still accepts it: a non-prompting mode is refused
-    // `non-prompting-mode` (SRV-C-003, #32), so this fails if the pin (or that rule) ever drifts.
+    // The pin (`default`) is accepted by the real ingress and launches end-to-end. ADR-007 removed
+    // the mode refusal, so the server now accepts every mode; this still pins that the UI's own
+    // launch body round-trips to a 201 against a live server.
     const res = await postLaunch(server, launchRequest({ cwd: process.cwd() }));
 
     expect(res.status).toBe(201);
@@ -229,19 +230,17 @@ describe("a launch failure surfaces the TYPED error (#37 AC3)", () => {
     expect(failure.code).toBe("launcher-absent");
   });
 
-  it("reads `malformed-request` and `non-prompting-mode` off the REAL 400s the UI's own body cannot provoke", async () => {
+  it("reads `malformed-request` off the REAL 400 the UI's own body cannot provoke", async () => {
     const { launcher } = fakeLauncher();
     const server = await serve({ port: 0, launcher });
 
-    // Bodies `launchRequest` would never build — the UI must still READ these codes correctly,
-    // because the server owns the set and another client (or a future control) can raise them.
+    // A body `launchRequest` would never build (an unknown mode) — the UI must still READ the code
+    // correctly, because the server owns the set and another client can raise it. (The old
+    // `non-prompting-mode` 400 is gone — ADR-007 launches every mode — so `malformed-request` is the
+    // remaining 400 this control's own body cannot provoke.)
     const malformed = await postLaunch(server, { cwd: process.cwd(), permissionMode: "bogus" });
     expect(malformed.status).toBe(400);
     expect(launchFailure(malformed.status, await malformed.json()).code).toBe("malformed-request");
-
-    const nonPrompting = await postLaunch(server, { cwd: process.cwd(), permissionMode: "bypassPermissions" });
-    expect(nonPrompting.status).toBe(400);
-    expect(launchFailure(nonPrompting.status, await nonPrompting.json()).code).toBe("non-prompting-mode");
   });
 
   it("degrades the ingress's 405 — the ONE failure answered with no `code` — instead of throwing", async () => {

@@ -28,7 +28,7 @@
  * `LaunchFailureCode` is the pinned discriminant that says WHICH failure it is (#33), so the
  * operator is told what to do rather than that something broke. The server owns the set and
  * partitions it by WHO must act: the operator's request is wrong (`invalid-cwd`,
- * `non-prompting-mode`, `malformed-request`), this server cannot launch at all (`launcher-absent`),
+ * `malformed-request`), this server cannot launch at all (`launcher-absent`),
  * it will not launch right now (`at-capacity`, #36 — well-formed, and retryable the moment a slot
  * frees), or the host could bring no surface up (`worker-not-found`, `backend-unavailable`,
  * `spawn-failed`). This module deliberately mirrors NO copy of that set: it reads a code rather than
@@ -49,16 +49,19 @@
  *
  * Pinned rather than offered as a control: the server REQUIRES the field — an absent or unknown
  * mode is refused `malformed-request` — so the UI must send one, and #37's control takes only an
- * initial prompt and a working directory/project. `default` is the standard PROMPTING mode, which
- * is the half that matters: a launched session must be able to block on a decision and raise the
- * "awaiting input" signal a remotely-driven session is steered by, so the server refuses the
- * non-prompting modes (`acceptEdits` / `bypassPermissions`) with a typed `non-prompting-mode`
- * (SRV-C-003, #32). Sending `default` therefore makes that refusal unreachable from this control
- * BY CONSTRUCTION — {@link launchFailure} still decodes the code, because the server owns the
- * closed set and this UI is not the only thing that can be wrong about it.
+ * initial prompt and a working directory/project. `default` is the pin because it is the standard
+ * PROMPTING mode: a session launched under it blocks on each decision and raises the "awaiting
+ * input" signal the operator steers it by, which is the sensible posture for a fresh session
+ * brought up from a phone.
  *
- * The other prompting mode, `plan`, is reachable on the wire but has no control here; surfacing a
- * mode picker is a separate item, not #37's scope.
+ * The pin is a UI CHOICE, not a server constraint. The server no longer refuses any mode
+ * (ADR-007 removed the `non-prompting-mode` refusal — its premise, that a non-prompting mode
+ * could never raise the "awaiting input" signal, was falsified by ADR-005), so `acceptEdits` /
+ * `bypassPermissions` / `dontAsk` / `auto` are all launchable on the wire; this control simply
+ * does not surface a picker for them. Surfacing a mode picker (and the amber
+ * `autoResolvesPermissions` badge it would light for a non-prompting choice) is a separate item,
+ * not #37's scope — `plan`, the other prompting mode, is likewise reachable on the wire with no
+ * control here.
  */
 export const LAUNCH_PERMISSION_MODE = "default";
 
@@ -138,9 +141,9 @@ export function launchFailureCode(payload) {
  * The message is the server's own `error` sentence, used verbatim and never re-derived here. That
  * is deliberate: every ccctl fail-closed branch already writes an actionable sentence, and it
  * writes a BETTER one than this module could — it echoes the directory the operator typed
- * (`invalid-cwd`), names how many sessions are live and what the cap is (`at-capacity`), lists the
- * two prompting modes (`non-prompting-mode`). A per-code sentence table here would be a second,
- * worse copy of prose the server already owns, and it would drift.
+ * (`invalid-cwd`) and names how many sessions are live and what the cap is (`at-capacity`). A
+ * per-code sentence table here would be a second, worse copy of prose the server already owns,
+ * and it would drift.
  *
  * Both halves are defensive, because not every failure answer comes from ccctl's typed ingress: the
  * `405` branch answers `{ error }` with no code, a tunnel or proxy can interpose an HTML error page

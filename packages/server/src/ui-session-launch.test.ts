@@ -304,8 +304,8 @@ describe("POST /api/sessions (launch)", () => {
     const { launcher, launches } = fakeLauncher();
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
 
-    // A prompting mode (`plan`) — a non-prompting one is refused on launch (SRV-C-003 launch half),
-    // so this test uses a launchable mode; its point is that the OPTIONALS are omitted when absent.
+    // Any mode launches (ADR-007 removed the mode refusal); this test uses `plan` and its point is
+    // that the OPTIONALS are omitted when absent.
     await postLaunch(server, { cwd: CWD, permissionMode: "plan" });
 
     expect(launches[0]).toEqual({
@@ -344,25 +344,25 @@ describe("POST /api/sessions (launch)", () => {
     expect(launches).toHaveLength(0);
   });
 
-  // SRV-C-003, launch half (#32): a UC2 launch is remotely driven, so the launched session must run
-  // under a PROMPTING mode — one that blocks on a decision and can raise the "awaiting input" signal.
-  // A non-prompting mode is refused at the ingress (400, never launched); a prompting mode launches.
-  it("fails closed 400 `non-prompting-mode` on EVERY non-prompting mode — and does not launch", async () => {
+  // ADR-007 (was SRV-C-003, launch half #32): the launch path no longer refuses a non-prompting
+  // mode. Its old premise — that a non-prompting session "could never raise the awaiting-input
+  // signal" — was falsified by ADR-005; every non-prompting mode CAN block awaiting input
+  // (`@ccctl/core` § NON_PROMPTING_PERMISSION_MODES), so a launch under one is carried exactly as the
+  // attach half (#26) already carries it. This is the reachable state the change introduces.
+  it("launches (201) under EVERY non-prompting mode — the mode refusal is gone (ADR-007)", async () => {
     const { launcher, launches } = fakeLauncher();
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
 
-    // Iterates the whole set so `auto` (classifier) and `dontAsk` (headless auto-deny) — added #271 —
-    // are locked in as refused for a remotely-driven UC2 launch, exactly like acceptEdits / bypass.
+    // The whole set — `acceptEdits` / `bypassPermissions` / `dontAsk` / `auto` — each launches and
+    // reaches the launcher; none is refused, and a session is born for each.
     for (const permissionMode of NON_PROMPTING_PERMISSION_MODES) {
       const res = await postLaunch(server, { cwd: CWD, permissionMode });
-      expect(res.status).toBe(400);
-      expect(await res.json()).toMatchObject({ code: "non-prompting-mode" });
+      expect(res.status).toBe(201);
     }
-    // A non-prompting launch never reaches the launcher — no non-prompting session is born.
-    expect(launches).toHaveLength(0);
+    expect(launches.map((l) => l.permissionMode)).toEqual([...NON_PROMPTING_PERMISSION_MODES]);
   });
 
-  it("launches (201) under every PROMPTING permission-mode — default and plan — so it does not over-refuse", async () => {
+  it("launches (201) under every PROMPTING permission-mode — default and plan — unchanged by ADR-007", async () => {
     const { launcher, launches } = fakeLauncher();
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
 
@@ -553,8 +553,8 @@ describe("the maxSessions cap (#36)", () => {
 
     // Typed, and surfaced to the UI: the machine-readable `code` a UI branches on, plus the human
     // sentence every ccctl failure carries. The status is 429 — the request is well-formed and the
-    // server REFUSES it by policy (like `non-prompting-mode`, a 4xx), not a host that could not
-    // bring a surface up (502).
+    // server REFUSES it by policy (a 4xx: `at-capacity` is the only policy-refusal the launch path
+    // still carries), not a host that could not bring a surface up (502).
     expect(res.status).toBe(429);
     expect(await res.json()).toMatchObject({ code: "at-capacity", error: expect.stringContaining("ccctl:") });
     // The refusal is a REFUSAL, not a failed attempt: the guard runs before the launcher, so no third
@@ -1214,15 +1214,16 @@ describe("CcctlServer.launchSession (programmatic)", () => {
     });
   });
 
-  it("rejects a typed `non-prompting-mode` — the launch-half invariant holds for the programmatic caller too", async () => {
+  it("carries a non-prompting mode through the programmatic caller too — no mode refusal (ADR-007)", async () => {
     const { launcher, launches } = fakeLauncher();
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
 
-    await expect(server.launchSession({ cwd: CWD, permissionMode: "acceptEdits" })).rejects.toMatchObject({
-      code: "non-prompting-mode",
-    });
-    // The shared core refuses BEFORE touching the launcher — no non-prompting session is born.
-    expect(launches).toHaveLength(0);
+    const { sessionId } = await server.launchSession({ cwd: CWD, permissionMode: "acceptEdits" });
+
+    // The shared core launches it — a session is born and tracked `registering`, exactly as the
+    // attach half (#26) carries one; the launch and HTTP entry points agree (neither refuses a mode).
+    expect(launches.map((l) => l.permissionMode)).toEqual(["acceptEdits"]);
+    expect(server.sessions.get(sessionId)?.status).toBe("registering");
   });
 
   it("rejects a typed `invalid-cwd` — the pre-flight holds for the programmatic caller too", async () => {

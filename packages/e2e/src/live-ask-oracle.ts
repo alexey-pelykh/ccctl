@@ -49,12 +49,14 @@
  * than on the server's `hasBufferedEnrichment` is FORCED, not a shortcut: the server's
  * hook→reconcile→buffer→serve path (`worker-channel.ts` § `reconcileHookHandoff`) fires ONLY for a
  * session the server LAUNCHED (its `hookInstalls` map is populated exclusively by
- * `ui-session-launch.ts` § `launchSession`), and `launchSession` STRUCTURALLY REFUSES a non-prompting
- * mode. A `bypassPermissions` session — the #266 target — can therefore only come up over the BRIDGE,
- * where no `hookInstalls` entry exists, so its handoff is never reconciled and `hasBufferedEnrichment`
- * would read `false` even on a perfect surfacing. The server-side buffer→serve IS already
- * unit/contract-tested (`worker-channel.test.ts` § hook-handoff correlation) — but ONLY for a
- * LAUNCHED/prompting session, the one kind that carries a `hookInstalls` entry. The served-enrichment
+ * `ui-session-launch.ts` § `launchSession`). This oracle brings its `bypassPermissions` session —
+ * the #266 target — up over the BRIDGE (a §2 attach registration), NOT via launch, so it carries no
+ * `hookInstalls` entry; its handoff is never reconciled and `hasBufferedEnrichment` would read
+ * `false` even on a perfect surfacing. (The LAUNCH↔BRIDGE split is what governs the `hookInstalls`
+ * entry, not the permission mode — ADR-007 lets launch accept `bypassPermissions` too, but this
+ * oracle deliberately drives the bridge on-ramp, the path with no install.) The server-side buffer→serve
+ * IS already unit/contract-tested (`worker-channel.test.ts` § hook-handoff correlation) — but ONLY for
+ * a LAUNCHED/prompting session, the one kind that carries a `hookInstalls` entry. The served-enrichment
  * leg for a `bypassPermissions`/bridge session is therefore covered by NEITHER this gate's live run NOR
  * those hermetic tests: it is structurally unreachable without a bridge-path hook install (see the SCOPE
  * note below). This gate's novel job is the two LIVE behaviors it alone can observe — the worker
@@ -69,8 +71,9 @@
  * **SCOPE — the (`bypassPermissions` + hook) pairing is GATE-constructed, and deliberately so.** The
  * hook BINARY is the shipped one, but the CONFIGURATION it runs in here is not one the product currently
  * produces on its own: today the daemon installs the #262 hook (and runs `reconcileHookHandoff`) ONLY for
- * a session it LAUNCHED — a prompting mode — so a `bypassPermissions`/bridge session gets NEITHER the
- * install NOR the reconcile in the product. This gate installs the hook itself (via `--settings`) to
+ * a session it LAUNCHED — never for one that registered over the BRIDGE (a §2 attach) — so a
+ * `bypassPermissions`/bridge session gets NEITHER the install NOR the reconcile in the product. This
+ * gate installs the hook itself (via `--settings`) to
  * reach the one observation #266 owns: that a real `bypassPermissions` worker's native `AskUserQuestion`
  * block surfaces as `requires_action`. That is legitimate — the surfacing is a worker/server behavior
  * independent of WHO installed the hook — but it means a `verified` verdict certifies the SURFACING and
@@ -318,8 +321,9 @@ const DEFAULT_ASK_LIVE_TIMEOUT_MS = 120_000;
  * "skips-never-fakes" holds even when the real worker cannot be brought up.
  *
  * Installs the REAL #78 hook, plays the environments-bridge to bring up a `bypassPermissions` session
- * over the bridge (the only way — `launchSession` refuses non-prompting modes), hands a REAL patched
- * worker the channel WITH the hook wired in, waits for it to reach idle, injects one turn instructing an
+ * over the bridge (a §2 attach registration — the on-ramp this oracle drives, whose session carries no
+ * `hookInstalls` entry, unlike a launched one), hands a REAL patched worker the channel WITH the hook
+ * wired in, waits for it to reach idle, injects one turn instructing an
  * `AskUserQuestion` call, and observes — receiver-grounded, with a timeout — whether the block surfaced
  * as `requires_action`. Then reads the hook's own capture (the structured options) and classifies. Tears
  * the worker down and cleans the hook-install files before returning, so a serial run leaks neither a

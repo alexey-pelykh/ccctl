@@ -305,12 +305,13 @@ export async function registerEnvironment(server: CcctlServer, bearer: string): 
  * was actually launched at — a REAL one, since a launch at a non-existent path is refused `invalid-cwd`
  * before any backend runs — whereas the pinned `/e2e/proj` is a fixture that exists nowhere and could
  * therefore never be claimed. The `permissionMode` override exists for the #266 AskUserQuestion oracle
- * (`live-ask-oracle.ts`), which needs a `bypassPermissions` session: `launchSession` STRUCTURALLY refuses
- * a non-prompting mode (`ui-session-launch.ts` § `non-prompting-mode`), so the only way a
- * `bypassPermissions` session comes up is over the bridge, right here — and the session's `permission_mode`
- * is what the server derives its `autoResolvesPermissions` marker from (`environments-bridge.ts`), so the
- * §2 body must carry it. Both absent (every other caller), the pinned body is POSTed verbatim, so the
- * golden's own conformance run is untouched.
+ * (`live-ask-oracle.ts`), which needs a `bypassPermissions` session: that oracle brings its session up
+ * over the BRIDGE (a §2 registration, the UC1 attach on-ramp), and the session's `permission_mode` is
+ * what the server derives its `autoResolvesPermissions` marker from (`environments-bridge.ts`), so the
+ * §2 body must carry it. (Launch would now accept `bypassPermissions` too — ADR-007 removed the
+ * `non-prompting-mode` refusal — but the oracle drives the bridge path, so the override lives here.)
+ * Both absent (every other caller), the pinned body is POSTed verbatim, so the golden's own
+ * conformance run is untouched.
  *
  * The overrides live HERE rather than as a second §2 POST in the oracle deliberately: these driving
  * helpers are "the single place the harness speaks the current flow" (see the package README), and a
