@@ -35,9 +35,9 @@ more than one session can be carried at once. `GET /api/sessions` lists the carr
 sessions and the UI picks one to view + steer; the selected session drives the
 zero-build transport pair:
 
-- **List + select (#20; live status #25; degraded badge #27):** a `fetch` GET of
+- **List + select (#20; live status #25; auto-resolves badge #27):** a `fetch` GET of
   `/api/sessions` enumerates the sessions the daemon is carrying (id + transport
-  status + activity + the notifications-degraded marker).
+  status + activity + the auto-resolves-permissions marker).
   The list is **polled on an interval** and reconciled **in place** — only the rows
   whose status / activity changed are relabelled — so each session's per-session
   status (running / idle / awaiting-input) stays live as sessions change state,

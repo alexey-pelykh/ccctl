@@ -201,7 +201,7 @@ export function handleEnvironmentRegister(req: IncomingMessage, res: ServerRespo
  * identity instead of a possibly-wrong one (`pending-launch.ts` § Correlation).
  *
  * Either way the session is (re)born here through {@link createSession} from the OBSERVED
- * `permission_mode`, so its life-long `notificationsDegraded` marker is derived from what the worker
+ * `permission_mode`, so its life-long `autoResolvesPermissions` marker is derived from what the worker
  * actually runs, never from what a launch merely asked for.
  */
 export function handleSessionCreate(req: IncomingMessage, res: ServerResponse, state: BridgeState): void {
@@ -230,12 +230,12 @@ export function handleSessionCreate(req: IncomingMessage, res: ServerResponse, s
     // eviction timer. If not, this is an attached session (UC1): mint a fresh id, as ever.
     const sessionId = claimPendingLaunch(state, body.context.cwd, body.permissionMode) ?? randomUUID();
     // The session is marked at birth from its OBSERVED permission mode (a non-prompting mode
-    // auto-approves some class of permission decision rather than prompting on it); the marker
+    // auto-resolves some class of permission decision rather than prompting on it); the marker
     // is life-long because ccctl derives it once here and never re-reads the mode — not because
     // the mode is immutable (the worker exposes a mid-run `set_permission_mode`, which ccctl does
     // not track, so the marker can go stale — #272). ADVISORY only — it does NOT mean the session
     // cannot emit `requires_action`, and nothing gates a notification on it (#265;
-    // `@ccctl/core` § `Session.notificationsDegraded`).
+    // `@ccctl/core` § `Session.autoResolvesPermissions`).
     state.sessions.set(sessionId, createSession(sessionId, body.permissionMode));
     // Registration §2 (#61): a `connecting` session is born on the bridge. The account Bearer that
     // authorized this leg is never a field here (loggable shape omits it by construction).

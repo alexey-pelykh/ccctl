@@ -358,7 +358,7 @@ describe("POST /api/sessions (launch)", () => {
       expect(res.status).toBe(400);
       expect(await res.json()).toMatchObject({ code: "non-prompting-mode" });
     }
-    // A non-prompting launch never reaches the launcher — no degraded session is born.
+    // A non-prompting launch never reaches the launcher — no non-prompting session is born.
     expect(launches).toHaveLength(0);
   });
 
@@ -1221,7 +1221,7 @@ describe("CcctlServer.launchSession (programmatic)", () => {
     await expect(server.launchSession({ cwd: CWD, permissionMode: "acceptEdits" })).rejects.toMatchObject({
       code: "non-prompting-mode",
     });
-    // The shared core refuses BEFORE touching the launcher — no degraded session is born.
+    // The shared core refuses BEFORE touching the launcher — no non-prompting session is born.
     expect(launches).toHaveLength(0);
   });
 

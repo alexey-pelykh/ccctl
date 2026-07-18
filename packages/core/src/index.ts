@@ -513,7 +513,7 @@ export type SessionStatus = "registering" | "connecting" | "ready" | "busy" | "c
  * heart-beating) — the dimensions are independent.
  *
  * Alongside the three transitioning dimensions is ONE static birth-property:
- * {@link Session.notificationsDegraded}, set once at attach from the observed
+ * {@link Session.autoResolvesPermissions}, set once at attach from the observed
  * permission mode and never cleared. It is not a fourth dimension that moves —
  * it is a fixed fact about how the session was created, and it is ADVISORY: no
  * predicate reads it to decide whether to notify (#265).
@@ -531,41 +531,31 @@ export interface Session {
   activity: SessionActivity;
   /**
    * Life-long attach-time marker: `true` when this session was created under a
-   * non-prompting {@link PermissionMode} ({@link isNonPromptingPermissionMode}) — it
-   * auto-resolves some class of permission decision (by approving or denying) instead
-   * of prompting on it. Set
-   * ONCE at {@link createSession} from the observed mode and never re-derived: every
-   * transition SPREADS the session, carrying this field through unchanged, so no ccctl
-   * code path clears it. Life-long by ccctl's CONSTRUCTION, not because the underlying
-   * mode is immutable — the worker exposes a mid-run `set_permission_mode` control (and
-   * an interactive Shift+Tab cycle), so an operator who changes mode mid-session leaves
-   * this marker STALE; ccctl does not observe the change today (#272). A prompting
-   * session (`default` / `plan`) carries `false`.
+   * non-prompting {@link PermissionMode} ({@link isNonPromptingPermissionMode}) — one that
+   * auto-resolves some class of permission decision (by approving OR denying) instead of
+   * prompting the operator on it. Set ONCE at {@link createSession} from the observed mode
+   * and never re-derived: every transition SPREADS the session, carrying this field through
+   * unchanged, so no ccctl code path clears it. Life-long by ccctl's CONSTRUCTION, not
+   * because the underlying mode is immutable — the worker exposes a mid-run
+   * `set_permission_mode` control (and an interactive Shift+Tab cycle), so an operator who
+   * changes mode mid-session leaves this marker STALE; ccctl does not observe the change
+   * today (#272). A prompting session (`default` / `plan`) carries `false`.
    *
-   * What it does NOT mean (#265 — the name over-claims; read this, not the name):
+   * One boolean over the whole non-prompting set, so it cannot say HOW MUCH — or in which
+   * DIRECTION — a marked session auto-resolves: `bypassPermissions` approves every tool call
+   * (never prompts); `acceptEdits` auto-accepts file edits ONLY and still prompts for tools it
+   * has no mode-specific handling for; `dontAsk` auto-DENIES; `auto` defers to a classifier.
+   * Read it as "auto-resolves SOME permission decisions without asking", never the stronger
+   * "never prompts" or "approves everything" ({@link NON_PROMPTING_PERMISSION_MODES}).
    *
-   *   - NOT "this session never emits `requires_action`". It can: `AskUserQuestion`
-   *     blocks natively even in bypass (ADR-005 / #263), and the worker is expected to
-   *     report that block as `requires_action` like any other — pending the #266
-   *     live-worker gate. See {@link NON_PROMPTING_PERMISSION_MODES}.
-   *   - NOT "needs-you notifications are broken for this session". They work. The
-   *     emitter (`@ccctl/server` § `reconcileNeedsInput`) composes
-   *     {@link isInputAwaited} + transition + liveness, and deliberately does NOT
-   *     read this marker — a marked session notifies exactly like an unmarked one.
-   *   - NOT "this session never prompts for permission". True of `bypassPermissions`;
-   *     FALSE of `acceptEdits`, which auto-accepts file edits but still prompts for
-   *     tools it has no mode-specific handling for. The marker cannot distinguish them
-   *     — it is one boolean over the whole set — so it must never be read as the stronger
-   *     claim ({@link NON_PROMPTING_PERMISSION_MODES}).
-   *   - NOT conditional on the #78 `PreToolUse` hook. That hook is ENRICH-ONLY
-   *     (ADR-005 § Decision 1): it neither creates nor removes a block, so it cannot
-   *     move this marker. The marker is derived from the mode alone.
-   *
-   * What it DOES mean: this session auto-resolves at least some permission decisions
-   * without asking, so it has FEWER needs-you triggers than a prompting one — never
-   * none. An advisory birth-fact for the operator, never a suppression input.
+   * ADVISORY, never a suppression input (#265): a marked session has FEWER needs-you triggers
+   * than a prompting one, never none. The emitter (`@ccctl/server` § `reconcileNeedsInput`)
+   * composes {@link isInputAwaited} + transition + liveness and deliberately does NOT read this
+   * marker — a marked session notifies exactly like an unmarked one, and no caller may add it as
+   * a suppression gate. It still emits `requires_action`: `AskUserQuestion` blocks natively even
+   * under `bypassPermissions` (ADR-005 / #263), pending the #266 live-worker gate.
    */
-  readonly notificationsDegraded: boolean;
+  readonly autoResolvesPermissions: boolean;
   /** Epoch millis when the session was first registered. */
   readonly createdAt: number;
   /** Epoch millis of the most recent `worker_status` frame applied. */
@@ -576,7 +566,7 @@ export interface Session {
 
 /**
  * Create a freshly-registered session: `connecting` lifecycle, `idle` activity,
- * its life-long {@link Session.notificationsDegraded} marker derived from
+ * its life-long {@link Session.autoResolvesPermissions} marker derived from
  * `permissionMode` (a non-prompting mode ⇒ marked — see that field for what the
  * mark does and does not claim), and the heartbeat clock
  * started at `now` (registration is its first liveness signal). `permissionMode`
@@ -590,7 +580,7 @@ export function createSession(id: string, permissionMode: PermissionMode, now: n
     id,
     status: "connecting",
     activity: { kind: "idle" },
-    notificationsDegraded: isNonPromptingPermissionMode(permissionMode),
+    autoResolvesPermissions: isNonPromptingPermissionMode(permissionMode),
     createdAt: now,
     lastActivityAt: now,
     lastHeartbeatAt: now,
@@ -601,7 +591,7 @@ export function createSession(id: string, permissionMode: PermissionMode, now: n
  * Create the PROVISIONAL session a UC2 launch places in the registry the moment its terminal
  * comes up — `registering` lifecycle, awaiting the worker's own bridge registration (§2, #33).
  * Identical birth to {@link createSession} — same id, same life-long
- * {@link Session.notificationsDegraded} marker derived from the mode the session was LAUNCHED
+ * {@link Session.autoResolvesPermissions} marker derived from the mode the session was LAUNCHED
  * under, same clocks started at `now` — but entering the lifecycle one step EARLIER, so the
  * launched session is visible in the list from LAUNCH rather than only from registration.
  *
@@ -954,7 +944,7 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
  * Either way a session created under one of these modes CAN block awaiting input (observed),
  * and is therefore expected to raise a needs-you — FEWER triggers than a prompting session,
  * never none, and the block itself is not in doubt; only its surfacing as `requires_action`
- * awaits #266. See {@link Session.notificationsDegraded} for what the derived marker claims.
+ * awaits #266. See {@link Session.autoResolvesPermissions} for what the derived marker claims.
  */
 export const NON_PROMPTING_PERMISSION_MODES: readonly PermissionMode[] = [
   "acceptEdits",
@@ -968,7 +958,7 @@ export const NON_PROMPTING_PERMISSION_MODES: readonly PermissionMode[] = [
  * that auto-resolves SOME class of permission decision rather than prompting on it (how
  * much, and whether by approving or denying, differs per mode — see that set). The
  * attach-time input to a session's life-long
- * {@link Session.notificationsDegraded} marker. It classifies the MODE's handling of
+ * {@link Session.autoResolvesPermissions} marker. It classifies the MODE's handling of
  * permission decisions and nothing else; it is not a prediction that the session will
  * never prompt, nor that it will never emit `requires_action` (#265).
  */
@@ -1470,7 +1460,7 @@ export function sessionActivityFromStatus(status: WorkerStatus, detail?: string)
  * what lets #43 compose the notification without re-deriving (and possibly re-sourcing) the trigger.
  *
  * Mode-agnostic, and deliberately so (#265). This reads `activity` and nothing else — it does NOT
- * consult {@link Session.notificationsDegraded}, and no caller may add that as a suppression gate. A
+ * consult {@link Session.autoResolvesPermissions}, and no caller may add that as a suppression gate. A
  * non-prompting session is NOT excluded here: `AskUserQuestion` blocks natively even under
  * `bypassPermissions` (ADR-005 / #263), so when the worker surfaces that block as `requires_action`
  * this predicate fires for it exactly as for a prompting session — the bypass-compatible needs-you
@@ -2647,10 +2637,11 @@ export type DiagnosticLogEventNameProofs = [
  * posture the wire contract takes ({@link BRIDGE_PROTOCOL_API_VERSION},
  * {@link WORK_SECRET_VERSION}). Bumping it is a deliberate, reviewed change.
  *
- * `2` (was `1`): {@link Session} gained the life-long `notificationsDegraded`
- * marker (#26), changing the persisted registry shape — so a pre-#26 `version: 1`
- * snapshot, whose sessions lack the field, is fail-closed on load rather than
- * loaded as a `Session` with an `undefined` marker.
+ * `2` (was `1`): {@link Session} gained the life-long `autoResolvesPermissions`
+ * marker (#26; introduced as `notificationsDegraded`, renamed at `4`), changing the
+ * persisted registry shape — so a pre-#26 `version: 1` snapshot, whose sessions lack
+ * the field, is fail-closed on load rather than loaded as a `Session` with an
+ * `undefined` marker.
  *
  * `3` (was `2`): {@link UnreadEntry} gained the required `eventId` — the per-session
  * SSE `Last-Event-ID` the needs-you was broadcast under, which the unread-queue
@@ -2658,8 +2649,17 @@ export type DiagnosticLogEventNameProofs = [
  * unread entries lack the field, is fail-closed on load rather than loaded as an entry
  * with an `undefined` order/ack key. The store is "safe to lose" state, so the
  * one-time hard stop on upgrade is the correct cost of a clean shape.
+ *
+ * `4` (was `3`): the marker added at `2` was RENAMED `notificationsDegraded` →
+ * {@link Session.autoResolvesPermissions} (#270) — the old name over-claimed (it is one
+ * advisory boolean over a set that auto-resolves permission decisions — approving, denying,
+ * or classifying — not a "notifications degraded" signal). The persisted registry keys the
+ * field by name, so a pre-#270 `version: 3` snapshot, whose sessions carry the field under
+ * the OLD key, is fail-closed on load rather than loaded as a `Session` whose renamed field
+ * reads `undefined`. Same "safe to lose" posture as `3`: the one-time hard stop on upgrade is
+ * the correct cost of carrying the honest name to the persisted shape.
  */
-export const SESSION_STORE_SNAPSHOT_VERSION = 3;
+export const SESSION_STORE_SNAPSHOT_VERSION = 4;
 
 /**
  * A single unread marker: a per-session {@link SessionActivity} the operator has

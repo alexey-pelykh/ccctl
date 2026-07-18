@@ -77,10 +77,10 @@ async function registerSession(server: CcctlServer, permissionMode: PermissionMo
  */
 async function listSessions(
   server: CcctlServer,
-): Promise<{ id: string; status: string; notificationsDegraded: boolean }[]> {
+): Promise<{ id: string; status: string; autoResolvesPermissions: boolean }[]> {
   const res = await fetch(`${base(server)}/api/sessions`);
   expect(res.status).toBe(200);
-  return ((await res.json()) as { sessions: { id: string; status: string; notificationsDegraded: boolean }[] })
+  return ((await res.json()) as { sessions: { id: string; status: string; autoResolvesPermissions: boolean }[] })
     .sessions;
 }
 
@@ -1592,7 +1592,7 @@ describe("§4/§5 blocking needs-input notification — names the session on a t
 
   it("raises it for a NON-PROMPTING session too — the marker is advisory, never a suppression gate (#265)", async () => {
     // AC4, asserted rather than assumed. `reconcileNeedsInput` composes isInputAwaited + transition +
-    // liveness and never reads `notificationsDegraded` — so a bypass session notifies exactly like a
+    // liveness and never reads `autoResolvesPermissions` — so a bypass session notifies exactly like a
     // prompting one. That is the whole point of #78: `AskUserQuestion` blocks natively even under
     // bypass (ADR-005 / #263), and the operator's phone must raise it. A suppression gate here would
     // silence every bypass session while leaving the rest of this suite green, so the negative is
@@ -1604,7 +1604,7 @@ describe("§4/§5 blocking needs-input notification — names the session on a t
 
     // The session IS marked — the precondition that would feed a suppression gate, were one added.
     const [listed] = await listSessions(server);
-    expect(listed.notificationsDegraded).toBe(true);
+    expect(listed.autoResolvesPermissions).toBe(true);
 
     expect((await putStatus(server, sessionId, epoch, "requires_action")).status).toBe(200);
 

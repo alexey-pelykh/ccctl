@@ -62,7 +62,7 @@
  *   - The persisted shape CANNOT carry a marker. {@link SessionStoreSnapshot} is `{ version, sessions,
  *     unread }` and a {@link Session} has neither a marker nor a `cwd` — so a {@link RecordedLaunch} is not
  *     derivable from a snapshot today. Supplying one is a `@ccctl/core` schema change PLUS a
- *     {@link SESSION_STORE_SNAPSHOT_VERSION} bump (the precedent: `2` was the `notificationsDegraded` bump).
+ *     {@link SESSION_STORE_SNAPSHOT_VERSION} bump (the precedent: `2` was the `autoResolvesPermissions` bump).
  *   - Persisting the `cwd` alongside the marker is what would let a returning worker RE-ADOPT its rehydrated
  *     row instead of minting a second one — see {@link rehydrateRetainedSessions}, which names that bound and
  *     the un-reaped-row bound it ships with.

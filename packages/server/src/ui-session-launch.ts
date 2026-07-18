@@ -408,7 +408,7 @@ function liveSessionCount(state: SessionLaunchState): number {
  * every slot under the `maxSessions` cap already held by a live session (`at-capacity`, #36), a
  * non-prompting permission-mode (`non-prompting-mode` — `acceptEdits` / `bypassPermissions`, a
  * session that could never raise the "awaiting input" signal a remotely-driven UC2 session needs;
- * the sibling attach half, #26, can only MARK such a session degraded, but the launch half CONTROLS
+ * the sibling attach half, #26, can only MARK such a session as auto-resolving, but the launch half CONTROLS
  * the mode, so it enforces prompting), or a working directory that does not exist (`invalid-cwd`).
  * A launcher reject propagates with the code the BACKEND classified it as. The HTTP handler maps
  * each code to its status; a programmatic caller reads `error.code` directly.

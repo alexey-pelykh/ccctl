@@ -52,7 +52,7 @@ interface SessionSummary {
   readonly id: string;
   readonly status: string;
   readonly activity: SessionActivity;
-  readonly notificationsDegraded: boolean;
+  readonly autoResolvesPermissions: boolean;
   readonly cursor: number;
   /** The #264 `AskUserQuestion` decoration — present only while the session is actually blocking. */
   readonly enrichment?: { readonly sequenceNum: number; readonly questions: readonly unknown[] };
@@ -143,12 +143,12 @@ describe("GET /api/sessions — session list (#20)", () => {
     const sessions = await listSessions(server);
     expect(sessions.map((s) => s.id)).toEqual([first, second]);
     // A freshly-created session is `connecting` transport-wise and `idle` activity-wise, and
-    // — created under `default` (a prompting mode) — carries no notifications-degraded marker.
+    // — created under `default` (a prompting mode) — carries no auto-resolves-permissions marker.
     // It has emitted nothing on its stream yet, so its message cursor (#80) is 0.
     for (const summary of sessions) {
       expect(summary.status).toBe("connecting");
       expect(summary.activity).toEqual({ kind: "idle" });
-      expect(summary.notificationsDegraded).toBe(false);
+      expect(summary.autoResolvesPermissions).toBe(false);
       expect(summary.cursor).toBe(0);
     }
   });
@@ -199,7 +199,7 @@ describe("GET /api/sessions — session list (#20)", () => {
     expect(quietSummary?.activity).toEqual({ kind: "idle" });
   });
 
-  it("attaches (lists) a non-prompting session and carries the persistent degraded-notification marker (#26)", async () => {
+  it("attaches (lists) a non-prompting session and carries the persistent auto-resolves-permissions marker (#26)", async () => {
     const server = await startTestServer();
     // A non-prompting session auto-resolves some class of permission decision rather than
     // prompting on it — so it carries the marker, and it attaches anyway (it is not refused).
@@ -209,20 +209,20 @@ describe("GET /api/sessions — session list (#20)", () => {
       const id = await createSession(server, mode);
       const summary = (await listSessions(server)).find((s) => s.id === id);
       expect(summary).toBeDefined(); // the attach on-ramp lists it — not refused
-      expect(summary?.notificationsDegraded).toBe(true);
+      expect(summary?.autoResolvesPermissions).toBe(true);
     }
   });
 
-  it("attaches a prompting session with NO degraded marker (#26)", async () => {
+  it("attaches a prompting session with NO auto-resolves marker (#26)", async () => {
     const server = await startTestServer();
     for (const mode of ["default", "plan"] as const) {
       const id = await createSession(server, mode);
       const summary = (await listSessions(server)).find((s) => s.id === id);
-      expect(summary?.notificationsDegraded).toBe(false);
+      expect(summary?.autoResolvesPermissions).toBe(false);
     }
   });
 
-  it("keeps the degraded marker persistent as the session runs on — a status update never clears it (#26)", async () => {
+  it("keeps the auto-resolves marker persistent as the session runs on — a status update never clears it (#26)", async () => {
     const server = await startTestServer();
     const id = await createSession(server, "bypassPermissions");
     // Drive the worker forward (register + a `running` status) to simulate a long-lived run;
@@ -240,7 +240,7 @@ describe("GET /api/sessions — session list (#20)", () => {
     expect(putStatus.status).toBe(200);
 
     const summary = (await listSessions(server)).find((s) => s.id === id);
-    expect(summary?.notificationsDegraded).toBe(true);
+    expect(summary?.autoResolvesPermissions).toBe(true);
     expect(summary?.activity).toEqual({ kind: "running" });
   });
 

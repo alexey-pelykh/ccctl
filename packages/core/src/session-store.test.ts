@@ -39,7 +39,7 @@ class InMemorySessionStore implements ISessionStore {
 /**
  * A representative session registry spanning the lifecycle/activity dimensions —
  * plus a non-prompting (`bypassPermissions`) session, so the round-trip also proves
- * the life-long `notificationsDegraded` marker survives JSON serialisation (#26).
+ * the life-long `autoResolvesPermissions` marker survives JSON serialisation (#26).
  */
 const sessions: readonly Session[] = [
   { ...createSession("sess-running", "bypassPermissions", T0), status: "ready", activity: { kind: "running" } },

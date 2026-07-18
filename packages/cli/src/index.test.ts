@@ -1044,12 +1044,12 @@ describe("ccctl attach — the UC1 attach on-ramp lists running sessions (AC1 + 
     const { deps, list } = makeDeps({
       list: () =>
         Promise.resolve([
-          { id: "phone-sess", status: "ready", activity: { kind: "running" }, notificationsDegraded: false },
+          { id: "phone-sess", status: "ready", activity: { kind: "running" }, autoResolvesPermissions: false },
           {
             id: "cli-sess",
             status: "busy",
             activity: { kind: "requires_action", detail: "approve edit" },
-            notificationsDegraded: false,
+            autoResolvesPermissions: false,
           },
         ]),
     });
@@ -1095,12 +1095,12 @@ describe("ccctl attach <session-id> — selects one session to attach to (UC1 co
   // Two sessions of DIFFERENT origin sit in the shared list; selecting either is identical, which
   // is exactly "attached sessions appear alongside phone-driven ones" read from the select side.
   const seeded = (): SessionSummaryWire[] => [
-    { id: "phone-sess", status: "ready", activity: { kind: "running" }, notificationsDegraded: false },
+    { id: "phone-sess", status: "ready", activity: { kind: "running" }, autoResolvesPermissions: false },
     {
       id: "cli-sess",
       status: "busy",
       activity: { kind: "requires_action", detail: "approve edit" },
-      notificationsDegraded: false,
+      autoResolvesPermissions: false,
     },
   ];
 

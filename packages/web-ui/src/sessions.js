@@ -21,7 +21,7 @@
  * dependency-free vanilla ESM. The mirrored contract (`GET /api/sessions` → `{ sessions }`):
  *
  *   SessionSummaryWire = { id: string, status: SessionStatus, activity: SessionActivity,
- *                          notificationsDegraded: boolean, cursor: number }
+ *                          autoResolvesPermissions: boolean, cursor: number }
  *   SessionStatus      = "registering" | "connecting" | "ready" | "busy" | "closed" | "errored"
  *                                                                                   (transport;
  *                        `registering` is a session ccctl LAUNCHED whose worker has not checked in
@@ -30,11 +30,11 @@
  *   SessionActivity    = { kind: "running" }
  *                      | { kind: "requires_action"; detail: string }
  *                      | { kind: "idle" }                                        (what the worker is doing)
- *   notificationsDegraded — a non-prompting session's persistent auto-approves-permissions marker
- *                      (#26): carried on the wire and read by {@link notificationsDegraded} into the
- *                      standing per-row badge the shell renders (#27). ADVISORY and narrower than its
- *                      name (#265) — a marked session still raises needs-you when the agent asks a
- *                      question; never read it as "cannot notify you".
+ *   autoResolvesPermissions — a non-prompting session's persistent auto-resolves-permissions marker
+ *                      (#26): carried on the wire and read by {@link autoResolvesPermissions} into the
+ *                      standing per-row badge the shell renders (#27). ADVISORY (#265) — a marked
+ *                      session still raises needs-you when the agent asks a question; never read it as
+ *                      "cannot notify you".
  *   cursor            — the session's monotonic message cursor (#80): the last event id emitted on
  *                      its stream, read by {@link sessionCursor} into the stale-guard the shell arms
  *                      (a steer against a session that has advanced past the cursor the operator last
@@ -95,29 +95,29 @@ export function sessionLabel(session) {
 }
 
 /**
- * Whether a session carries the non-prompting marker (#26) — a session under `acceptEdits` /
- * `bypassPermissions` auto-approves some class of permission decision rather than prompting the
- * operator on it; a standing badge says so (#27). A dimension distinct from {@link sessionLabel}:
- * the label carries the live status/activity, this the marker, which is set once at attach and
- * never cleared — a fact about how the session was created, not a state that moves.
+ * Whether a session carries the non-prompting marker (#26) — a session under a non-prompting mode
+ * (`bypassPermissions` / `acceptEdits` / `dontAsk` / `auto`) auto-resolves some class of permission
+ * decision rather than prompting the operator on it; a standing badge says so (#27). A dimension
+ * distinct from {@link sessionLabel}: the label carries the live status/activity, this the marker,
+ * which is set once at attach and never cleared — a fact about how the session was created, not a
+ * state that moves.
  *
- * The wire field keeps the `notificationsDegraded` name, but the marker is ADVISORY and narrower
- * than that name suggests (#265): a marked session DOES still emit `requires_action` and DOES
- * still raise needs-you when the agent asks a question, because `AskUserQuestion` blocks natively
- * even in bypass (ADR-005 / #263). It means FEWER triggers, never none — so this must not be read
- * as "cannot notify you", and nothing may gate a notification on it. It also does not mean the
- * session never prompts: `bypassPermissions` approves every tool call, but `acceptEdits` only
- * auto-accepts file edits and still prompts for others — one boolean covers both.
+ * The marker is ADVISORY (#265): a marked session DOES still emit `requires_action` and DOES still
+ * raise needs-you when the agent asks a question, because `AskUserQuestion` blocks natively even
+ * under `bypassPermissions` (ADR-005 / #263). It means FEWER triggers, never none — so this must
+ * not be read as "cannot notify you", and nothing may gate a notification on it. Nor does it mean
+ * the session never prompts: `bypassPermissions` approves every tool call, but `acceptEdits` only
+ * auto-accepts file edits and still prompts for others — one boolean covers the whole set.
  *
  * Strict and defensive: only a literal `true` marks (a truthy non-boolean does not), and a missing
  * field or shapeless value reads as unmarked — so a partial or pre-#26 row never shows a spurious
  * badge, and this never throws.
  *
- * @param {{ notificationsDegraded?: unknown }} session - a `SessionSummaryWire`, or any value.
+ * @param {{ autoResolvesPermissions?: unknown }} session - a `SessionSummaryWire`, or any value.
  * @returns {boolean}
  */
-export function notificationsDegraded(session) {
-  return session?.notificationsDegraded === true;
+export function autoResolvesPermissions(session) {
+  return session?.autoResolvesPermissions === true;
 }
 
 /**
