@@ -649,7 +649,7 @@ function insertShortcut(phrase) {
 }
 
 /**
- * A standing "auto-approves permissions" badge for a non-prompting session (#26/#27). It is a
+ * A standing "auto-approves at launch" badge for a non-prompting session (#26/#27). It is a
  * SIBLING of the row button, never a child of it: a poll relabels a row via
  * `button.textContent = label`, which would wipe a badge nested inside the button — as a
  * sibling it survives every relabel. It carries an id so the button can point at it as its
@@ -662,6 +662,15 @@ function insertShortcut(phrase) {
  * this badge — it invites them to distrust a channel that works, or to over-monitor a session the
  * phone would have caught. What stays true, and is worth a standing amber flag, is the permissive
  * mode itself: this session approves permission decisions the operator would otherwise be asked.
+ *
+ * The copy says "at launch", not present-tense, because the marker is LAUNCH-TIME by decision
+ * (ADR-006 / #272). ccctl derives it once from the mode
+ * the session was launched under and does NOT fold the mid-run mode change — tracking is feasible
+ * (the worker DOES emit its mode on a §5 `system/status` frame ccctl already ingests) but is
+ * deferred, not adopted (ADR-006). So the badge states the LAUNCH posture; a session Shift+Tab'd
+ * into bypass after a `default` launch shows no badge, and one Shift+Tab'd back out keeps a stale
+ * one. The title says so plainly rather than implying the badge tracks the current mode — the
+ * temporal twin of the direction honesty (#265) the rest of this copy already carries.
  *
  * The title names BOTH modes rather than making one claim about them, because the wire carries a
  * single boolean — the browser cannot tell which mode a marked session runs, and the two are NOT
@@ -678,9 +687,9 @@ function createAutoResolvesBadge(sessionId) {
   const badge = document.createElement("span");
   badge.id = `auto-resolves-${sessionId}`;
   badge.dataset.badge = "auto-resolves-permissions";
-  badge.textContent = "auto-approves permissions";
+  badge.textContent = "auto-approves at launch";
   badge.title =
-    "This session runs in a non-prompting mode: bypassPermissions approves every tool call without asking; acceptEdits auto-accepts file edits and still prompts for other tools. It can still raise a needs-you notification when the agent asks you a question.";
+    "This session was LAUNCHED under a non-prompting mode: bypassPermissions approves every tool call without asking; acceptEdits auto-accepts file edits and still prompts for other tools. ccctl reads the mode once at launch and does not track later changes, so if the operator switched modes at the terminal (Shift+Tab) this may no longer reflect the current mode. It can still raise a needs-you notification when the agent asks you a question.";
   return badge;
 }
 

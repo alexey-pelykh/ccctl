@@ -569,8 +569,9 @@ describe("createSession auto-resolves-permissions marker (AC: set at attach from
     // A non-prompting session marked at birth stays marked through EVERY transition —
     // activity, heartbeat, ready, close — because ccctl derives the marker once and each
     // transition spreads the session forward unchanged on this axis (NOT because the mode is
-    // immutable — the worker can change it mid-run, which ccctl does not track; #272). This
-    // pins ccctl's own no-clear invariant, which is what the marker's life-long-ness rests on.
+    // immutable — the worker can change it mid-run, which ccctl does not track by decision: the
+    // marker is launch-time, ADR-006 / #272). This pins ccctl's own no-clear invariant, which is
+    // what the marker's life-long-ness — hence its launch-time reading — rests on.
     const born = createSession("sess-np", "bypassPermissions", T0);
     expect(born.autoResolvesPermissions).toBe(true);
     const running = applyWorkerStatusFrame(born, statusFrame({ status: "running" }), T0 + 1);
