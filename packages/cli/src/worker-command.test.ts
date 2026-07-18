@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { afterEach, describe, expect, it } from "vitest";
+import { PERMISSION_MODES } from "@ccctl/core";
 import { createTmuxSessionLauncher, type SessionLaunchOptions } from "@ccctl/server";
 import {
   buildWorkerCommand,
@@ -22,8 +23,6 @@ import {
 // these tests are about the argv the builder produces, not about what is installed on the machine
 // running them. Leaving it real would make them pass or fail on whether a `claude` happens to be on
 // the test host's PATH — which is exactly the kind of accidental green this suite must not have.
-
-const PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan"] as const;
 
 describe("resolveClaudeBin — binds the patched-binary path (default / override)", () => {
   it("defaults to the bare-PATH `claude` when CCCTL_CLAUDE_BIN is unset (worktree-safe, no ../)", () => {

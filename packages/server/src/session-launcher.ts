@@ -42,8 +42,7 @@ export interface SessionLaunchOptions {
   readonly cwd: string;
   /**
    * Permission mode the session runs under — the pinned {@link PermissionMode} set from
-   * `@ccctl/core` (`default` / `acceptEdits` / `bypassPermissions` / `plan`), reused so the
-   * launcher and the §2 session-create speak one vocabulary.
+   * `@ccctl/core`, reused so the launcher and the §2 session-create speak one vocabulary.
    */
   readonly permissionMode: PermissionMode;
   /**

@@ -532,7 +532,8 @@ export interface Session {
   /**
    * Life-long attach-time marker: `true` when this session was created under a
    * non-prompting {@link PermissionMode} ({@link isNonPromptingPermissionMode}) — it
-   * auto-approves some class of permission decision instead of prompting on it. Set
+   * auto-resolves some class of permission decision (by approving or denying) instead
+   * of prompting on it. Set
    * ONCE at {@link createSession} from the observed mode and never re-derived: every
    * transition SPREADS the session, carrying this field through unchanged, so no ccctl
    * code path clears it. Life-long by ccctl's CONSTRUCTION, not because the underlying
@@ -554,13 +555,13 @@ export interface Session {
    *   - NOT "this session never prompts for permission". True of `bypassPermissions`;
    *     FALSE of `acceptEdits`, which auto-accepts file edits but still prompts for
    *     tools it has no mode-specific handling for. The marker cannot distinguish them
-   *     — it is one boolean over both modes — so it must never be read as the stronger
+   *     — it is one boolean over the whole set — so it must never be read as the stronger
    *     claim ({@link NON_PROMPTING_PERMISSION_MODES}).
    *   - NOT conditional on the #78 `PreToolUse` hook. That hook is ENRICH-ONLY
    *     (ADR-005 § Decision 1): it neither creates nor removes a block, so it cannot
    *     move this marker. The marker is derived from the mode alone.
    *
-   * What it DOES mean: this session auto-approves at least some permission decisions
+   * What it DOES mean: this session auto-resolves at least some permission decisions
    * without asking, so it has FEWER needs-you triggers than a prompting one — never
    * none. An advisory birth-fact for the operator, never a suppression input.
    */
@@ -877,12 +878,30 @@ export function loggableEnvironmentRegisterRequest(
  * The Claude Code permission modes a session can be created under. Pinned to the
  * current build's set ({@link PERMISSION_MODES}); an unrecognized mode fails
  * closed via {@link isPermissionMode} rather than being silently accepted
- * (drift), mirroring the control-frame codec's discriminant validation.
+ * (drift), mirroring the control-frame codec's discriminant validation. `dontAsk`
+ * (headless auto-deny) and `auto` (classifier) are the two modes beyond the original
+ * four — see {@link NON_PROMPTING_PERMISSION_MODES} for each one's observed behavior.
  */
-export type PermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan";
+export type PermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk" | "auto";
 
-/** The pinned {@link PermissionMode} set, in one place, for the guard and tests. */
-export const PERMISSION_MODES: readonly PermissionMode[] = ["default", "acceptEdits", "bypassPermissions", "plan"];
+/**
+ * The pinned {@link PermissionMode} set, in one place, for the guard and tests.
+ *
+ * Verified against stock `claude` 2.1.214 by reading the binary's own mode table
+ * (`strings`, canary-first — #271, 2026-07-18): the six are `default`, `acceptEdits`,
+ * `bypassPermissions`, `plan`, `dontAsk`, `auto`. Claude Code adds modes between releases
+ * (this set went 4→6 across the 2.1.x line), so this pin DATES from that build — on a
+ * target-build bump, re-read the mode table and re-triage {@link NON_PROMPTING_PERMISSION_MODES}
+ * from each new mode's observed permission path (never its name), the way #271 did.
+ */
+export const PERMISSION_MODES: readonly PermissionMode[] = [
+  "default",
+  "acceptEdits",
+  "bypassPermissions",
+  "plan",
+  "dontAsk",
+  "auto",
+];
 
 /** Runtime guard for {@link PermissionMode} — fails closed on an unknown mode (drift). */
 export function isPermissionMode(value: unknown): value is PermissionMode {
@@ -890,29 +909,43 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
 }
 
 /**
- * The {@link PermissionMode}s that AUTO-APPROVE some class of permission decision
- * rather than prompting the operator on it. The PROMPTING complement — `default`
- * (prompts per decision) and `plan` (blocks awaiting plan approval) — is deliberately
- * absent. Pinned in one place, mirroring {@link PERMISSION_MODES}; the two sets
- * partition {@link PERMISSION_MODES}.
+ * The {@link PermissionMode}s that AUTO-RESOLVE some class of permission decision — by
+ * approving OR denying it WITHOUT prompting the operator. The PROMPTING complement —
+ * `default` (prompts per decision) and `plan` (blocks awaiting plan approval) — is
+ * deliberately absent. Pinned in one place, mirroring {@link PERMISSION_MODES}; the two
+ * sets partition {@link PERMISSION_MODES}.
  *
- * The two members auto-approve DIFFERENT amounts, and the difference is load-bearing
- * (#265) — "non-prompting" is the set's name, not a uniform property of its members:
+ * The members resolve DIFFERENT amounts in DIFFERENT directions, and the difference is
+ * load-bearing (#265/#269) — "non-prompting" is the set's name, not a uniform property of
+ * its members, and it is emphatically NOT "permissive" (`dontAsk` resolves by DENYING).
+ * Each was triaged from the binary's OBSERVED permission path, never its name or color,
+ * against stock `claude` 2.1.214 (#271):
  *
  *   - `bypassPermissions` approves EVERY tool call without asking, so no permission
  *     prompt ever fires.
  *   - `acceptEdits` auto-accepts FILE EDITS only. A tool it has no mode-specific
  *     handling for falls through to normal permission evaluation and CAN still prompt
- *     (stock `claude` 2.1.212 returns `{behavior: "passthrough", message: "No
+ *     (stock `claude` 2.1.214 returns `{behavior: "passthrough", message: "No
  *     mode-specific handling for '{tool}' in acceptEdits mode"}`). So it has FEWER
  *     permission prompts than `default`, not none.
+ *   - `auto` is the CLASSIFIER mode: it defers each decision to a model classifier
+ *     (`{behavior: "passthrough", message: "… requires classifier review"}`) that
+ *     auto-decides the common case and escalates only the uncertain — the build's own
+ *     permissiveness ordering ranks it ABOVE `acceptEdits`, below `bypassPermissions`.
+ *     So it too prompts FEWER times than `default`, not none.
+ *   - `dontAsk` is the HEADLESS-AGENT mode: it auto-DENIES (`{behavior: "deny"}`) rather
+ *     than prompting, and is never in the interactive Shift+Tab cycle. It resolves without
+ *     asking — by refusing — so it has FEWER needs-you than `default`. It renders
+ *     `color: "error"` like `bypassPermissions` yet does the OPPOSITE (deny-all vs
+ *     approve-all); classifying it from that color/name instead of its path is exactly the
+ *     trap #271 flagged, and is why this set means "auto-resolve", not "auto-approve".
  *
- * Neither SILENCES the session, which is the point this set is most often misread on.
+ * None SILENCES the session, which is the point this set is most often misread on.
  * `AskUserQuestion` is an INTERACTION tool, not a permission decision, so a mode that
  * suppresses permission *prompts* does not touch it: it blocks awaiting input natively
  * even under `bypassPermissions`. That block is OBSERVED against the stock permission
  * engine — ADR-005 (`docs/decisions/adr-005-askuserquestion-bypass-block-and-hook-role.md`)
- * records the #263 spike. That the worker then SURFACES that block as
+ * records the #263 spike (`claude` 2.1.212). That the worker then SURFACES that block as
  * `worker_status: requires_action` over §4/§5 is a strong INFERENCE, not yet observed:
  * the spike ran against the TUI and could not reach the last hop, which the #266
  * live-worker gate owns (ADR-005 § What remains open). Stated separately on purpose —
@@ -923,12 +956,18 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
  * never none, and the block itself is not in doubt; only its surfacing as `requires_action`
  * awaits #266. See {@link Session.notificationsDegraded} for what the derived marker claims.
  */
-export const NON_PROMPTING_PERMISSION_MODES: readonly PermissionMode[] = ["acceptEdits", "bypassPermissions"];
+export const NON_PROMPTING_PERMISSION_MODES: readonly PermissionMode[] = [
+  "acceptEdits",
+  "bypassPermissions",
+  "dontAsk",
+  "auto",
+];
 
 /**
  * Whether `mode` is non-prompting ({@link NON_PROMPTING_PERMISSION_MODES}) — i.e. a mode
- * that auto-approves SOME class of permission decision rather than prompting on it (how
- * much differs per mode — see that set). The attach-time input to a session's life-long
+ * that auto-resolves SOME class of permission decision rather than prompting on it (how
+ * much, and whether by approving or denying, differs per mode — see that set). The
+ * attach-time input to a session's life-long
  * {@link Session.notificationsDegraded} marker. It classifies the MODE's handling of
  * permission decisions and nothing else; it is not a prediction that the session will
  * never prompt, nor that it will never emit `requires_action` (#265).
