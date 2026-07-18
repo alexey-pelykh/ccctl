@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Oleksii PELYKH
 
 import { describe, expect, it } from "vitest";
-import type { WorkItem } from "@ccctl/core";
+import { PERMISSION_MODES, type WorkItem } from "@ccctl/core";
 import {
   parseEnvironmentRegisterBody,
   parseSessionCreateBody,
@@ -96,7 +96,7 @@ describe("parseSessionCreateBody (§2 request, snake_case → core, fail closed)
   });
 
   it("accepts every pinned permission mode", () => {
-    for (const mode of ["default", "acceptEdits", "bypassPermissions", "plan"]) {
+    for (const mode of PERMISSION_MODES) {
       expect(parseSessionCreateBody({ ...wire, permission_mode: mode })?.permissionMode).toBe(mode);
     }
   });

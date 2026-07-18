@@ -3,6 +3,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  NON_PROMPTING_PERMISSION_MODES,
   SESSIONS_PATH,
   workerChannelPath,
   workerEventsPath,
@@ -200,10 +201,11 @@ describe("GET /api/sessions — session list (#20)", () => {
 
   it("attaches (lists) a non-prompting session and carries the persistent degraded-notification marker (#26)", async () => {
     const server = await startTestServer();
-    // A non-prompting session auto-approves some class of permission decision rather than
+    // A non-prompting session auto-resolves some class of permission decision rather than
     // prompting on it — so it carries the marker, and it attaches anyway (it is not refused).
     // The marker is ADVISORY: it does not mean the session cannot emit `requires_action` (#265).
-    for (const mode of ["acceptEdits", "bypassPermissions"] as const) {
+    // Iterates the whole set so `auto` and `dontAsk` (added #271) are covered on the attach on-ramp.
+    for (const mode of NON_PROMPTING_PERMISSION_MODES) {
       const id = await createSession(server, mode);
       const summary = (await listSessions(server)).find((s) => s.id === id);
       expect(summary).toBeDefined(); // the attach on-ramp lists it — not refused

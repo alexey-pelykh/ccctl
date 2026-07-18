@@ -174,7 +174,10 @@ describe("§2 session create", () => {
     for (const mode of PERMISSION_MODES) {
       expect(isPermissionMode(mode)).toBe(true);
     }
-    expect(PERMISSION_MODES).toEqual(["default", "acceptEdits", "bypassPermissions", "plan"]);
+    // The canonical pin: exactly the six modes of the verified build (stock `claude` 2.1.214, #271),
+    // in declaration order. Order-sensitive on purpose — a mode added to / removed from the set must
+    // fail here loudly, forcing a deliberate re-verification against the target binary's mode table.
+    expect(PERMISSION_MODES).toEqual(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"]);
     expect(isPermissionMode("yolo")).toBe(false);
     expect(isPermissionMode(42)).toBe(false);
     expect(isPermissionMode(undefined)).toBe(false);

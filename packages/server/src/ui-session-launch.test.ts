@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { SESSIONS_PATH } from "@ccctl/core";
+import { NON_PROMPTING_PERMISSION_MODES, SESSIONS_PATH } from "@ccctl/core";
 import { DEFAULT_HOST, DEFAULT_MAX_SESSIONS, startServer, type CcctlServer, type ServerConfig } from "./index.js";
 import { XDG_STATE_HOME_ENV } from "./session-store-file.js";
 import {
@@ -347,11 +347,13 @@ describe("POST /api/sessions (launch)", () => {
   // SRV-C-003, launch half (#32): a UC2 launch is remotely driven, so the launched session must run
   // under a PROMPTING mode — one that blocks on a decision and can raise the "awaiting input" signal.
   // A non-prompting mode is refused at the ingress (400, never launched); a prompting mode launches.
-  it("fails closed 400 `non-prompting-mode` on acceptEdits / bypassPermissions — and does not launch", async () => {
+  it("fails closed 400 `non-prompting-mode` on EVERY non-prompting mode — and does not launch", async () => {
     const { launcher, launches } = fakeLauncher();
     const server = await startTestServer({ port: 0, host: DEFAULT_HOST, launcher });
 
-    for (const permissionMode of ["acceptEdits", "bypassPermissions"] as const) {
+    // Iterates the whole set so `auto` (classifier) and `dontAsk` (headless auto-deny) — added #271 —
+    // are locked in as refused for a remotely-driven UC2 launch, exactly like acceptEdits / bypass.
+    for (const permissionMode of NON_PROMPTING_PERMISSION_MODES) {
       const res = await postLaunch(server, { cwd: CWD, permissionMode });
       expect(res.status).toBe(400);
       expect(await res.json()).toMatchObject({ code: "non-prompting-mode" });

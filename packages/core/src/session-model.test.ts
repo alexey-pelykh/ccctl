@@ -174,7 +174,7 @@ describe("session identity (AC: identity is the register-response session id)", 
 
   it("createRegisteringSession derives the SAME life-long degraded marker as createSession", () => {
     // Identical birth, one step earlier in the lifecycle: the only difference is `status`.
-    for (const mode of ["default", "plan", "acceptEdits", "bypassPermissions"] as const) {
+    for (const mode of PERMISSION_MODES) {
       const registering = createRegisteringSession("sess-1", mode, T0);
       const connecting = createSession("sess-1", mode, T0);
       expect(registering.notificationsDegraded).toBe(connecting.notificationsDegraded);
@@ -519,9 +519,15 @@ describe("requires_action detail capture (#39 AC2: the session carries the human
 });
 
 describe("isNonPromptingPermissionMode (AC: non-prompting modes → notifications degraded)", () => {
-  it("classifies acceptEdits and bypassPermissions as non-prompting (they auto-proceed)", () => {
+  it("classifies acceptEdits, bypassPermissions, auto, and dontAsk as non-prompting (they auto-resolve, not prompt)", () => {
+    // Triaged from the 2.1.214 permission path (#271), never the name/color: bypass approves-all,
+    // acceptEdits accepts-edits, auto defers to the classifier, dontAsk auto-DENIES — all resolve
+    // WITHOUT prompting the operator. `dontAsk` renders color:"error" like bypass yet does the
+    // OPPOSITE (deny-all vs approve-all); it is non-prompting because it does not ASK, not permissive.
     expect(isNonPromptingPermissionMode("acceptEdits")).toBe(true);
     expect(isNonPromptingPermissionMode("bypassPermissions")).toBe(true);
+    expect(isNonPromptingPermissionMode("auto")).toBe(true);
+    expect(isNonPromptingPermissionMode("dontAsk")).toBe(true);
   });
 
   it("classifies default and plan as prompting (default prompts per decision; plan blocks on plan approval)", () => {
@@ -542,7 +548,7 @@ describe("isNonPromptingPermissionMode (AC: non-prompting modes → notification
 
 describe("createSession notifications-degraded marker (AC: set at attach from the observed mode, life-long)", () => {
   it("marks a session created under a non-prompting mode notifications-degraded", () => {
-    for (const mode of ["acceptEdits", "bypassPermissions"] as const) {
+    for (const mode of NON_PROMPTING_PERMISSION_MODES) {
       expect(createSession("sess-np", mode, T0).notificationsDegraded).toBe(true);
     }
   });
